@@ -1333,6 +1333,7 @@ export function App() {
     try { return JSON.parse(localStorage.getItem('currentUser')); } catch { return null; }
   });
   const [currentPage, setCurrentPage] = useState('dashboard');
+  const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedCustomerId, setSelectedCustomerId] = useState(null);
   const [authNotice, setAuthNotice] = useState('');
   // Bump to force a fully-fresh New Transaction form (remount → no pre-filled data).
@@ -1460,7 +1461,8 @@ export function App() {
   return (
     <div className="app-shell">
       <Toaster />
-      <aside className="sidebar">
+      <div className={`sidebar-overlay${sidebarOpen ? ' open' : ''}`} onClick={() => setSidebarOpen(false)} />
+      <aside className={`sidebar${sidebarOpen ? ' open' : ''}`}>
         <div className="sidebar-brand">
           <div className="sidebar-brand-icon">🔵</div>
           <div className="sidebar-brand-name">CylinderPro</div>
@@ -1473,7 +1475,7 @@ export function App() {
             <button
               key={item.key}
               className={`nav-link ${activeNav === item.key ? 'active' : ''}`}
-              onClick={() => item.key === 'new-transaction' ? goNewTransaction() : setCurrentPage(item.key)}
+              onClick={() => { setSidebarOpen(false); item.key === 'new-transaction' ? goNewTransaction() : setCurrentPage(item.key); }}
             >
               <span className="nav-icon">{item.icon}</span>
               <span>{item.label}</span>
@@ -1484,7 +1486,7 @@ export function App() {
         <div className="sidebar-footer">
           <button
             className={`sidebar-profile ${currentPage === 'profile' ? 'active' : ''}`}
-            onClick={() => setCurrentPage('profile')}
+            onClick={() => { setSidebarOpen(false); setCurrentPage('profile'); }}
             title="View profile"
           >
             <span className="profile-avatar">{initialsOf(currentUser?.name)}</span>
@@ -1498,6 +1500,7 @@ export function App() {
 
       <div className="main-content">
         <div className="topbar">
+          <button className="mobile-hamburger" onClick={() => setSidebarOpen(o => !o)} aria-label="Menu">☰</button>
           <span className="topbar-title">{pageTitles[currentPage] || 'CylinderPro'}</span>
           <span className="topbar-date">{today}</span>
         </div>

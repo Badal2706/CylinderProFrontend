@@ -1760,7 +1760,7 @@ export function ReportTable({ reportType, data }) {
     default:
       return withToggle(
         <div>
-          <div style={{padding: '0.75rem 1rem', backgroundColor: '#f8f9fa', borderRadius: '4px', marginBottom: '1rem', display: 'flex', gap: '2rem'}}>
+          <div style={{padding: '0.75rem 1rem', backgroundColor: '#f8f9fa', borderRadius: '4px', marginBottom: '1rem', display: 'flex', gap: '1rem', flexWrap: 'wrap'}}>
             <span><strong>Total Customers:</strong> {data.length}</span>
             <span><strong>Total Payment Due:</strong> ₹{data.reduce((s, i) => s + (i.bill_amount > 0 ? i.bill_amount : 0), 0).toFixed(2)}</span>
             <span><strong>Cylinders Out:</strong> {data.reduce((s, i) => s + (i.cylinder_hold || 0), 0)}</span>
