@@ -1133,7 +1133,16 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         });
         return own;
       }
-      return inRotationCyls;
+      let receivedPool = [...inRotationCyls];
+      if (transactionType === 'SWAP') {
+        const givenSerials = new Set(givenItems.flatMap(gi => gi.serial_numbers || []));
+        cylinders.forEach(c => {
+          if (givenSerials.has(c.rotational_number) && !receivedPool.some(p => p.rotational_number === c.rotational_number)) {
+            receivedPool.push(c);
+          }
+        });
+      }
+      return receivedPool;
     }
     let pool = cylinders.filter(c => c.stock_state === 'IN_STOCK' && !c.under_maintenance);
     if (isInternal) {
@@ -1980,7 +1989,9 @@ export function CylinderItem({ item, index, gasTypes, cylinderSizes, availableCy
         || pool.find(c => c.rotational_number.toLowerCase() === text.toLowerCase());
       if (cyl && !matchesLine(cyl)) { setLineError(mismatchMessage(cyl)); return; }
       if (cyl) onSelectCylinder(cyl); // typed an exact available number without selecting: auto-fill + add
-      else { setLineError(notFoundMessage || 'Cylinder not found in inventory. For the customer\'s own cylinders, use the personal cylinder count below.'); return; }
+      else if (notFoundMessage) { setLineError(notFoundMessage); return; }
+      else if (!item.gas_type_id || !item.cylinder_size_id) { setLineError('Select gas type and size first, then type the cylinder number.'); return; }
+      else onAddSerial(text);
     }
     setQuery('');
     setPendingCyl(null);

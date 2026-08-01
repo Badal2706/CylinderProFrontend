@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import {
   API_URL, apiFetch, apiErrorMessage, showToast, formatDate, formatDateTime,
@@ -6,7 +6,7 @@ import {
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
   LOCATIONS, LOCATION_LABELS, locationText, stockStateText, cylinderStateText,
-  Pagination
+  Pagination, useDebounce, InfiniteScroll
 } from './App.jsx';
 import { printSavedBill, RentalSummaryModal, StepUpVerificationModal } from './components.jsx';
 
@@ -2133,7 +2133,8 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
     gas_type: cylinder?.gas_type || '',
     capacity: cylinder?.capacity || '',
     location: cylinder?.location || 'AT_PLANT_CHANDISAR',
-    stock_state: cylinder?.stock_state || 'IN_STOCK'
+    stock_state: cylinder?.stock_state || 'IN_STOCK',
+    under_maintenance: cylinder?.under_maintenance || false
   });
   // Gas types and dependent capacities from the shared GAS_CAPACITIES map.
   const GAS_TYPES = GAS_TYPE_LIST;
@@ -2248,10 +2249,18 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
               </div>
               <div className="form-group">
                 <label>Stock State</label>
-                <select className="form-control" value={formData.stock_state}
-                  onChange={(e) => setFormData({...formData, stock_state: e.target.value})}>
+                <select className="form-control" value={formData.under_maintenance ? 'UNDER_MAINTENANCE' : formData.stock_state}
+                  onChange={(e) => {
+                    const v = e.target.value;
+                    if (v === 'UNDER_MAINTENANCE') {
+                      setFormData({...formData, stock_state: 'IN_STOCK', under_maintenance: true, location: 'AT_PLANT_CHANDISAR'});
+                    } else {
+                      setFormData({...formData, stock_state: v, under_maintenance: false});
+                    }
+                  }}>
                   <option value="IN_STOCK">In Stock</option>
                   <option value="AT_CUSTOMER">At Customer</option>
+                  <option value="UNDER_MAINTENANCE">Under Maintenance</option>
                 </select>
                 <small style={{color:'var(--text-muted)', fontSize:'0.78rem'}}>
                   Normally derived from bills — set manually only for onboarding corrections.
@@ -2275,45 +2284,53 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
 // Cylinder Inventory Page
 export function CylinderInventory({ onViewCustomer }) {
   const [cylinders, setCylinders] = useState([]);
-  const [cylPagination, setCylPagination] = useState(null);
+  const [hasMore, setHasMore] = useState(true);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const debouncedSearch = useDebounce(searchTerm, 300);
   const [cylPage, setCylPage] = useState(1);
-  // Multi-select filter groups (empty array = All):
-  //   locFilters — subset of LOCATIONS; stateFilters — subset of IN_STOCK / AT_CUSTOMER / UNDER_MAINTENANCE.
   const [locFilters, setLocFilters] = useState([]);
   const [stateFilters, setStateFilters] = useState([]);
-  const [modalCylinder, setModalCylinder] = useState(undefined); // undefined = closed, null = add, obj = edit
+  const [modalCylinder, setModalCylinder] = useState(undefined);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleting, setDeleting] = useState(false);
-  const [maintTarget, setMaintTarget] = useState(null); // { cyl, on } pending confirmation
+  const [maintTarget, setMaintTarget] = useState(null);
   const [maintSaving, setMaintSaving] = useState(false);
-  // rotational_number -> { holder_id, holder_name } for AT_CUSTOMER rows (click-through to customer).
   const [holders, setHolders] = useState({});
-  // Whole-inventory totals for the stat cards — independent of the search/stock filters below.
   const [counts, setCounts] = useState({ total: 0, inStock: 0, atCustomer: 0, maintenance: 0, byLocation: {} });
 
   const maintenanceView = stateFilters.includes('UNDER_MAINTENANCE');
 
-  useEffect(() => { fetchCylinders(); }, [searchTerm, locFilters, stateFilters, cylPage]);
+  // Reset to page 1 when filters/search change
+  useEffect(() => { setCylPage(1); setCylinders([]); setHasMore(true); }, [debouncedSearch, locFilters, stateFilters]);
+  useEffect(() => { fetchCylinders(); }, [debouncedSearch, locFilters, stateFilters, cylPage]);
   useEffect(() => { fetchCounts(); fetchHolders(); }, []);
 
   const fetchCylinders = async () => {
+    const isFirstPage = cylPage === 1;
+    if (isFirstPage) setLoading(true); else setLoadingMore(true);
     try {
       let url = `${API_URL}/cylinders?page=${cylPage}&limit=50&`;
-      if (searchTerm) url += `search=${encodeURIComponent(searchTerm)}&`;
+      if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
       if (stateFilters.length) url += `state=${stateFilters.join(',')}&`;
       if (locFilters.length) url += `location=${locFilters.join(',')}`;
       const res = await apiFetch(url);
       const result = await res.json();
-      setCylinders(result.data || result);
-      setCylPagination(result.pagination || null);
-      setLoading(false);
+      const newData = result.data || result;
+      setCylinders(prev => isFirstPage ? newData : [...prev, ...newData]);
+      const pg = result.pagination;
+      setHasMore(pg ? pg.page < pg.totalPages : false);
     } catch (error) {
       console.error('Error fetching cylinders:', error);
-      setLoading(false);
     }
+    setLoading(false);
+    setLoadingMore(false);
   };
+
+  const loadMore = useCallback(() => {
+    if (!loadingMore && hasMore) setCylPage(p => p + 1);
+  }, [loadingMore, hasMore]);
 
   // Always reflects the full inventory (no search/stock filter), so the stat cards stay fixed.
   const fetchCounts = async () => {
@@ -2324,7 +2341,7 @@ export function CylinderInventory({ onViewCustomer }) {
         total: stock.totalCylinders || 0,
         inStock: stock.cylindersAtPlant || 0,
         atCustomer: stock.cylindersInRotation || 0,
-        maintenance: (stock.totalCylinders || 0) - (stock.cylindersAtPlant || 0) - (stock.cylindersInRotation || 0),
+        maintenance: stock.maintenanceCount || 0,
         byLocation: stock.byLocation || {}
       });
     } catch (error) {
@@ -2349,9 +2366,8 @@ export function CylinderInventory({ onViewCustomer }) {
   // Location: "All" clears the set; picking sites toggles them. While Under Maintenance is
   // selected, location is forced to Chandisar-only (maintenance exists only there).
   const toggleLocation = (loc) => {
-    if (maintenanceView && loc !== 'AT_PLANT_CHANDISAR') return; // disabled
+    if (maintenanceView && loc !== 'AT_PLANT_CHANDISAR') return;
     setLocFilters(prev => prev.includes(loc) ? prev.filter(l => l !== loc) : [...prev, loc]);
-    setCylPage(1);
   };
   const toggleState = (st) => {
     setStateFilters(prev => {
@@ -2359,7 +2375,6 @@ export function CylinderInventory({ onViewCustomer }) {
       if (next.includes('UNDER_MAINTENANCE')) setLocFilters(['AT_PLANT_CHANDISAR']);
       return next;
     });
-    setCylPage(1);
   };
 
   // ── Maintenance toggle (backend re-enforces the Chandisar + IN_STOCK gate) ──
@@ -2614,7 +2629,7 @@ export function CylinderInventory({ onViewCustomer }) {
                 </tbody>
               </table>
               {cylMore && <ViewAllButton count={cylinders.length} onClick={() => setCylOpen(true)} />}
-              <Pagination pagination={cylPagination} onPageChange={(p) => setCylPage(p)} />
+              <InfiniteScroll hasMore={hasMore} loading={loadingMore} onLoadMore={loadMore} />
               </>
             )}
           </div>
@@ -2701,41 +2716,51 @@ export function directionLabel(d, opts = {}) {
 
 export function TransactionHistory() {
   const [bills, setBills] = useState([]);
-  const [billPagination, setBillPagination] = useState(null);
+  const [hasMore, setHasMore] = useState(true);
   const [payments, setPayments] = useState([]);
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const [billPage, setBillPage] = useState(1);
-  // Defaults to today — the page is a single-day view unless the date is cleared (Phase 9).
   const [dateFilter, setDateFilter] = useState(() => {
     const x = new Date();
     return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
   });
-  const [locFilter, setLocFilter] = useState('');     // '' = All Places | one of LOCATIONS
+  const [locFilter, setLocFilter] = useState('');
   const [detailBillId, setDetailBillId] = useState(null);
   const [editBillId, setEditBillId] = useState(null);
-  const [editAuth, setEditAuth] = useState(null); // step-up approval carried into EditBillModal (Phase 18)
+  const [editAuth, setEditAuth] = useState(null);
 
+  useEffect(() => { setBillPage(1); setBills([]); setHasMore(true); }, [dateFilter]);
   useEffect(() => { load(); }, [billPage, dateFilter]);
   const load = async () => {
-    setLoading(true);
+    const isFirstPage = billPage === 1;
+    if (isFirstPage) setLoading(true); else setLoadingMore(true);
     try {
       let billUrl = `${API_URL}/bills?page=${billPage}&limit=50`;
       if (dateFilter) billUrl += `&date=${dateFilter}`;
-      const [bRes, pRes] = await Promise.all([
-        apiFetch(billUrl),
-        apiFetch(`${API_URL}/payments?limit=200`)
-      ]);
-      const bData = await bRes.json();
-      setBills(bData.data || bData);
-      setBillPagination(bData.pagination || null);
-      const pData = await pRes.json();
-      setPayments(pData.data || pData);
+      const fetches = [apiFetch(billUrl)];
+      if (isFirstPage) fetches.push(apiFetch(`${API_URL}/payments?limit=200`));
+      const results = await Promise.all(fetches);
+      const bData = await results[0].json();
+      const newBills = bData.data || bData;
+      setBills(prev => isFirstPage ? newBills : [...prev, ...newBills]);
+      const pg = bData.pagination;
+      setHasMore(pg ? pg.page < pg.totalPages : false);
+      if (isFirstPage && results[1]) {
+        const pData = await results[1].json();
+        setPayments(pData.data || pData);
+      }
     } catch (e) {
       console.error('Error loading transaction history:', e);
     }
     setLoading(false);
+    setLoadingMore(false);
   };
+
+  const loadMoreBills = useCallback(() => {
+    if (!loadingMore && hasMore) setBillPage(p => p + 1);
+  }, [loadingMore, hasMore]);
 
   const rows = bills.map(b => {
     const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
@@ -2836,7 +2861,7 @@ export function TransactionHistory() {
           <div className="btn-group" style={{margin:0}}>
             <button className="btn btn-secondary" onClick={handlePrintList} disabled={!filtered.length}>🖨️ Print / PDF</button>
             <button className="btn btn-secondary" onClick={handleExport} disabled={!filtered.length}>Export Excel</button>
-            <button className="btn btn-secondary" onClick={() => setOpen(true)} disabled={!rows.length}>View All ({billPagination ? billPagination.total : rows.length})</button>
+            <button className="btn btn-secondary" onClick={() => setOpen(true)} disabled={!rows.length}>View All ({rows.length})</button>
           </div>
         </div>
         <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'0.5rem'}}>
@@ -2861,9 +2886,9 @@ export function TransactionHistory() {
           </div>
           <div style={{display:'flex', gap:'0.4rem', alignItems:'center'}}>
             <input type="date" className="form-control" style={{width:'auto'}}
-              value={dateFilter} onChange={(e) => { setDateFilter(e.target.value); setBillPage(1); }} />
+              value={dateFilter} onChange={(e) => setDateFilter(e.target.value)} />
             {dateFilter && (
-              <button className="btn btn-secondary" onClick={() => { setDateFilter(''); setBillPage(1); }}>✕ Clear date</button>
+              <button className="btn btn-secondary" onClick={() => setDateFilter('')}>✕ Clear date</button>
             )}
           </div>
         </div>
@@ -2905,7 +2930,7 @@ export function TransactionHistory() {
                 ))}
               </tbody>
             </table>
-            <Pagination pagination={billPagination} onPageChange={(p) => setBillPage(p)} />
+            <InfiniteScroll hasMore={hasMore} loading={loadingMore} onLoadMore={loadMoreBills} />
           </div>
         )}
       </div>

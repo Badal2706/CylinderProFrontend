@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import { TransactionEntry, StepUpVerificationModal } from './components.jsx';
 import { CustomerDetail, Payments, CylinderInventory, CylinderAgingReport, TransactionHistory, Reports, PaymentForm, FillingListPage } from './pages.jsx';
@@ -300,6 +300,37 @@ export function Pagination({ pagination, onPageChange }) {
         <button className="btn btn-secondary" style={{padding:'0.25rem 0.5rem', fontSize:'0.8rem'}}
           disabled={page >= totalPages} onClick={() => onPageChange(page + 1)}>Next ›</button>
       </div>
+    </div>
+  );
+}
+
+// Debounce hook — delays updating a value until the caller stops changing it.
+export function useDebounce(value, delay = 300) {
+  const [debounced, setDebounced] = useState(value);
+  useEffect(() => {
+    const t = setTimeout(() => setDebounced(value), delay);
+    return () => clearTimeout(t);
+  }, [value, delay]);
+  return debounced;
+}
+
+// Infinite scroll sentinel — calls `onLoadMore` when scrolled into view.
+export function InfiniteScroll({ hasMore, loading, onLoadMore }) {
+  const ref = useRef(null);
+  useEffect(() => {
+    if (!hasMore || loading) return;
+    const el = ref.current;
+    if (!el) return;
+    const obs = new IntersectionObserver(([entry]) => {
+      if (entry.isIntersecting) onLoadMore();
+    }, { rootMargin: '200px' });
+    obs.observe(el);
+    return () => obs.disconnect();
+  }, [hasMore, loading, onLoadMore]);
+  return (
+    <div ref={ref} style={{ textAlign: 'center', padding: '1rem' }}>
+      {loading && <Spinner label="Loading more…" />}
+      {!hasMore && !loading && <span style={{ fontSize: '0.82rem', color: 'var(--text-muted)' }}>— End of list —</span>}
     </div>
   );
 }
@@ -899,11 +930,15 @@ export function downloadImportIssues(issues, baseName) {
 // Auth Page Component
 export function AuthPage({ onAuthSuccess, notice }) {
   const [mode, setMode] = useState('signin');
-  const [formData, setFormData] = useState({ name: '', email: '', password: '' });
-  // "Remember this device" (Phase 17): checked → 90-day device session; unchecked → 24h.
+  const [formData, setFormData] = useState({ name: '', email: '', password: '', developer_token: '' });
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
+  // 2FA / signup OTP verification state
+  const [otpStep, setOtpStep] = useState(false);
+  const [otpCode, setOtpCode] = useState('');
+  const [pendingToken, setPendingToken] = useState('');
+  const [otpEmail, setOtpEmail] = useState('');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -911,7 +946,7 @@ export function AuthPage({ onAuthSuccess, notice }) {
     setLoading(true);
     try {
       const body = mode === 'signup'
-        ? { name: formData.name, email: formData.email, password: formData.password, remember }
+        ? { name: formData.name, email: formData.email, password: formData.password, developer_token: formData.developer_token }
         : { email: formData.email, password: formData.password, remember };
 
       const res = await fetch(`${API_URL}/auth/${mode}`, {
@@ -923,6 +958,11 @@ export function AuthPage({ onAuthSuccess, notice }) {
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || 'Something went wrong');
+      } else if (data.requires_2fa || data.requires_otp) {
+        setPendingToken(data.pending_token);
+        setOtpEmail(data.gatekeeper_email || data.email);
+        setOtpStep(true);
+        setOtpCode('');
       } else {
         onAuthSuccess(data);
       }
@@ -932,9 +972,39 @@ export function AuthPage({ onAuthSuccess, notice }) {
     setLoading(false);
   };
 
+  const handleOtpSubmit = async (e) => {
+    e.preventDefault();
+    setError('');
+    setLoading(true);
+    try {
+      const endpoint = mode === 'signin'
+        ? `${API_URL}/auth/signin/verify-2fa`
+        : `${API_URL}/auth/signup/confirm`;
+      const body = { pending_token: pendingToken, code: otpCode, remember };
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        setError(data.error || 'Verification failed');
+      } else {
+        onAuthSuccess(data);
+      }
+    } catch {
+      setError('Network error');
+    }
+    setLoading(false);
+  };
+
   const switchMode = () => {
     setMode(mode === 'signin' ? 'signup' : 'signin');
     setError('');
+    setOtpStep(false);
+    setOtpCode('');
+    setPendingToken('');
   };
 
   return (
@@ -952,65 +1022,124 @@ export function AuthPage({ onAuthSuccess, notice }) {
           <button
             type="button"
             className={`auth-tab ${mode === 'signin' ? 'active' : ''}`}
-            onClick={() => { setMode('signin'); setError(''); }}
+            onClick={() => { setMode('signin'); setError(''); setOtpStep(false); }}
           >Sign In</button>
           <button
             type="button"
             className={`auth-tab ${mode === 'signup' ? 'active' : ''}`}
-            onClick={() => { setMode('signup'); setError(''); }}
+            onClick={() => { setMode('signup'); setError(''); setOtpStep(false); }}
           >Sign Up</button>
         </div>
 
-        <form onSubmit={handleSubmit} className="auth-form">
-          {mode === 'signup' && (
+        {otpStep ? (
+          <form onSubmit={handleOtpSubmit} className="auth-form">
+            <div style={{textAlign:'center', marginBottom:'1rem'}}>
+              <div style={{fontSize:'2rem', marginBottom:'0.5rem'}}>🔐</div>
+              <p style={{fontSize:'0.9rem', color:'var(--text-muted)'}}>
+                {mode === 'signin'
+                  ? `Enter the 6-digit code sent to your email (${otpEmail})`
+                  : `Enter the 6-digit approval code sent to the administrator (${otpEmail})`}
+              </p>
+            </div>
             <div className="form-group">
-              <label>Full Name</label>
+              <label>Verification Code</label>
               <input
                 type="text"
                 className="form-control"
-                value={formData.name}
-                onChange={(e) => setFormData({...formData, name: e.target.value})}
-                placeholder="Your full name"
+                value={otpCode}
+                onChange={(e) => setOtpCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+                placeholder="••••••"
+                maxLength={6}
+                autoFocus
+                style={{textAlign:'center', fontSize:'1.5rem', letterSpacing:'0.5rem'}}
                 required
               />
             </div>
-          )}
 
-          <div className="form-group">
-            <label>Email</label>
-            <input
-              type="email"
-              className="form-control"
-              value={formData.email}
-              onChange={(e) => setFormData({...formData, email: e.target.value})}
-              placeholder="your@email.com"
-              required
-            />
-          </div>
+            {mode === 'signin' && (
+              <label style={{display:'flex', alignItems:'center', gap:'0.5rem', fontSize:'0.85rem', marginBottom:'1rem', cursor:'pointer'}}>
+                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+                Remember this device for 3 months
+              </label>
+            )}
 
-          <div className="form-group">
-            <label>Password</label>
-            <input
-              type="password"
-              className="form-control"
-              value={formData.password}
-              onChange={(e) => setFormData({...formData, password: e.target.value})}
-              placeholder={mode === 'signup' ? 'Minimum 8 characters' : 'Your password'}
-              required
-            />
-          </div>
+            {error && <div className="alert alert-danger" style={{marginBottom:'1rem'}}>{error}</div>}
 
-          <label style={{display:'flex', alignItems:'center', gap:'0.5rem', fontSize:'0.85rem', marginBottom:'1rem', cursor:'pointer'}}>
-            <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
-            Remember this device for 3 months
-          </label>
+            <button type="submit" className="btn btn-primary auth-submit" disabled={loading || otpCode.length !== 6}>
+              {loading ? 'Verifying...' : 'Verify & Continue'}
+            </button>
+            <button type="button" className="link-btn" style={{marginTop:'0.75rem', display:'block', textAlign:'center', width:'100%'}}
+              onClick={() => { setOtpStep(false); setError(''); }}>
+              ← Back to {mode === 'signin' ? 'Sign In' : 'Sign Up'}
+            </button>
+          </form>
+        ) : (
+          <form onSubmit={handleSubmit} className="auth-form">
+            {mode === 'signup' && (
+              <>
+                <div className="form-group">
+                  <label>Developer Token</label>
+                  <input
+                    type="text"
+                    className="form-control"
+                    value={formData.developer_token}
+                    onChange={(e) => setFormData({...formData, developer_token: e.target.value})}
+                    placeholder="Enter developer access token"
+                    required
+                  />
+                </div>
+                <div className="form-group">
+                  <label>Full Name</label>
+                  <input
+                    type="text"
+                    className="form-control"
+                    value={formData.name}
+                    onChange={(e) => setFormData({...formData, name: e.target.value})}
+                    placeholder="Your full name"
+                    required
+                  />
+                </div>
+              </>
+            )}
 
-          {error && <div className="alert alert-danger" style={{marginBottom: '1rem'}}>{error}</div>}
+            <div className="form-group">
+              <label>Email</label>
+              <input
+                type="email"
+                className="form-control"
+                value={formData.email}
+                onChange={(e) => setFormData({...formData, email: e.target.value})}
+                placeholder="your@email.com"
+                required
+              />
+            </div>
 
-          <button type="submit" className="btn btn-primary auth-submit" disabled={loading}>
-            {loading ? 'Please wait...' : (mode === 'signin' ? 'Sign In' : 'Create Account')}
-          </button>
-        </form>
+            <div className="form-group">
+              <label>Password</label>
+              <input
+                type="password"
+                className="form-control"
+                value={formData.password}
+                onChange={(e) => setFormData({...formData, password: e.target.value})}
+                placeholder={mode === 'signup' ? 'Minimum 8 characters' : 'Your password'}
+                required
+              />
+            </div>
+
+            {mode === 'signin' && (
+              <label style={{display:'flex', alignItems:'center', gap:'0.5rem', fontSize:'0.85rem', marginBottom:'1rem', cursor:'pointer'}}>
+                <input type="checkbox" checked={remember} onChange={(e) => setRemember(e.target.checked)} />
+                Remember this device for 3 months
+              </label>
+            )}
+
+            {error && <div className="alert alert-danger" style={{marginBottom: '1rem'}}>{error}</div>}
+
+            <button type="submit" className="btn btn-primary auth-submit" disabled={loading}>
+              {loading ? 'Please wait...' : (mode === 'signin' ? 'Sign In' : 'Create Account')}
+            </button>
+          </form>
+        )}
 
         <p className="auth-switch">
           {mode === 'signin' ? "Don't have an account? " : "Already have an account? "}
@@ -2111,33 +2240,42 @@ export function Dashboard({ onNavigate }) {
 // Customer Master Component
 export function CustomerMaster({ onNavigate, onSelectCustomer }) {
   const [customers, setCustomers] = useState([]);
-  const [custPagination, setCustPagination] = useState(null);
+  const [hasMore, setHasMore] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
+  const debouncedSearch = useDebounce(searchTerm, 300);
   const [statusFilter, setStatusFilter] = useState('');
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [custPage, setCustPage] = useState(1);
 
-  useEffect(() => {
-    fetchCustomers();
-  }, [searchTerm, statusFilter, custPage]);
+  useEffect(() => { setCustPage(1); setCustomers([]); setHasMore(true); }, [debouncedSearch, statusFilter]);
+  useEffect(() => { fetchCustomers(); }, [debouncedSearch, statusFilter, custPage]);
 
   const fetchCustomers = async () => {
+    const isFirstPage = custPage === 1;
+    if (isFirstPage) setLoading(true); else setLoadingMore(true);
     try {
       let url = `${API_URL}/customers?page=${custPage}&limit=50&`;
-      if (searchTerm) url += `search=${encodeURIComponent(searchTerm)}&`;
+      if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
       if (statusFilter) url += `status=${statusFilter}`;
 
       const response = await apiFetch(url);
       const result = await response.json();
-      setCustomers(result.data || result);
-      setCustPagination(result.pagination || null);
-      setLoading(false);
+      const newData = result.data || result;
+      setCustomers(prev => isFirstPage ? newData : [...prev, ...newData]);
+      const pg = result.pagination;
+      setHasMore(pg ? pg.page < pg.totalPages : false);
     } catch (error) {
       console.error('Error fetching customers:', error);
-      setLoading(false);
     }
+    setLoading(false);
+    setLoadingMore(false);
   };
+
+  const loadMoreCust = useCallback(() => {
+    if (!loadingMore && hasMore) setCustPage(p => p + 1);
+  }, [loadingMore, hasMore]);
 
   const [custVisible, custMore, custOpen, setCustOpen] = useViewAll(customers, 10);
 
@@ -2189,7 +2327,7 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
             type="text"
             placeholder="Search by name, contact, or GST..."
             value={searchTerm}
-            onChange={(e) => { setSearchTerm(e.target.value); setCustPage(1); }}
+            onChange={(e) => setSearchTerm(e.target.value)}
             className="form-control"
           />
         </div>
@@ -2197,23 +2335,23 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
         <div className="btn-group">
           <button
             className={`btn ${statusFilter === '' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => { setStatusFilter(''); setCustPage(1); }}
+            onClick={() => setStatusFilter('')}
           >All</button>
           <button
             className={`btn ${statusFilter === 'ACTIVE' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => { setStatusFilter('ACTIVE'); setCustPage(1); }}
+            onClick={() => setStatusFilter('ACTIVE')}
           >Active</button>
           <button
             className={`btn ${statusFilter === 'OVER_LIMIT' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => { setStatusFilter('OVER_LIMIT'); setCustPage(1); }}
+            onClick={() => setStatusFilter('OVER_LIMIT')}
           >Over Limit</button>
           <button
             className={`btn ${statusFilter === 'ZERO_BALANCE' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => { setStatusFilter('ZERO_BALANCE'); setCustPage(1); }}
+            onClick={() => setStatusFilter('ZERO_BALANCE')}
           >Zero Balance</button>
           <button
             className={`btn ${statusFilter === 'FILLING_VENDOR' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => { setStatusFilter('FILLING_VENDOR'); setCustPage(1); }}
+            onClick={() => setStatusFilter('FILLING_VENDOR')}
           >🏭 Filling Vendor</button>
         </div>
 
@@ -2279,7 +2417,7 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
             </tbody>
           </table>
           {custMore && <ViewAllButton count={customers.length} onClick={() => setCustOpen(true)} />}
-          <Pagination pagination={custPagination} onPageChange={(p) => setCustPage(p)} />
+          <InfiniteScroll hasMore={hasMore} loading={loadingMore} onLoadMore={loadMoreCust} />
         </div>
         )}
       </div>
