@@ -314,6 +314,363 @@ export function useDebounce(value, delay = 300) {
   return debounced;
 }
 
+// Fetch every page of a paginated list endpoint and return the full array.
+//
+// Phase 24: the New Transaction form's cylinder and customer pickers used to request a single
+// `?limit=200` page and then filter it in the browser. The server clamps limit to 200, so the
+// cylinder picker only ever saw rotational numbers 1–200 out of 2,965 — a cylinder like 7617783
+// was IN_STOCK at the right plant and still reported "no matching available cylinders", and 195
+// of 395 customers were invisible to the customer picker. Both pickers now get the whole set,
+// which keeps their existing client-side filters (and the strict location/stock-state rules
+// they encode) working against complete data.
+export async function fetchAllPages(baseUrl, { pageSize = 200 } = {}) {
+  const join = baseUrl.includes('?') ? '&' : '?';
+  const first = await apiFetch(`${baseUrl}${join}page=1&limit=${pageSize}`);
+  const { ok, rows, pagination, error } = await readListResponse(first);
+  if (!ok) { showToast(error); return []; }
+  const totalPages = pagination ? pagination.totalPages : 1;
+  if (totalPages <= 1) return rows;
+
+  const rest = await Promise.all(
+    Array.from({ length: totalPages - 1 }, (_, i) =>
+      apiFetch(`${baseUrl}${join}page=${i + 2}&limit=${pageSize}`).then(readListResponse)
+    )
+  );
+  const all = [...rows];
+  for (const r of rest) {
+    if (!r.ok) { showToast(r.error); break; }
+    all.push(...r.rows);
+  }
+  return all;
+}
+
+// ─── Phase 26: prove control of the new inbox before the email is saved ───
+// Nothing has been written to the account at this point. Cancelling, failing, or letting the
+// code expire leaves the old email — and the existing authenticator — completely untouched.
+export function VerifyNewEmailModal({ pending, onCancel, onVerified }) {
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const submit = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    try {
+      const res = await apiFetch(`${API_URL}/profile/email-change/verify`, {
+        method: 'POST',
+        body: JSON.stringify({ pending_token: pending.pending_token, code })
+      });
+      if (!res.ok) { setErr(await apiErrorMessage(res, 'That code did not match.')); return; }
+      onVerified(await res.json());
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <Modal title="Verify your new email" onClose={onCancel}>
+      <p style={{ marginTop: 0, fontSize: '0.9rem' }}>
+        We sent a 6-digit code to <strong>{pending.pending_email}</strong>. Enter it to confirm you
+        can receive mail there.
+      </p>
+      <div className="alert" style={{ fontSize: '0.82rem' }}>
+        Your account email has <strong>not</strong> changed yet. If you cancel or the code expires,
+        your current email and authenticator stay exactly as they are.
+      </div>
+      <form onSubmit={submit}>
+        <input className="form-control" inputMode="numeric" maxLength={6} placeholder="6-digit code"
+          value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))} autoFocus />
+        {err && <div className="alert alert-danger" style={{ marginTop: '0.5rem' }}>{err}</div>}
+        <div className="modal-actions" style={{ marginTop: '0.9rem' }}>
+          <button type="button" className="btn btn-secondary" onClick={onCancel} disabled={busy}>Cancel</button>
+          <button type="submit" className="btn btn-primary" disabled={busy || code.length !== 6}>
+            {busy ? 'Verifying…' : 'Verify and save email'}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// ─── Phase 25: authenticator rotation after an account email change ───
+// Shown immediately after the save. The user's EXISTING authenticator code keeps working the
+// whole time — confirming here is what switches it over, so closing this dialog is safe and
+// leaves 2FA fully intact (it just re-offers the rotation later).
+export function TotpRotationModal({ rotation, onDone }) {
+  const [code, setCode] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState('');
+
+  const confirm = async (e) => {
+    e.preventDefault();
+    setBusy(true); setErr('');
+    try {
+      const res = await apiFetch(`${API_URL}/trusted-people/${rotation.person_id}/totp/rotation/confirm`, {
+        method: 'POST', body: JSON.stringify({ code })
+      });
+      if (!res.ok) { setErr(await apiErrorMessage(res, 'That code did not match.')); return; }
+      const data = await res.json();
+      showToast(data.message, 'success');
+      window.dispatchEvent(new CustomEvent('trusted-people-refresh'));
+      onDone();
+    } finally { setBusy(false); }
+  };
+
+  const later = async () => {
+    // Discard the pending secret so a half-finished rotation can't linger. The working secret
+    // is untouched, so the user's current authenticator continues to function.
+    try {
+      await apiFetch(`${API_URL}/trusted-people/${rotation.person_id}/totp/rotation/cancel`, { method: 'POST' });
+    } catch {}
+    onDone();
+  };
+
+  return (
+    <Modal title="Update your authenticator" onClose={later}>
+      <p style={{ marginTop: 0, fontSize: '0.9rem' }}>
+        Your account email is now <strong>{rotation.email}</strong>. Scan this new QR code in your
+        authenticator app, then enter a code from it to switch over.
+      </p>
+      <div style={{ textAlign: 'center', margin: '0.75rem 0' }}>
+        <img src={rotation.qr} alt="New authenticator QR code" style={{ width: 190, height: 190 }} />
+        <div style={{ fontSize: '0.72rem', color: 'var(--text-muted)', wordBreak: 'break-all', marginTop: '0.4rem' }}>
+          Can't scan? Enter this key manually: <code>{rotation.secret}</code>
+        </div>
+      </div>
+      {rotation.had_previous && (
+        <div className="alert" style={{ fontSize: '0.82rem' }}>
+          Your <strong>existing</strong> authenticator code still works until you confirm below —
+          your account is never left without 2FA.
+        </div>
+      )}
+      <form onSubmit={confirm}>
+        <input className="form-control" inputMode="numeric" maxLength={6} placeholder="6-digit code"
+          value={code} onChange={(e) => setCode(e.target.value.replace(/\D/g, ''))} autoFocus />
+        {err && <div className="alert alert-danger" style={{ marginTop: '0.5rem' }}>{err}</div>}
+        <div className="modal-actions" style={{ marginTop: '0.9rem' }}>
+          <button type="button" className="btn btn-secondary" onClick={later} disabled={busy}>
+            Not now (keep current code)
+          </button>
+          <button type="submit" className="btn btn-primary" disabled={busy || code.length !== 6}>
+            {busy ? 'Verifying…' : 'Confirm new authenticator'}
+          </button>
+        </div>
+      </form>
+    </Modal>
+  );
+}
+
+// Today's date as YYYY-MM-DD in local time (the date filters compare local calendar days).
+export function todayISO() {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+// ─── Phase 25: the two dashboard charts ───
+// Hand-rolled inline SVG rather than a charting library: the bundle is already 936 kB and one
+// stacked bar plus one donut is far less code than the smallest chart dependency. Both read
+// from /api/dashboard/cylinder-stock, which the dashboard already fetches — no extra request.
+const GAS_COLORS = ['#2563EB', '#0891B2', '#7C3AED', '#DB2777', '#EA580C', '#16A34A', '#CA8A04', '#64748B'];
+
+function StackedLocationBar({ byLocationState, onNavigate }) {
+  const locs = LOCATIONS.filter(l => byLocationState && byLocationState[l]);
+  if (!locs.length) return <EmptyState icon="📍" message="No cylinders to chart yet" />;
+  const max = Math.max(...locs.map(l => (byLocationState[l].IN_STOCK || 0) + (byLocationState[l].AT_CUSTOMER || 0)), 1);
+
+  return (
+    <div>
+      <div style={{ display: 'flex', gap: '1rem', fontSize: '0.78rem', marginBottom: '0.75rem' }}>
+        <span><span style={{ display: 'inline-block', width: 10, height: 10, background: '#2563EB', borderRadius: 2, marginRight: 5 }} />In Stock</span>
+        <span><span style={{ display: 'inline-block', width: 10, height: 10, background: '#F59E0B', borderRadius: 2, marginRight: 5 }} />At Customer</span>
+      </div>
+      <div style={{ display: 'grid', gap: '0.85rem' }}>
+        {locs.map(loc => {
+          const inStock = byLocationState[loc].IN_STOCK || 0;
+          const atCust = byLocationState[loc].AT_CUSTOMER || 0;
+          const total = inStock + atCust;
+          return (
+            <div key={loc}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.8rem', marginBottom: '0.25rem' }}>
+                <span>{LOCATION_LABELS[loc]}</span>
+                <span style={{ color: 'var(--text-muted)' }}>{total.toLocaleString()}</span>
+              </div>
+              <div style={{ display: 'flex', height: 22, borderRadius: 4, overflow: 'hidden', background: 'var(--bg, #f1f5f9)' }}>
+                <div title={`In stock: ${inStock}`} onClick={() => onNavigate('cylinders', { locFilters: [loc], stateFilters: ['IN_STOCK'] })}
+                  style={{ width: `${(inStock / max) * 100}%`, background: '#2563EB', cursor: 'pointer' }} />
+                <div title={`At customer: ${atCust}`} onClick={() => onNavigate('cylinders', { locFilters: [loc], stateFilters: ['AT_CUSTOMER'] })}
+                  style={{ width: `${(atCust / max) * 100}%`, background: '#F59E0B', cursor: 'pointer' }} />
+              </div>
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function GasTypeDonut({ byGasType, onNavigate }) {
+  const data = (byGasType || []).filter(d => d.count > 0);
+  if (!data.length) return <EmptyState icon="⛽" message="No cylinders to chart yet" />;
+  const total = data.reduce((s, d) => s + d.count, 0);
+
+  // Donut drawn with stroke-dasharray on concentric circles — no path maths, no library.
+  const R = 60, C = 2 * Math.PI * R;
+  let offset = 0;
+
+  return (
+    <div style={{ display: 'flex', gap: '1.5rem', alignItems: 'center', flexWrap: 'wrap' }}>
+      <svg width="150" height="150" viewBox="0 0 150 150" role="img" aria-label="Cylinders by gas type">
+        <g transform="rotate(-90 75 75)">
+          {data.map((d, i) => {
+            const len = (d.count / total) * C;
+            const el = (
+              <circle key={d.gas_type} cx="75" cy="75" r={R} fill="none"
+                stroke={GAS_COLORS[i % GAS_COLORS.length]} strokeWidth="26"
+                strokeDasharray={`${len} ${C - len}`} strokeDashoffset={-offset}>
+                <title>{`${d.gas_type}: ${d.count} (${((d.count / total) * 100).toFixed(1)}%)`}</title>
+              </circle>
+            );
+            offset += len;
+            return el;
+          })}
+        </g>
+        <text x="75" y="71" textAnchor="middle" style={{ fontSize: '1.15rem', fontWeight: 700, fill: 'var(--text)' }}>
+          {total.toLocaleString()}
+        </text>
+        <text x="75" y="88" textAnchor="middle" style={{ fontSize: '0.62rem', fill: 'var(--text-muted)' }}>cylinders</text>
+      </svg>
+      <div style={{ display: 'grid', gap: '0.3rem', fontSize: '0.8rem', flex: 1, minWidth: 160 }}>
+        {data.map((d, i) => (
+          <div key={d.gas_type} onClick={() => onNavigate('cylinders', { searchTerm: d.gas_type })}
+            style={{ display: 'flex', justifyContent: 'space-between', cursor: 'pointer' }}
+            title={`Show ${d.gas_type} cylinders`}>
+            <span>
+              <span style={{ display: 'inline-block', width: 10, height: 10, borderRadius: 2, marginRight: 6, background: GAS_COLORS[i % GAS_COLORS.length] }} />
+              {d.gas_type}
+            </span>
+            <span style={{ color: 'var(--text-muted)' }}>
+              {d.count.toLocaleString()} · {((d.count / total) * 100).toFixed(0)}%
+            </span>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Phase 26: returns the two chart tiles as bare siblings (not wrapped in their own grid) so
+// they sit in the SAME bento grid as the KPI tiles. Keeping them in a separate grid was what
+// left a dead band between the two sections.
+export function DashboardCharts({ stock, onNavigate }) {
+  return (
+    <>
+      <div className="card bento-chart">
+        <h2>Cylinders by Location</h2>
+        <StackedLocationBar byLocationState={stock?.byLocationState} onNavigate={onNavigate} />
+      </div>
+      <div className="card bento-chart">
+        <h2>Cylinders by Gas Type</h2>
+        <GasTypeDonut byGasType={stock?.byGasType} onNavigate={onNavigate} />
+      </div>
+    </>
+  );
+}
+
+// ─── Phase 24: initial batch + "View All (N)" + background batch-load ───
+// Replaces infinite scroll on the big lists. Loads INITIAL_BATCH rows up front, reports the
+// true server-side total, and only fetches the rest when the user asks for it.
+//
+// Two deliberate choices:
+//  * Search/filter is always sent to the server (via buildUrl), never applied to the loaded
+//    slice — otherwise searching before "View All" would silently miss most of the dataset.
+//  * The background pass re-reads from page 1 at BACKGROUND_BATCH (the server's max limit)
+//    rather than continuing at 50. 2,965 cylinders is 60 requests at 50/page, which alone
+//    exceeds the 100 req/min limiter; at 200/page it is 15. Rows are appended in the same sort
+//    order, so the already-visible rows keep their position and the scrollbar does not jump.
+export const INITIAL_BATCH = 50;
+const BACKGROUND_BATCH = 200; // server clamps `limit` to 200 (utils/paginate.js)
+
+export function useBatchList(buildUrl, deps) {
+  const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadingAll, setLoadingAll] = useState(false);
+  const [loadedAll, setLoadedAll] = useState(false);
+
+  const buildRef = useRef(buildUrl);
+  buildRef.current = buildUrl;              // always call the latest closure, never a stale one
+  const reqRef = useRef(0);                 // guards against out-of-order responses
+  const key = JSON.stringify(deps);
+
+  const loadFirst = useCallback(async () => {
+    const reqId = ++reqRef.current;
+    setLoading(true); setLoadingAll(false); setLoadedAll(false);
+    try {
+      const res = await apiFetch(buildRef.current(1, INITIAL_BATCH));
+      const { ok, rows: got, pagination, error } = await readListResponse(res);
+      if (reqId !== reqRef.current) return;
+      if (!ok) { showToast(error); setRows([]); setTotal(0); setLoadedAll(true); }
+      else {
+        setRows(got);
+        setTotal(pagination ? pagination.total : got.length);
+        setLoadedAll(!pagination || pagination.total <= got.length);
+      }
+    } catch (e) {
+      console.error('List load failed:', e);
+      setRows([]); setLoadedAll(true);
+    }
+    setLoading(false);
+  }, []);
+
+  useEffect(() => { loadFirst(); }, [key, loadFirst]);
+
+  const loadAll = useCallback(async () => {
+    const reqId = reqRef.current;           // pin to the filter state we started from
+    setLoadingAll(true);
+    const acc = [];
+    try {
+      const pages = Math.ceil(total / BACKGROUND_BATCH) || 1;
+      for (let p = 1; p <= pages; p++) {
+        const res = await apiFetch(buildRef.current(p, BACKGROUND_BATCH));
+        const { ok, rows: got, error } = await readListResponse(res);
+        if (reqId !== reqRef.current) return; // filters changed mid-load — abandon quietly
+        if (!ok) { showToast(error); break; }
+        acc.push(...got);
+        setRows([...acc]);                  // grow in place; earlier rows keep their index
+        if (got.length < BACKGROUND_BATCH) break;
+      }
+      if (reqId === reqRef.current) setLoadedAll(true);
+    } catch (e) {
+      console.error('Background list load failed:', e);
+    }
+    if (reqId === reqRef.current) setLoadingAll(false);
+  }, [total]);
+
+  return { rows, total, loading, loadingAll, loadedAll, loadAll, reload: loadFirst };
+}
+
+// The "View All (N)" footer for a useBatchList-backed table.
+export function BatchListFooter({ shown, total, loadedAll, loadingAll, onLoadAll, noun = 'records' }) {
+  if (loadingAll) {
+    return <div style={{ textAlign: 'center', padding: '1rem' }}>
+      <Spinner label={`Loading all ${total.toLocaleString()} ${noun}… (${shown.toLocaleString()} so far)`} />
+    </div>;
+  }
+  if (loadedAll || shown >= total) {
+    return <div style={{ textAlign: 'center', padding: '1rem', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
+      — showing all {shown.toLocaleString()} {noun} —
+    </div>;
+  }
+  return (
+    <div style={{ textAlign: 'center', padding: '1rem' }}>
+      <button className="btn btn-secondary" onClick={onLoadAll}>
+        View All ({total.toLocaleString()}) →
+      </button>
+      <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.35rem' }}>
+        Showing first {shown.toLocaleString()} of {total.toLocaleString()}. Search covers all {total.toLocaleString()}.
+      </div>
+    </div>
+  );
+}
+
 // Infinite scroll sentinel — calls `onLoadMore` when scrolled into view.
 export function InfiniteScroll({ hasMore, loading, onLoadMore }) {
   const ref = useRef(null);
@@ -447,6 +804,24 @@ export async function apiErrorMessage(res, fallback = 'Something went wrong. Ple
   } catch {
     return fallback;
   }
+}
+
+// Read a paginated list endpoint's response safely. Returns rows as an ARRAY always —
+// on a non-2xx the body is an error object ({error: "Too many requests…"} for a 429), and
+// callers spread the result into their list, so returning it raw throws "x is not iterable"
+// and takes the whole page down via the error boundary.
+export async function readListResponse(res, fallback = 'Could not load this list. Please try again.') {
+  let body = null;
+  try { body = await res.json(); } catch { /* empty or non-JSON body */ }
+  if (!res.ok) {
+    const error = (body && body.error) || (res.status === 429
+      ? 'Loading too fast — please wait a moment and try again.'
+      : fallback);
+    return { ok: false, rows: [], pagination: null, error };
+  }
+  const rows = Array.isArray(body) ? body
+    : (Array.isArray(body && body.data) ? body.data : []);
+  return { ok: true, rows, pagination: (body && body.pagination) || null, error: null };
 }
 
 // ─── Shared context-aware file-name helpers (print PDFs + Excel/ZIP exports) ───
@@ -1462,6 +1837,7 @@ export function App() {
     try { return JSON.parse(localStorage.getItem('currentUser')); } catch { return null; }
   });
   const [currentPage, setCurrentPage] = useState('dashboard');
+  const [navFilter, setNavFilter] = useState(null); // one-shot filter handed to the next page
   const [sidebarOpen, setSidebarOpen] = useState(false);
   const [selectedCustomerId, setSelectedCustomerId] = useState(null);
   const [authNotice, setAuthNotice] = useState('');
@@ -1512,12 +1888,22 @@ export function App() {
     );
   }
 
+  // Phase 25: KPI cards navigate AND pre-apply a filter. onNavigate stays backwards compatible —
+  // called with one argument it behaves exactly as before; the optional second argument is
+  // consumed once by the destination page and then cleared, so it does not stick on the next visit.
+  const navigateWithFilter = (page, filter = null) => {
+    setNavFilter(filter);
+    setCurrentPage(page);
+  };
+  const consumeNavFilter = () => { const f = navFilter; setNavFilter(null); return f; };
+
   const renderPage = () => {
     switch (currentPage) {
       case 'dashboard':
-        return <Dashboard onNavigate={setCurrentPage} />;
+        return <Dashboard onNavigate={navigateWithFilter} />;
       case 'customers':
-        return <CustomerMaster onNavigate={setCurrentPage} onSelectCustomer={setSelectedCustomerId} />;
+        return <CustomerMaster onNavigate={setCurrentPage} onSelectCustomer={setSelectedCustomerId}
+          initialFilter={navFilter} onFilterConsumed={consumeNavFilter} />;
       case 'customer-detail':
         return <CustomerDetail customerId={selectedCustomerId} scrollTo={customerScrollTo} onBack={() => setCurrentPage('customers')} onSelectCustomer={openCustomer} />;
       case 'new-transaction':
@@ -1530,11 +1916,12 @@ export function App() {
       case 'outstanding':
         return <OutstandingReceivables onNavigate={setCurrentPage} onSelectCustomer={setSelectedCustomerId} />;
       case 'cylinders':
-        return <CylinderInventory onViewCustomer={(id) => openCustomer(id, 'currently-holding')} />;
+        return <CylinderInventory onViewCustomer={(id) => openCustomer(id, 'currently-holding')}
+          initialFilter={navFilter} onFilterConsumed={consumeNavFilter} />;
       case 'aging-report':
         return <CylinderAgingReport onViewCustomer={(id) => openCustomer(id, 'aging-history')} />;
       case 'transactions':
-        return <TransactionHistory />;
+        return <TransactionHistory initialFilter={navFilter} onFilterConsumed={consumeNavFilter} />;
       case 'filling-list':
         return <FillingListPage />;
       case 'reports':
@@ -2113,52 +2500,68 @@ export function Dashboard({ onNavigate }) {
     return <Spinner label="Loading dashboard…" />;
   }
 
+  // Phase 25: every card becomes a click-through. Content, colour, icon and layout are
+  // unchanged — the only additions are cursor/role/keyboard affordances, so the cards look
+  // exactly as before. No trend indicators, no sparklines.
+  const cardProps = (label, go) => ({
+    className: undefined, // set by caller
+    role: 'button',
+    tabIndex: 0,
+    title: label,
+    style: { cursor: 'pointer' },
+    onClick: go,
+    onKeyDown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); go(); } }
+  });
+
   return (
     <div>
-      <div className="stats-grid">
-        <div className="stat-card green">
+      {/* Phase 26: bento layout. Tile order, content, values, icons and click-through targets
+          are exactly as Phase 25 left them — only the grid placement classes are new.
+          4 cols: [4 KPIs] / [2 KPIs + in-stock×2] / [chart×2 + chart×2]. */}
+      <div className="bento-grid">
+        <div {...cardProps('View outstanding receivables', () => onNavigate('outstanding'))} className="stat-card green">
           <div className="stat-icon">💸</div>
           <div className="stat-body">
             <h3>Outstanding</h3>
             <div className="value">₹{(stats?.total_outstanding || 0).toFixed(0)}</div>
           </div>
         </div>
-        <div className="stat-card blue">
+        <div {...cardProps('View all customers', () => onNavigate('customers'))} className="stat-card blue">
           <div className="stat-icon">👥</div>
           <div className="stat-body">
             <h3>Customers</h3>
             <div className="value">{stats?.total_customers || 0}</div>
           </div>
         </div>
-        <div className="stat-card orange">
+        <div {...cardProps('View cylinders at customers', () => onNavigate('cylinders', { stateFilters: ['AT_CUSTOMER'] }))} className="stat-card orange">
           <div className="stat-icon">🔵</div>
           <div className="stat-body">
             <h3>Cylinders Out</h3>
             <div className="value">{stats?.total_cylinders_out || 0}</div>
           </div>
         </div>
-        <div className="stat-card purple">
+        <div {...cardProps('View customers over their holding limit', () => onNavigate('customers', { statusFilter: 'OVER_LIMIT' }))} className="stat-card purple">
           <div className="stat-icon">⚠️</div>
           <div className="stat-body">
             <h3>Over Limit</h3>
             <div className="value">{overLimitCustomers.length}</div>
           </div>
         </div>
-        <div className="stat-card green">
+        <div {...cardProps("View today's transactions", () => onNavigate('transactions', { dateFilter: todayISO() }))} className="stat-card green">
           <div className="stat-icon">📋</div>
           <div className="stat-body">
             <h3>Today's Bills</h3>
             <div className="value">{stats?.today_transactions || 0}</div>
           </div>
         </div>
-        <div className="stat-card blue">
+        <div {...cardProps('View customers and their deposits', () => onNavigate('customers'))} className="stat-card blue">
           <div className="stat-icon">🏦</div>
           <div className="stat-body">
             <h3>Security Deposit</h3>
             <div className="value">₹{(stats?.total_security_deposit || 0).toFixed(0)}</div>
           </div>
         </div>
-        <div className="stat-card green">
+        <div {...cardProps('View cylinders in stock', () => onNavigate('cylinders', { stateFilters: ['IN_STOCK'] }))} className="stat-card green bento-wide">
           <div className="stat-icon">🏭</div>
           <div className="stat-body">
             <h3>Cylinders in Stock</h3>
@@ -2168,6 +2571,8 @@ export function Dashboard({ onNavigate }) {
             </div>
           </div>
         </div>
+
+        <DashboardCharts stock={cylinderStock} onNavigate={onNavigate} />
       </div>
 
       <div className="card">
@@ -2238,46 +2643,43 @@ export function Dashboard({ onNavigate }) {
 }
 
 // Customer Master Component
-export function CustomerMaster({ onNavigate, onSelectCustomer }) {
-  const [customers, setCustomers] = useState([]);
-  const [hasMore, setHasMore] = useState(true);
+export function CustomerMaster({ onNavigate, onSelectCustomer, initialFilter = null, onFilterConsumed }) {
   const [showForm, setShowForm] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
+  const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
   const debouncedSearch = useDebounce(searchTerm, 300);
-  const [statusFilter, setStatusFilter] = useState('');
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [custPage, setCustPage] = useState(1);
+  // Seeded from a dashboard KPI click, then cleared so it does not reapply on the next visit.
+  const [statusFilter, setStatusFilter] = useState(initialFilter?.statusFilter || '');
+  useEffect(() => { if (initialFilter && onFilterConsumed) onFilterConsumed(); }, []);
 
-  useEffect(() => { setCustPage(1); setCustomers([]); setHasMore(true); }, [debouncedSearch, statusFilter]);
-  useEffect(() => { fetchCustomers(); }, [debouncedSearch, statusFilter, custPage]);
-
-  const fetchCustomers = async () => {
-    const isFirstPage = custPage === 1;
-    if (isFirstPage) setLoading(true); else setLoadingMore(true);
-    try {
-      let url = `${API_URL}/customers?page=${custPage}&limit=50&`;
-      if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
-      if (statusFilter) url += `status=${statusFilter}`;
-
-      const response = await apiFetch(url);
-      const result = await response.json();
-      const newData = result.data || result;
-      setCustomers(prev => isFirstPage ? newData : [...prev, ...newData]);
-      const pg = result.pagination;
-      setHasMore(pg ? pg.page < pg.totalPages : false);
-    } catch (error) {
-      console.error('Error fetching customers:', error);
-    }
-    setLoading(false);
-    setLoadingMore(false);
+  // Search and status are sent to the server, so they always match against all customers —
+  // not just the batch currently on screen.
+  const buildUrl = (page, limit) => {
+    let url = `${API_URL}/customers?page=${page}&limit=${limit}&`;
+    if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
+    if (statusFilter) url += `status=${statusFilter}`;
+    return url;
   };
+  const {
+    rows: customers, total, loading, loadingAll, loadedAll, loadAll, reload: fetchCustomers
+  } = useBatchList(buildUrl, [debouncedSearch, statusFilter]);
 
-  const loadMoreCust = useCallback(() => {
-    if (!loadingMore && hasMore) setCustPage(p => p + 1);
-  }, [loadingMore, hasMore]);
+  const [custOpen, setCustOpen] = useState(false);
 
-  const [custVisible, custMore, custOpen, setCustOpen] = useViewAll(customers, 10);
+  // Phase 26: reverse a soft delete. Only flips is_hidden — no bill, payment or transaction is
+  // read or written on either side of hide/unhide.
+  const [unhiding, setUnhiding] = useState(null);
+  const unhideCustomer = async (customer) => {
+    setUnhiding(customer.customer_id);
+    try {
+      const res = await apiFetch(`${API_URL}/customers/${customer.customer_id}/hidden`, {
+        method: 'PATCH', body: JSON.stringify({ hidden: false })
+      });
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not unhide this customer.')); return; }
+      const data = await res.json();
+      showToast(data.message, 'success');
+      fetchCustomers();
+    } finally { setUnhiding(null); }
+  };
 
   // Deposit and Status stay visible inside Customer Detail only (Phase 7).
   const custColumns = [
@@ -2295,9 +2697,10 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
       ) }
   ];
 
-  if (loading) {
-    return <Spinner label="Loading customers…" />;
-  }
+  // NOTE: deliberately no `if (loading) return <Spinner/>` here. That early return sits above
+  // the search input, so every debounced search refetch unmounted the input mid-typing and the
+  // caret was lost after the first character. The spinner now renders in place of the table
+  // only (see below), which keeps the input mounted and focused throughout.
 
   return (
     <div>
@@ -2353,7 +2756,20 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
             className={`btn ${statusFilter === 'FILLING_VENDOR' ? 'btn-primary' : 'btn-secondary'}`}
             onClick={() => setStatusFilter('FILLING_VENDOR')}
           >🏭 Filling Vendor</button>
+          {/* Phase 26: the dedicated view for reversing a soft delete. */}
+          <button
+            className={`btn ${statusFilter === 'HIDDEN' ? 'btn-primary' : 'btn-secondary'}`}
+            onClick={() => setStatusFilter(statusFilter === 'HIDDEN' ? '' : 'HIDDEN')}
+            title="Show customers that were hidden with Delete → Hide Customer"
+          >🙈 Hidden</button>
         </div>
+
+        {statusFilter === 'HIDDEN' && (
+          <div className="alert" style={{ fontSize: '0.82rem' }}>
+            These customers are hidden from active lists, search and transaction pickers. Their
+            bills, payments and history are untouched — unhiding restores them exactly as they were.
+          </div>
+        )}
 
         <div style={{display:'flex', justifyContent:'flex-end', marginBottom:'0.5rem'}}>
           <button className="btn btn-secondary" onClick={() => exportToExcel(
@@ -2370,7 +2786,9 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
             })), getExportFileName('default', { pageName: 'Customers' }), 'Customers'
           )}>Export Excel</button>
         </div>
-        {customers.length === 0 ? (
+        {loading ? (
+          <Spinner label="Loading customers…" />
+        ) : customers.length === 0 ? (
           <EmptyState icon="👥" message="No customers found" hint={searchTerm || statusFilter ? 'Try clearing the search or filters.' : 'Add your first customer above.'} />
         ) : (
         <div className="table-container" style={{marginTop: '1rem'}}>
@@ -2388,7 +2806,7 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
               </tr>
             </thead>
             <tbody>
-              {custVisible.map((customer, index) => (
+              {customers.map((customer, index) => (
                 <tr
                   key={customer.customer_id}
                   className={customer.status === 'OVER LIMIT' ? 'row-over-limit' :
@@ -2402,22 +2820,31 @@ export function CustomerMaster({ onNavigate, onSelectCustomer }) {
                   <td>{customer.cylinders_held}</td>
                   <td>₹{customer.current_bill_amount?.toFixed(2)}</td>
                   <td>
-                    <button
-                      className="btn btn-primary"
-                      onClick={() => {
-                        onSelectCustomer(customer.customer_id);
-                        onNavigate('customer-detail');
-                      }}
-                    >
-                      View Detail
-                    </button>
+                    <div style={{display:'flex', gap:'0.4rem', flexWrap:'wrap'}}>
+                      <button
+                        className="btn btn-primary"
+                        onClick={() => {
+                          onSelectCustomer(customer.customer_id);
+                          onNavigate('customer-detail');
+                        }}
+                      >
+                        View Detail
+                      </button>
+                      {customer.is_hidden && (
+                        <button className="btn btn-secondary" disabled={unhiding === customer.customer_id}
+                          title="Restore this customer to active lists, search and pickers"
+                          onClick={() => unhideCustomer(customer)}>
+                          {unhiding === customer.customer_id ? 'Unhiding…' : '↩ Unhide'}
+                        </button>
+                      )}
+                    </div>
                   </td>
                 </tr>
               ))}
             </tbody>
           </table>
-          {custMore && <ViewAllButton count={customers.length} onClick={() => setCustOpen(true)} />}
-          <InfiniteScroll hasMore={hasMore} loading={loadingMore} onLoadMore={loadMoreCust} />
+          <BatchListFooter shown={customers.length} total={total} loadedAll={loadedAll}
+            loadingAll={loadingAll} onLoadAll={loadAll} noun="customers" />
         </div>
         )}
       </div>
@@ -2450,6 +2877,48 @@ export function CustomerForm({ onSuccess, onCancel, customer = null }) {
     is_filling_vendor: !!customer?.is_filling_vendor,
     is_active: customer?.is_active !== undefined ? customer.is_active : 1
   });
+
+  // Delete flow (Phase 24): null → 'choose' → 'hide-confirm' | 'hard-confirm'.
+  const [deleteMode, setDeleteMode] = useState(null);
+  const [deleteBusy, setDeleteBusy] = useState(false);
+
+  const handleHide = async () => {
+    setDeleteBusy(true);
+    try {
+      const res = await apiFetch(`${API_URL}/customers/${customer.customer_id || customer._id}/hidden`, {
+        method: 'PATCH',
+        body: JSON.stringify({ hidden: true })
+      });
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not hide this customer.')); return; }
+      const data = await res.json();
+      showToast(data.message, 'success');
+      setDeleteMode(null);
+      onSuccess && onSuccess();
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
+
+  const handleHardDelete = async () => {
+    setDeleteBusy(true);
+    try {
+      const res = await apiFetch(
+        `${API_URL}/customers/${customer.customer_id || customer._id}?confirm=DELETE`,
+        { method: 'DELETE' }
+      );
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not delete this customer.')); return; }
+      const data = await res.json();
+      const d = data.deleted || {};
+      showToast(
+        `${data.message} (${d.bills || 0} bills, ${d.payments || 0} payments, ${d.rental_charges || 0} rental charges)`,
+        'success'
+      );
+      setDeleteMode(null);
+      onSuccess && onSuccess({ deleted: true });
+    } finally {
+      setDeleteBusy(false);
+    }
+  };
 
   // Up to 4 additional contacts (5 total incl. primary). Each: { name?, number }
   const [additionalContacts, setAdditionalContacts] = useState(
@@ -2624,8 +3093,96 @@ export function CustomerForm({ onSuccess, onCancel, customer = null }) {
         <button type="button" className="btn btn-secondary" onClick={onCancel}>
           Cancel
         </button>
+        {/* Delete is edit-only — there is nothing to delete while adding. */}
+        {customer && (
+          <button type="button" className="btn btn-danger" onClick={() => setDeleteMode('choose')}>
+            Delete Customer
+          </button>
+        )}
       </div>
+
+      {deleteMode && (
+        <DeleteCustomerModal
+          customer={customer}
+          mode={deleteMode}
+          setMode={setDeleteMode}
+          busy={deleteBusy}
+          onHide={handleHide}
+          onHardDelete={handleHardDelete}
+        />
+      )}
     </form>
+  );
+}
+
+// ─── Phase 24: two-mode customer delete ───
+// Neither path can fire from a single click. "Hide" asks for one confirmation; "Permanently
+// Delete" asks for a second, separate confirmation that names what will be destroyed, because
+// it cascades to bills, payments and rental charges and cannot be undone.
+function DeleteCustomerModal({ customer, mode, setMode, busy, onHide, onHardDelete }) {
+  const name = customer?.company_name || 'this customer';
+
+  if (mode === 'choose') {
+    // The overflow came from .btn itself (index.html:346): `white-space: nowrap` kept the
+    // descriptions on one line, and `display: inline-flex` laid the heading and description out
+    // side by side instead of stacked. Overriding both is the actual fix — widening the modal
+    // alone would not have stopped the horizontal scroll.
+    const optionBtn = {
+      textAlign: 'left', padding: '0.85rem 1rem', width: '100%',
+      whiteSpace: 'normal', wordBreak: 'break-word', display: 'block', lineHeight: 1.45
+    };
+    return (
+      <Modal title="Delete Customer" onClose={() => setMode(null)}>
+        <p style={{ marginTop: 0 }}>What should happen to <strong>{name}</strong>?</p>
+        <div style={{ display: 'grid', gap: '0.75rem', marginTop: '1rem', maxWidth: '100%' }}>
+          <button type="button" className="btn btn-secondary" style={optionBtn}
+            onClick={() => setMode('hide-confirm')}>
+            <strong>🙈 Hide Customer</strong>
+            <div style={{ fontSize: '0.82rem', color: 'var(--text-muted)', marginTop: '0.3rem', whiteSpace: 'normal' }}>
+              Removes them from customer lists and transaction pickers. Every bill, payment and
+              report entry stays exactly as it is. Reversible.
+            </div>
+          </button>
+          <button type="button" className="btn btn-danger" style={optionBtn}
+            onClick={() => setMode('hard-confirm')}>
+            <strong>🗑️ Permanently Delete</strong>
+            <div style={{ fontSize: '0.82rem', marginTop: '0.3rem', opacity: 0.92, whiteSpace: 'normal' }}>
+              Erases the customer and cascade-deletes all their bills, transactions, payments and
+              rental charges. Cannot be undone.
+            </div>
+          </button>
+        </div>
+        <div className="modal-actions" style={{ marginTop: '1rem' }}>
+          <button type="button" className="btn btn-secondary" onClick={() => setMode(null)}>Cancel</button>
+        </div>
+      </Modal>
+    );
+  }
+
+  if (mode === 'hide-confirm') {
+    return (
+      <ConfirmModal
+        title="Hide this customer?"
+        message={`${name} will no longer appear in customer lists or transaction pickers. Their bills, payments and history remain fully intact, and you can unhide them later.`}
+        confirmLabel={busy ? 'Hiding…' : 'Yes, hide customer'}
+        danger={false}
+        loading={busy}
+        onConfirm={onHide}
+        onCancel={() => setMode('choose')}
+      />
+    );
+  }
+
+  return (
+    <ConfirmModal
+      title="Permanently delete everything?"
+      message={`This erases ${name} AND every bill, transaction, payment and rental charge belonging to them. Historical reports that included this customer will change. This cannot be undone — choose "Hide Customer" instead if you only want them out of the way.`}
+      confirmLabel={busy ? 'Deleting…' : 'Permanently delete'}
+      danger={true}
+      loading={busy}
+      onConfirm={onHardDelete}
+      onCancel={() => setMode('choose')}
+    />
   );
 }
 
@@ -3054,10 +3611,26 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     if (acct.email !== account.email && !acct.current_password) errs.current_password = 'Enter your current password to change email';
     setAcctErrors(errs);
     if (Object.keys(errs).length) return;
+    const emailChanged = acct.email !== account.email;
     setStepUpAsk({
       title: 'Approve saving Account Information',
       context: `save Account Information changes (name/phone/email for ${acct.email || 'this account'})`,
       action: async (auth) => {
+        // Phase 26: an email change goes down the verify-first path — a code is sent to the NEW
+        // address and nothing is saved until it is entered. Name/phone-only saves are unchanged.
+        if (emailChanged) {
+          try {
+            const res = await apiFetch(`${API_URL}/profile/email-change/request`, {
+              method: 'POST', headers: { 'x-step-up-token': auth.step_up_token },
+              body: JSON.stringify({ email: acct.email, current_password: acct.current_password })
+            });
+            if (!res.ok) { showToast(await apiErrorMessage(res)); return; }
+            const data = await res.json();
+            setAcct(prev => ({ ...prev, current_password: '' }));
+            setEmailVerify({ pending_email: data.pending_email, pending_token: data.pending_token });
+          } catch {}
+          return;
+        }
         try {
           const res = await apiFetch(`${API_URL}/profile`, {
             method:'PUT', headers: { 'x-step-up-token': auth.step_up_token }, body: JSON.stringify(acct)
@@ -3070,11 +3643,19 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             fetchAll();
             // The bootstrap Trusted Person mirrors these fields — tell that section to reload.
             window.dispatchEvent(new CustomEvent('trusted-people-refresh'));
+            // Phase 25: an email change rotates the authenticator. Show the new QR straight
+            // away — the previous code keeps working until this is confirmed.
+            if (data.totp_rotation) setTotpRotation(data.totp_rotation);
           } else { showToast(await apiErrorMessage(res)); }
         } catch {}
       }
     });
   };
+
+  // Phase 25: pending authenticator rotation after an email change.
+  const [totpRotation, setTotpRotation] = useState(null);
+  // Phase 26: pending new-email verification, shown before anything is saved.
+  const [emailVerify, setEmailVerify] = useState(null);
 
   // ── Business save — step-up-gated (Phase 18): viewing is open, saving needs approval ──
   const [stepUpAsk, setStepUpAsk] = useState(null); // { title, action(auth) }
@@ -3445,6 +4026,24 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           message="Saving this change needs approval from a trusted person."
           onVerified={(auth) => { const a = stepUpAsk; setStepUpAsk(null); a.action(auth); }}
           onClose={() => setStepUpAsk(null)} />
+      )}
+      {emailVerify && (
+        <VerifyNewEmailModal
+          pending={emailVerify}
+          onCancel={() => { setEmailVerify(null); setAcct(prev => ({ ...prev, email: account.email })); }}
+          onVerified={(data) => {
+            setEmailVerify(null);
+            showToast(data.message, 'success');
+            onUserUpdated({ name: data.name, email: data.email });
+            fetchAll();
+            window.dispatchEvent(new CustomEvent('trusted-people-refresh'));
+            // Only now — with the new address proven — does the authenticator step begin.
+            if (data.totp_rotation) setTotpRotation(data.totp_rotation);
+          }}
+        />
+      )}
+      {totpRotation && (
+        <TotpRotationModal rotation={totpRotation} onDone={() => setTotpRotation(null)} />
       )}
       {pendingSwitch && (
         <ConfirmModal

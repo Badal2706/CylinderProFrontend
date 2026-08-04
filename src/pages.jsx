@@ -1,12 +1,12 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import {
-  API_URL, apiFetch, apiErrorMessage, showToast, formatDate, formatDateTime,
+  API_URL, apiFetch, apiErrorMessage, readListResponse, showToast, formatDate, formatDateTime,
   getExportFileName, exportToExcel, useViewAll, Spinner, EmptyState, Modal,
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
   LOCATIONS, LOCATION_LABELS, locationText, stockStateText, cylinderStateText,
-  Pagination, useDebounce, InfiniteScroll
+  Pagination, useDebounce, useBatchList, BatchListFooter
 } from './App.jsx';
 import { printSavedBill, RentalSummaryModal, StepUpVerificationModal } from './components.jsx';
 
@@ -409,7 +409,13 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         <Modal title={`Edit Customer — ${customer.company_name}`} size="wide" onClose={() => setShowEdit(false)}>
           <CustomerForm
             customer={customer}
-            onSuccess={() => { setShowEdit(false); fetchCustomerDetail(); }}
+            // A hard delete removes the customer this page is built on, so refetching it would
+            // 404 — go back to the list instead. Hiding keeps the record, so it just refreshes.
+            onSuccess={(result) => {
+              setShowEdit(false);
+              if (result && result.deleted) onBack();
+              else fetchCustomerDetail();
+            }}
             onCancel={() => setShowEdit(false)}
           />
         </Modal>
@@ -2282,16 +2288,13 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
 }
 
 // Cylinder Inventory Page
-export function CylinderInventory({ onViewCustomer }) {
-  const [cylinders, setCylinders] = useState([]);
-  const [hasMore, setHasMore] = useState(true);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
+export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilterConsumed }) {
+  const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
   const debouncedSearch = useDebounce(searchTerm, 300);
-  const [cylPage, setCylPage] = useState(1);
-  const [locFilters, setLocFilters] = useState([]);
-  const [stateFilters, setStateFilters] = useState([]);
+  // Seeded from a dashboard KPI/chart click, then cleared so it does not stick on the next visit.
+  const [locFilters, setLocFilters] = useState(initialFilter?.locFilters || []);
+  useEffect(() => { if (initialFilter && onFilterConsumed) onFilterConsumed(); }, []);
+  const [stateFilters, setStateFilters] = useState(initialFilter?.stateFilters || []);
   const [modalCylinder, setModalCylinder] = useState(undefined);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [deleting, setDeleting] = useState(false);
@@ -2302,35 +2305,20 @@ export function CylinderInventory({ onViewCustomer }) {
 
   const maintenanceView = stateFilters.includes('UNDER_MAINTENANCE');
 
-  // Reset to page 1 when filters/search change
-  useEffect(() => { setCylPage(1); setCylinders([]); setHasMore(true); }, [debouncedSearch, locFilters, stateFilters]);
-  useEffect(() => { fetchCylinders(); }, [debouncedSearch, locFilters, stateFilters, cylPage]);
-  useEffect(() => { fetchCounts(); fetchHolders(); }, []);
-
-  const fetchCylinders = async () => {
-    const isFirstPage = cylPage === 1;
-    if (isFirstPage) setLoading(true); else setLoadingMore(true);
-    try {
-      let url = `${API_URL}/cylinders?page=${cylPage}&limit=50&`;
-      if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
-      if (stateFilters.length) url += `state=${stateFilters.join(',')}&`;
-      if (locFilters.length) url += `location=${locFilters.join(',')}`;
-      const res = await apiFetch(url);
-      const result = await res.json();
-      const newData = result.data || result;
-      setCylinders(prev => isFirstPage ? newData : [...prev, ...newData]);
-      const pg = result.pagination;
-      setHasMore(pg ? pg.page < pg.totalPages : false);
-    } catch (error) {
-      console.error('Error fetching cylinders:', error);
-    }
-    setLoading(false);
-    setLoadingMore(false);
+  // Search + filters go to the server on every keystroke (debounced), so a search always spans
+  // the full 2,965-cylinder inventory rather than whatever batch happens to be loaded.
+  const buildUrl = (page, limit) => {
+    let url = `${API_URL}/cylinders?page=${page}&limit=${limit}&`;
+    if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
+    if (stateFilters.length) url += `state=${stateFilters.join(',')}&`;
+    if (locFilters.length) url += `location=${locFilters.join(',')}`;
+    return url;
   };
+  const {
+    rows: cylinders, total, loading, loadingAll, loadedAll, loadAll, reload: fetchCylinders
+  } = useBatchList(buildUrl, [debouncedSearch, locFilters, stateFilters]);
 
-  const loadMore = useCallback(() => {
-    if (!loadingMore && hasMore) setCylPage(p => p + 1);
-  }, [loadingMore, hasMore]);
+  useEffect(() => { fetchCounts(); fetchHolders(); }, []);
 
   // Always reflects the full inventory (no search/stock filter), so the stat cards stay fixed.
   const fetchCounts = async () => {
@@ -2417,7 +2405,10 @@ export function CylinderInventory({ onViewCustomer }) {
     setDeleteTarget(null);
   };
 
-  const [cylVisible, cylMore, cylOpen, setCylOpen] = useViewAll(cylinders, 10);
+  // Infinite scroll renders every row loaded so far — capping the table at 10 would pin the
+  // scroll sentinel inside the viewport, so it would fire again the instant each load finished
+  // and walk the whole collection in one burst. Only the "View All" modal trigger uses the cap.
+  const [cylOpen, setCylOpen] = useState(false);
 
   const stockBadge = (c) => c.under_maintenance
     ? <span className="badge badge-danger">Under Maintenance</span>
@@ -2599,7 +2590,7 @@ export function CylinderInventory({ onViewCustomer }) {
                   </tr>
                 </thead>
                 <tbody>
-                  {cylVisible.map((c, index) => (
+                  {cylinders.map((c, index) => (
                     <tr key={c._id}
                       style={isClickable(c) ? {cursor:'pointer'} : {}}
                       title={isClickable(c) ? `View ${holders[c.rotational_number]?.holder_name || 'holding customer'}` : undefined}
@@ -2628,8 +2619,8 @@ export function CylinderInventory({ onViewCustomer }) {
                   ))}
                 </tbody>
               </table>
-              {cylMore && <ViewAllButton count={cylinders.length} onClick={() => setCylOpen(true)} />}
-              <InfiniteScroll hasMore={hasMore} loading={loadingMore} onLoadMore={loadMore} />
+              <BatchListFooter shown={cylinders.length} total={total} loadedAll={loadedAll}
+                loadingAll={loadingAll} onLoadAll={loadAll} noun="cylinders" />
               </>
             )}
           </div>
@@ -2714,15 +2705,13 @@ export function directionLabel(d, opts = {}) {
   );
 }
 
-export function TransactionHistory() {
-  const [bills, setBills] = useState([]);
-  const [hasMore, setHasMore] = useState(true);
+export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
   const [payments, setPayments] = useState([]);
-  const [loading, setLoading] = useState(true);
-  const [loadingMore, setLoadingMore] = useState(false);
-  const [searchTerm, setSearchTerm] = useState('');
-  const [billPage, setBillPage] = useState(1);
+  const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
+  const debouncedSearch = useDebounce(searchTerm, 300);
+  useEffect(() => { if (initialFilter && onFilterConsumed) onFilterConsumed(); }, []);
   const [dateFilter, setDateFilter] = useState(() => {
+    if (initialFilter?.dateFilter) return initialFilter.dateFilter;
     const x = new Date();
     return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
   });
@@ -2731,36 +2720,27 @@ export function TransactionHistory() {
   const [editBillId, setEditBillId] = useState(null);
   const [editAuth, setEditAuth] = useState(null);
 
-  useEffect(() => { setBillPage(1); setBills([]); setHasMore(true); }, [dateFilter]);
-  useEffect(() => { load(); }, [billPage, dateFilter]);
-  const load = async () => {
-    const isFirstPage = billPage === 1;
-    if (isFirstPage) setLoading(true); else setLoadingMore(true);
-    try {
-      let billUrl = `${API_URL}/bills?page=${billPage}&limit=50`;
-      if (dateFilter) billUrl += `&date=${dateFilter}`;
-      const fetches = [apiFetch(billUrl)];
-      if (isFirstPage) fetches.push(apiFetch(`${API_URL}/payments?limit=200`));
-      const results = await Promise.all(fetches);
-      const bData = await results[0].json();
-      const newBills = bData.data || bData;
-      setBills(prev => isFirstPage ? newBills : [...prev, ...newBills]);
-      const pg = bData.pagination;
-      setHasMore(pg ? pg.page < pg.totalPages : false);
-      if (isFirstPage && results[1]) {
-        const pData = await results[1].json();
-        setPayments(pData.data || pData);
-      }
-    } catch (e) {
-      console.error('Error loading transaction history:', e);
-    }
-    setLoading(false);
-    setLoadingMore(false);
+  // Search is sent to the server (bill no., challan no., type, customer name) so it matches
+  // every bill, not only the batch on screen.
+  const buildUrl = (page, limit) => {
+    let url = `${API_URL}/bills?page=${page}&limit=${limit}`;
+    if (dateFilter) url += `&date=${dateFilter}`;
+    if (debouncedSearch) url += `&search=${encodeURIComponent(debouncedSearch)}`;
+    return url;
   };
+  const {
+    rows: bills, total, loading, loadingAll, loadedAll, loadAll, reload: load
+  } = useBatchList(buildUrl, [dateFilter, debouncedSearch]);
 
-  const loadMoreBills = useCallback(() => {
-    if (!loadingMore && hasMore) setBillPage(p => p + 1);
-  }, [loadingMore, hasMore]);
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await apiFetch(`${API_URL}/payments?limit=200`);
+        const { rows } = await readListResponse(res);
+        setPayments(rows);
+      } catch (e) { console.error('Error loading payments:', e); }
+    })();
+  }, []);
 
   const rows = bills.map(b => {
     const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
@@ -2851,7 +2831,8 @@ export function TransactionHistory() {
     printReportPopup(bits.join(' — '), exportRows(), getExportFileName('transaction-history', { date: dateFilter || undefined }));
   };
 
-  if (loading) return <Spinner label="Loading transactions…" />;
+  // No early-return spinner here: it would sit above the search input and unmount it on every
+  // debounced server-side search, losing the caret. Rendered in place of the table instead.
 
   return (
     <div>
@@ -2893,7 +2874,9 @@ export function TransactionHistory() {
           </div>
         </div>
 
-        {filtered.length === 0 ? (
+        {loading ? (
+          <Spinner label="Loading transactions…" />
+        ) : filtered.length === 0 ? (
           <EmptyState icon="🧾" message="No transactions found" hint={searchTerm || dateFilter || locFilter ? 'Try clearing the search or filters.' : 'Record a transaction to see it here.'} />
         ) : (
           <div className="table-container" style={{marginTop:'1rem'}}>
@@ -2930,7 +2913,8 @@ export function TransactionHistory() {
                 ))}
               </tbody>
             </table>
-            <InfiniteScroll hasMore={hasMore} loading={loadingMore} onLoadMore={loadMoreBills} />
+            <BatchListFooter shown={bills.length} total={total} loadedAll={loadedAll}
+              loadingAll={loadingAll} onLoadAll={loadAll} noun="transactions" />
           </div>
         )}
       </div>

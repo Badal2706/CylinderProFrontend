@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { API_URL, apiFetch, apiErrorMessage, showToast, formatDate, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, Modal, Spinner } from './App.jsx';
+import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
 // A Filled line's amount is ALWAYS rate × (inventory cylinders + personal cylinders returned),
@@ -532,11 +532,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     showToast(`Draft ${d.bill_number} loaded.`, 'success');
   };
 
+  // Full inventory, not a first-200 slice — see fetchAllPages in App.jsx for why.
   const fetchCylinders = async () => {
     try {
-      const response = await apiFetch(`${API_URL}/cylinders?limit=200`);
-      const result = await response.json();
-      setCylinders(result.data || result);
+      setCylinders(await fetchAllPages(`${API_URL}/cylinders`));
     } catch (error) {
       console.error('Error fetching cylinders:', error);
     }
@@ -555,11 +554,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     }
   };
 
+  // Full customer list, not a first-200 slice — see fetchAllPages in App.jsx for why.
   const fetchCustomers = async () => {
     try {
-      const response = await apiFetch(`${API_URL}/customers?limit=200`);
-      const result = await response.json();
-      const data = result.data || result;
+      const data = await fetchAllPages(`${API_URL}/customers`);
       setCustomers(data);
       setSelectedCustomer(prev => prev
         ? (data.find(c => String(c.customer_id) === String(prev.customer_id)) || prev)

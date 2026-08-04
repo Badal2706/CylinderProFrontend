@@ -218,6 +218,37 @@
       margin-bottom: 1.5rem;
     }
 
+    /* ─── Bento dashboard (Phase 26) ───
+       A fixed 4-column track at desktop so tiles can span deliberately; auto-flow:dense lets
+       the smaller tiles backfill any hole a spanning tile leaves, which is what keeps the grid
+       free of dead space. Tile CONTENT is untouched — this rule set only sizes and places. */
+    .bento-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-auto-rows: minmax(112px, auto);
+      grid-auto-flow: row dense;
+      gap: 1rem;
+      margin-bottom: 1.5rem;
+    }
+    .bento-grid > .stat-card, .bento-grid > .bento-chart { margin: 0; }
+    /* "Cylinders in stock" carries a breakdown subtitle — give it two columns to breathe. */
+    .bento-grid .bento-wide { grid-column: span 2; }
+    /* The two charts are the visual anchors: half the width each, two rows tall. */
+    .bento-grid .bento-chart { grid-column: span 2; grid-row: span 2; display: flex; flex-direction: column; }
+    .bento-grid .bento-chart > h2 { margin-top: 0; }
+
+    @media (max-width: 1100px) {
+      .bento-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .bento-grid .bento-wide,
+      .bento-grid .bento-chart { grid-column: span 2; }
+      .bento-grid .bento-chart { grid-row: auto; }
+    }
+    @media (max-width: 620px) {
+      .bento-grid { grid-template-columns: minmax(0, 1fr); gap: 0.75rem; }
+      .bento-grid .bento-wide,
+      .bento-grid .bento-chart { grid-column: span 1; }
+    }
+
     .stat-card {
       background: var(--surface);
       border: 1px solid var(--border);
@@ -618,7 +649,13 @@
     .form-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
     .form-row.challan-remarks { grid-template-columns: 1fr 2fr; }
     /* Right-aligned action buttons at the bottom of a modal form */
-    .modal-actions { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.75rem; }
+    /* flex-wrap is load-bearing (Phase 26): .btn is white-space:nowrap, so two long labels
+       (e.g. "Not now (keep current code)" + "Confirm new authenticator") overflow the 440px
+       modal. With justify-content:flex-end the overflow is pushed off the LEFT edge, cropping
+       the first button. Wrapping to a second row fixes every modal at once rather than one
+       dialog at a time. min-width:0 lets a single over-wide button shrink instead of spilling. */
+    .modal-actions { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 0.5rem; margin-top: 0.75rem; }
+    .modal-actions > .btn { min-width: 0; }
     @media (max-width: 640px) {
       .form-row.cols-2, .form-row.cols-3, .form-row.challan-remarks { grid-template-columns: 1fr; }
       .modal-card.modal-wide { min-width: 0; }
