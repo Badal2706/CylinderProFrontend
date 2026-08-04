@@ -1303,6 +1303,122 @@ export function downloadImportIssues(issues, baseName) {
 }
 
 // Auth Page Component
+// ─── Phase 27: forgot-password recovery panel ───
+// Two steps: (1) enter the account email → a code is sent to it; (2) enter that code — OR a
+// code from an authenticator already enrolled on the account — plus the new password. The
+// authenticator alternative is the escape hatch for when the inbox itself is unreachable.
+export function ForgotPasswordPanel({ initialEmail = '', onCancel, onDone }) {
+  const [step, setStep] = useState(1);
+  const [email, setEmail] = useState(initialEmail);
+  const [resetToken, setResetToken] = useState('');
+  const [totpAvailable, setTotpAvailable] = useState(false);
+  const [useTotp, setUseTotp] = useState(false);
+  const [code, setCode] = useState('');
+  const [newPassword, setNewPassword] = useState('');
+  const [confirmPw, setConfirmPw] = useState('');
+  const [error, setError] = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const request = async (e) => {
+    e.preventDefault();
+    setBusy(true); setError('');
+    try {
+      const res = await fetch(`${API_URL}/auth/forgot-password`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email })
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Could not start reset.'); return; }
+      setResetToken(data.reset_token);
+      setTotpAvailable(!!data.totp_available);
+      setStep(2);
+    } catch { setError('Network error. Is the server running?'); }
+    finally { setBusy(false); }
+  };
+
+  const reset = async (e) => {
+    e.preventDefault();
+    if (newPassword !== confirmPw) { setError('The two passwords do not match.'); return; }
+    setBusy(true); setError('');
+    try {
+      const body = { reset_token: resetToken, new_password: newPassword };
+      if (useTotp) body.totp_code = code; else body.code = code;
+      const res = await fetch(`${API_URL}/auth/forgot-password/reset`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body)
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Reset failed.'); return; }
+      showToast(data.message || 'Password updated.', 'success');
+      onDone();
+    } catch { setError('Network error.'); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="auth-form">
+      <div style={{ textAlign: 'center', marginBottom: '1rem' }}>
+        <div style={{ fontSize: '2rem', marginBottom: '0.5rem' }}>🔑</div>
+        <p style={{ fontSize: '0.9rem', color: 'var(--text-muted)' }}>
+          {step === 1
+            ? 'Enter your account email and we\'ll send a 6-digit code to reset your password.'
+            : `Enter the code and choose a new password for ${email}.`}
+        </p>
+      </div>
+
+      {step === 1 ? (
+        <form onSubmit={request}>
+          <div className="form-group">
+            <label>Account Email</label>
+            <input type="email" className="form-control" value={email} autoFocus
+              onChange={(e) => setEmail(e.target.value)} placeholder="your@email.com" required />
+          </div>
+          {error && <div className="alert alert-danger" style={{ marginBottom: '1rem' }}>{error}</div>}
+          <button type="submit" className="btn btn-primary auth-submit" disabled={busy || !email}>
+            {busy ? 'Sending…' : 'Send reset code'}
+          </button>
+        </form>
+      ) : (
+        <form onSubmit={reset}>
+          <div className="alert" style={{ fontSize: '0.82rem' }}>
+            If that email has an account, a code is on its way. Didn't get it?{' '}
+            {totpAvailable
+              ? <button type="button" className="link-btn" onClick={() => { setUseTotp(v => !v); setCode(''); setError(''); }}>
+                  {useTotp ? 'use the emailed code instead' : 'use your authenticator app instead'}
+                </button>
+              : 'check spam, or try again in a moment.'}
+          </div>
+          <div className="form-group">
+            <label>{useTotp ? 'Authenticator code' : 'Emailed code'}</label>
+            <input type="text" className="form-control" value={code} autoFocus
+              onChange={(e) => setCode(e.target.value.replace(/\D/g, '').slice(0, 6))}
+              placeholder="••••••" maxLength={6}
+              style={{ textAlign: 'center', fontSize: '1.4rem', letterSpacing: '0.4rem' }} required />
+          </div>
+          <div className="form-group">
+            <label>New Password</label>
+            <input type="password" className="form-control" value={newPassword}
+              onChange={(e) => setNewPassword(e.target.value)} placeholder="Min 8 chars, a number and a symbol" required />
+          </div>
+          <div className="form-group">
+            <label>Confirm New Password</label>
+            <input type="password" className="form-control" value={confirmPw}
+              onChange={(e) => setConfirmPw(e.target.value)} placeholder="Re-enter new password" required />
+          </div>
+          {error && <div className="alert alert-danger" style={{ marginBottom: '1rem' }}>{error}</div>}
+          <button type="submit" className="btn btn-primary auth-submit" disabled={busy || code.length !== 6 || !newPassword}>
+            {busy ? 'Updating…' : 'Reset password'}
+          </button>
+        </form>
+      )}
+
+      <button type="button" className="link-btn"
+        style={{ marginTop: '0.75rem', display: 'block', textAlign: 'center', width: '100%' }}
+        onClick={onCancel}>← Back to Sign In</button>
+    </div>
+  );
+}
+
 export function AuthPage({ onAuthSuccess, notice }) {
   const [mode, setMode] = useState('signin');
   const [formData, setFormData] = useState({ name: '', email: '', password: '', developer_token: '' });
@@ -1314,6 +1430,7 @@ export function AuthPage({ onAuthSuccess, notice }) {
   const [otpCode, setOtpCode] = useState('');
   const [pendingToken, setPendingToken] = useState('');
   const [otpEmail, setOtpEmail] = useState('');
+  const [showForgot, setShowForgot] = useState(false); // Phase 27: password recovery panel
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -1380,6 +1497,7 @@ export function AuthPage({ onAuthSuccess, notice }) {
     setOtpStep(false);
     setOtpCode('');
     setPendingToken('');
+    setShowForgot(false);
   };
 
   return (
@@ -1406,7 +1524,13 @@ export function AuthPage({ onAuthSuccess, notice }) {
           >Sign Up</button>
         </div>
 
-        {otpStep ? (
+        {showForgot ? (
+          <ForgotPasswordPanel
+            initialEmail={formData.email}
+            onCancel={() => { setShowForgot(false); setError(''); }}
+            onDone={() => { setShowForgot(false); setError(''); setMode('signin'); }}
+          />
+        ) : otpStep ? (
           <form onSubmit={handleOtpSubmit} className="auth-form">
             <div style={{textAlign:'center', marginBottom:'1rem'}}>
               <div style={{fontSize:'2rem', marginBottom:'0.5rem'}}>🔐</div>
@@ -1513,6 +1637,13 @@ export function AuthPage({ onAuthSuccess, notice }) {
             <button type="submit" className="btn btn-primary auth-submit" disabled={loading}>
               {loading ? 'Please wait...' : (mode === 'signin' ? 'Sign In' : 'Create Account')}
             </button>
+            {mode === 'signin' && (
+              <button type="button" className="link-btn"
+                style={{marginTop:'0.75rem', display:'block', textAlign:'center', width:'100%', fontSize:'0.85rem'}}
+                onClick={() => { setShowForgot(true); setError(''); }}>
+                Forgot password?
+              </button>
+            )}
           </form>
         )}
 
@@ -2227,6 +2358,18 @@ export function TrustedPeopleSection() {
     } catch {}
   };
 
+  // Phase 27: re-scan an already-enrolled authenticator on demand (e.g. the owner picked
+  // "Not now" during an email-change rotation, or reinstalled their app). Uses the pending-secret
+  // rotation, so the existing code keeps working until the new QR is confirmed.
+  const [rescanRotation, setRescanRotation] = useState(null);
+  const rescanAuthenticator = async (person) => {
+    try {
+      const res = await apiFetch(`${API_URL}/trusted-people/${person.person_id}/totp/rotation/begin`, { method: 'POST' });
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not start re-scan.')); return; }
+      setRescanRotation(await res.json());
+    } catch {}
+  };
+
   const confirmEnroll = async () => {
     if (!enroll) return;
     try {
@@ -2283,7 +2426,12 @@ export function TrustedPeopleSection() {
                         ? <span className="badge badge-success">✓ Verified</span>
                         : <button className="link-btn" style={{fontSize:'0.8rem'}} onClick={() => resend(p)}>Send code</button>}</td>
                       <td>{p.totp_enabled
-                        ? <span className="badge badge-success">✓ Enrolled</span>
+                        ? <span style={{display:'inline-flex', alignItems:'center', gap:'0.5rem', flexWrap:'wrap'}}>
+                            <span className="badge badge-success">✓ Enrolled</span>
+                            <button className="link-btn" style={{fontSize:'0.75rem'}}
+                              title="Scan a new QR code for this authenticator. The current code keeps working until you confirm the new one."
+                              onClick={() => rescanAuthenticator(p)}>Re-scan</button>
+                          </span>
                         : p.is_active
                           ? <button className="link-btn" style={{fontSize:'0.8rem'}} onClick={() => startEnroll(p)}>Enroll</button>
                           : <span style={{color:'var(--text-muted)', fontSize:'0.8rem'}}>Verify email first</span>}</td>
@@ -2361,6 +2509,12 @@ export function TrustedPeopleSection() {
             <button className="btn btn-secondary" onClick={() => setEnroll(null)}>Cancel</button>
           </div>
         </Modal>
+      )}
+
+      {/* Phase 27: on-demand re-scan reuses the email-change rotation modal (old code stays
+          valid until the new QR is confirmed). */}
+      {rescanRotation && (
+        <TotpRotationModal rotation={rescanRotation} onDone={() => { setRescanRotation(null); load(); }} />
       )}
 
       {removeTarget && (
