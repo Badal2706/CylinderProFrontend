@@ -17,154 +17,83 @@ export function lineAmount(item) {
 //   "Cylinders Empty from Customer" (no Rate/Amount) above, "Cylinders Filled to Customer" (with Rate/Amount + TOTAL) below.
 // A section is omitted entirely when it has no lines, so Given-only / Received-only / Swap all render correctly.
 // The logo is loaded from /guru-logo.png (served from the frontend's public/ folder).
-export function printSavedBill(bill) {
-  const esc = (s) => String(s == null ? '' : s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+// Shared print helper (Phase 27): HTML-escape for print templates.
+const printEsc = (s) => String(s == null ? '' : s)
+  .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
-  const LOGO_URL = window.location.origin + '/guru-logo.png';
+// Phase 28 patch: a bulk-import left some customer contacts stored as "0". Treat 0/empty/falsy
+// as blank for DISPLAY only (never mutate stored data) so a literal "0" never shows anywhere.
+export const displayContact = (v) => {
+  const s = String(v == null ? '' : v).trim();
+  return (s === '' || s === '0') ? '' : s;
+};
 
-  const givenLines    = (bill.lines || []).filter(l => l.direction === 'GIVEN');
-  const receivedLines = (bill.lines || []).filter(l => l.direction === 'RECEIVED');
-  const cylNo = (l) => esc((l.serials || []).join(', '));
-  const nSerials = (l) => (l.serials || []).length;
-  const nPersonal = (l) => Number(l.personalCyl) || 0;
-
-  // Empty table: inventory row, plus a "(Personal Cyl. ×N)" row when personal cylinders were
-  // taken from the customer (qty only — nothing is charged for taking empties back).
-  let rSr = 0;
-  const receivedRows = receivedLines.map((l) => {
-    let rows = '';
-    if (nSerials(l) > 0) {
-      rows += `<tr><td class="c">${++rSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>${cylNo(l)}</td><td class="c">${nSerials(l)}</td></tr>`;
-    }
-    if (nPersonal(l) > 0) {
-      rows += `<tr><td class="c">${++rSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>(Personal Cyl. ×${nPersonal(l)})</td><td class="c">${nPersonal(l)}</td></tr>`;
-    }
-    return rows;
-  }).join('');
-
-  // Filled table: inventory row (rate × inventory count), plus a separate "(Personal Cyl. ×N)"
-  // row charged at the SAME rate — personal cylinders returned are refilled service items.
-  let gSr = 0;
-  const givenRows = givenLines.map((l) => {
-    const rate = Number(l.rate) || 0;
-    let rows = '';
-    if (nSerials(l) > 0) {
-      rows += `<tr><td class="c">${++gSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>${cylNo(l)}</td><td class="c">${nSerials(l)}</td><td class="r">${rate.toFixed(2)}</td><td class="r">${(rate * nSerials(l)).toFixed(2)}</td></tr>`;
-    }
-    if (nPersonal(l) > 0) {
-      rows += `<tr><td class="c">${++gSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>(Personal Cyl. ×${nPersonal(l)})</td><td class="c">${nPersonal(l)}</td><td class="r">${rate.toFixed(2)}</td><td class="r">${(rate * nPersonal(l)).toFixed(2)}</td></tr>`;
-    }
-    return rows;
-  }).join('');
-
-  const givenTotal = givenLines.reduce((s, l) => s + (Number(l.rate) || 0) * (nSerials(l) + nPersonal(l)), 0);
-
-  // Each section renders only when it has lines (no empty tables / placeholders).
-  // Filling-vendor bills (Phase 16): GIVEN = "Sent for Filling (Empty)" — cylinders leave
-  // empty; RECEIVED = "Received Back Filled" — they return full. Titles flip accordingly and
-  // the Sent section prints FIRST (matching the entry form's order for vendors).
-  const isVendorBill = !!bill.is_filling_vendor;
-  const receivedSection = receivedLines.length ? `
-    <div class="sec-title">${isVendorBill ? 'Cylinders Received Back Filled' : 'Cylinders Empty from Customer'}</div>
-    <table class="ctab">
-      <thead><tr><th class="c" style="width:8%">Sr. No.</th><th>Gas Type</th><th>Size</th><th>Cylinder No.</th><th class="c" style="width:9%">Qty</th></tr></thead>
-      <tbody>${receivedRows}</tbody>
-    </table>` : '';
-
-  const givenSection = givenLines.length ? `
-    <div class="sec-title">${isVendorBill ? 'Cylinders Sent for Filling (Empty)' : 'Cylinders Filled to Customer'}</div>
-    <table class="ctab">
-      <thead><tr><th class="c" style="width:8%">Sr. No.</th><th>Gas Type</th><th>Size</th><th>Cylinder No.</th><th class="c" style="width:9%">Qty</th><th class="r" style="width:12%">Rate</th><th class="r" style="width:14%">Amount</th></tr></thead>
-      <tbody>${givenRows}</tbody>
-      <tfoot><tr><td colspan="6" class="r tot">TOTAL...</td><td class="r tot">${givenTotal.toFixed(2)}</td></tr></tfoot>
-    </table>` : '';
-
-  // Transfer table (Phase 13): internal-transfer challans list transferred cylinders and any
-  // PC quantities (as "(Personal Cyl. ×N)" rows) — no Rate/Amount, like the Empty table.
-  const transferLines = (bill.lines || []).filter(l => l.direction === 'TRANSFER');
-  let tSr = 0;
-  const transferRows = transferLines.map((l) => {
-    let rows = '';
-    if (nSerials(l) > 0) {
-      rows += `<tr><td class="c">${++tSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>${cylNo(l)}</td><td class="c">${nSerials(l)}</td></tr>`;
-    }
-    if (nPersonal(l) > 0) {
-      rows += `<tr><td class="c">${++tSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>(Personal Cyl. ×${nPersonal(l)})</td><td class="c">${nPersonal(l)}</td></tr>`;
-    }
-    return rows;
-  }).join('');
-  const transferSection = transferLines.length ? `
-    <div class="sec-title">Cylinders Transferred</div>
-    <table class="ctab">
-      <thead><tr><th class="c" style="width:8%">Sr. No.</th><th>Gas Type</th><th>Size</th><th>Cylinder No.</th><th class="c" style="width:9%">Qty</th></tr></thead>
-      <tbody>${transferRows}</tbody>
-    </table>` : '';
-
-  // Popup <title> drives BOTH the browser print header text AND the default "Save as PDF" filename.
-  // Show only the customer name (falls back to the brand if unknown).
-  const docTitle = bill.customer_name ? esc(bill.customer_name) : 'Delivery Challan';
-
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${docTitle}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
-  <style>
+// Shared print <head> styles, reused by the challan and the Currently Holding statement.
+function printDocStyles() {
+  return `
     * { margin:0; padding:0; box-sizing:border-box; }
     html, body { height:100%; }
-    /* Body flex column so the signature block can pin toward the page bottom. Latin renders in Arial;
-       Gujarati glyphs fall through (per-glyph) to the Gujarati fonts. */
     body { font-family: Arial, 'Noto Sans Gujarati', 'Shruti', 'Arial Unicode MS', sans-serif; color:#000; font-size:12px; padding:10px;
            display:flex; flex-direction:column; min-height:calc(100vh - 20px); }
-    /* Clean minimal header: ONE outer 1.5px box. Centered "Delivery Challan" title on top
-       (bottom-bordered), then a 3-column row. Single border-right dividers only — no doubled lines. */
     .hdr-box { border:1.5px solid #000; }
     .hdr-title { text-align:center; font-size:14px; font-weight:bold; padding:5px; border-bottom:1px solid #000; }
     .hdr-cols { display:flex; }
     .hcol { padding:8px 10px; font-size:11px; font-weight:normal; line-height:1.5; }
-    .hcol.logo { width:20%; display:flex; align-items:center; justify-content:center; border-right:1px solid #000; }
-    .hcol.logo img { max-width:100%; max-height:70px; }
-    .hcol.company { width:40%; border-right:1px solid #000; }
+    /* Phase 28 patch: logo enlarged again by reclaiming the unused whitespace to the right of
+       the contact box — the logo column widens (26%→34%, 120px→150px) while the company and
+       contact boxes shift right and the over-wide contact box narrows to fit its text (38%→28%). */
+    .hcol.logo { width:34%; display:flex; align-items:center; justify-content:center; border-right:1px solid #000; }
+    .hcol.logo img { max-width:100%; max-height:150px; }
+    .hcol.company { width:38%; border-right:1px solid #000; }
     .hcol.company .co { font-size:16px; font-weight:bold; margin-bottom:3px; }
-    .hcol.contact { width:40%; }
-    /* Mfg / Plot: plain 10px lines OUTSIDE the box, no border. */
-    .mfg { font-size:10px; margin-top:5px; }
-    .plot { font-size:10px; margin-bottom:8px; }
-    /* Bill info block. */
+    /* Phase 27: Plot line now lives inside the company box, under the ISO line. */
+    .hcol.company .plot-in { margin-top:3px; }
+    .hcol.contact { width:28%; }
+    /* Phase 27: Mfg stays below the box, font bumped one point (10 -> 11). */
+    .mfg { font-size:11px; margin-top:5px; margin-bottom:8px; }
     .info { padding:6px 0; border-top:1px solid #000; border-bottom:1px solid #000; margin-bottom:10px; }
-    .info .row { display:flex; justify-content:space-between; margin-bottom:8px; font-size:13px; }
     .info .ms { font-size:13px; margin-bottom:6px; }
     .info b { font-weight:700; }
+    /* Phase 29: every two-column info line (Ch.No./Date, M/s/GSTIN, Address/Vehicle) uses one
+       pattern — left item + right item on a single row, right-aligned. A print-time script
+       (__fitPairs) adds a "stacked" class per line, independently, only when the two would collide
+       (fewer than ~3 space-widths of gap), dropping the right item to its own right-aligned line.
+       NOTE: never put backticks in this CSS comment — it lives inside a template literal. */
+    .pair { display:flex; justify-content:space-between; align-items:baseline; gap:0; font-size:13px; margin-bottom:6px; }
+    .pair .pair-r { text-align:right; white-space:nowrap; }
+    .pair.stacked { flex-direction:column; align-items:stretch; gap:2px; }
+    .pair.stacked .pair-r { text-align:right; white-space:normal; }
+    /* Blank vehicle → a ruled space to fill in by hand after printing (Phase 28 patch). */
+    .veh-blank { display:inline-block; min-width:130px; border-bottom:1px solid #000; }
     .sec-title { font-weight:700; font-size:13px; margin:8px 0 4px; }
-    /* Cylinder tables: border-collapse => clean single borders on all edges (no doubled lines). */
     table.ctab { width:100%; border-collapse:collapse; margin-bottom:6px; }
     table.ctab th, table.ctab td { border:1px solid #000; padding:5px 7px; font-size:12px; vertical-align:top; }
     table.ctab th { font-weight:700; text-align:left; }
     table.ctab td.c, table.ctab th.c { text-align:center; }
     table.ctab td.r, table.ctab th.r { text-align:right; }
-    table.ctab .tot { font-weight:700; }
-    /* ≥24px gap above the notes block. Gujarati uses the requested stack. */
+    table.ctab .tot td { font-weight:700; }
     .foot { margin-top:24px; }
     .note-h { font-weight:700; font-size:12.5px; font-family:'Noto Sans Gujarati','Shruti','Arial Unicode MS',sans-serif; }
     .note { font-size:12px; line-height:1.7; font-family:'Noto Sans Gujarati','Shruti','Arial Unicode MS',sans-serif; }
     .eng { margin-top:7px; font-size:12px; font-weight:600; }
-    /* Signatures pinned toward the page bottom (margin-top:auto), with ≥40px signing space above. */
     .signs { display:flex; justify-content:space-between; align-items:flex-end; margin-top:auto; padding-top:40px; font-size:12.5px; font-weight:700; }
     .signs .right { text-align:right; }
-    @page { margin-top:10mm; margin-bottom:10mm; margin-left:10mm; margin-right:10mm; }
-  </style></head><body>
-  <!--
-    To remove browser date/filename from print headers:
-    Chrome: Print > More settings > uncheck "Headers and footers"
-    This cannot be suppressed programmatically in all browsers.
-  -->
+    @page { margin-top:10mm; margin-bottom:10mm; margin-left:10mm; margin-right:10mm; }`;
+}
+
+// Shared company header box (logo + company info + contact), used by both print documents.
+function printHeaderBox(title) {
+  const LOGO_URL = window.location.origin + '/guru-logo.png';
+  return `
   <div class="hdr-box">
-    <div class="hdr-title">Delivery Challan</div>
+    <div class="hdr-title">${title}</div>
     <div class="hdr-cols">
       <div class="hcol logo"><img src="${LOGO_URL}" alt="GURU Industries" onerror="this.style.display='none'"/></div>
       <div class="hcol company">
         <div class="co">GURU Industries</div>
         <div>GSTIN: 24AAJFG7415N1Z3</div>
         <div>ISO 9001:2015 Certified Company</div>
+        <div class="plot-in">Plot No.: 114/47, Chandisar G.I.D.C., Palanpur-385 001. (B.K.) Gujarat.</div>
       </div>
       <div class="hcol contact">
         <div>Chandisar: M 7600076251, 7600076254</div>
@@ -174,15 +103,179 @@ export function printSavedBill(bill) {
       </div>
     </div>
   </div>
-  <div class="mfg">Mfg.: Industrial &amp; Medical Oxygen, CO2, Nitrogen, Argon etc gases.</div>
-  <div class="plot">Plot No.: 114/47, Chandisar G.I.D.C., Palanpur-385 001. (B.K.) Gujarat.</div>
+  <div class="mfg">Mfg.: Industrial &amp; Medical Oxygen, CO2, Nitrogen, Argon etc gases.</div>`;
+}
+
+// Shared customer info block: M/s + right-slot GSTIN, address, contact, and a right-aligned
+// meta line (Ch.No./Date for the challan, or a plain Date for the holding statement).
+function printCustomerBlock(bill, metaLeftHtml, metaRightHtml, opts = {}) {
+  // Contact: never print the bulk-import "0" artifact — blank value instead (label always shown).
+  const contact = displayContact(bill.customer_contact) || displayContact(bill.phone_primary);
+  const vehicle = printEsc(bill.vehicle_number || '');
+  // Phase 29: Address and Vehicle share one two-column line (Address left, Vehicle right),
+  // matching the Ch.No./Date and M/s/GSTIN lines. Blank vehicle → a ruled fill-in space.
+  // Each `.pair` wraps its right item independently at print time (see __fitPairs in the doc script)
+  // only when fewer than ~3 space-widths of gap remain — so a long name and a long address never
+  // affect each other's line. The holding statement (no vehicle) keeps Address on its own line.
+  const vehicleRight = vehicle ? `<b>${vehicle}</b>` : `<span class="veh-blank"></span>`;
+  const addrVehLine = opts.showVehicle
+    ? `<div class="pair">
+      <span class="pair-l">Address: ${printEsc(bill.customer_address || '')}</span>
+      <span class="pair-r">Vehicle: ${vehicleRight}</span>
+    </div>`
+    : `<div class="ms">Address: ${printEsc(bill.customer_address || '')}</div>`;
+  return `
   <div class="info">
-    <div class="row"><span>Ch.No.: <b>${esc(bill.challan_no || '')}</b></span><span>Date: <b>${formatDate(bill.bill_date)}</b></span></div>
-    <div class="ms">M/s.: <b>${esc(bill.customer_name || '')}</b></div>
-    <div class="ms">Address: ${esc(bill.customer_address || '')}</div>
-    <div class="ms">GSTIN: <b>${esc(bill.customer_gst || 'URP')}</b></div>
-  </div>
-  ${isVendorBill ? givenSection + receivedSection : receivedSection + givenSection}
+    ${(metaLeftHtml || metaRightHtml) ? `<div class="pair"><span class="pair-l">${metaLeftHtml || ''}</span><span class="pair-r">${metaRightHtml || ''}</span></div>` : ''}
+    <div class="pair">
+      <span class="pair-l">M/s.: <b>${printEsc(bill.customer_name || '')}</b></span>
+      <span class="pair-r">GSTIN: <b>${printEsc(bill.customer_gst || 'URP')}</b></span>
+    </div>
+    ${addrVehLine}
+    <div class="ms">Contact: ${printEsc(contact)}</div>
+  </div>`;
+}
+
+// Phase 29: shared doc script — measures each two-column `.pair` line and stacks (wraps the right
+// item to its own right-aligned line) only when fewer than ~3 space-character-widths of gap remain
+// between the left and right text. Runs per line independently, before printing.
+function printFitAndPrintScript() {
+  return `<script>
+  function __fitPairs(){
+    var info = document.querySelector('.info') || document.body;
+    var sp = document.createElement('span');
+    sp.style.cssText = 'position:absolute;visibility:hidden;left:-9999px;white-space:pre;font-size:13px';
+    sp.textContent = '   '; // three spaces at the pair font size
+    info.appendChild(sp); var space3 = sp.getBoundingClientRect().width; info.removeChild(sp);
+    var pairs = document.querySelectorAll('.pair');
+    for (var i=0;i<pairs.length;i++){
+      var p = pairs[i]; p.classList.remove('stacked');
+      var l = p.querySelector('.pair-l'), r = p.querySelector('.pair-r');
+      if(!l || !r) continue;
+      var natural = function(node){
+        var c = node.cloneNode(true);
+        c.style.position='absolute'; c.style.visibility='hidden'; c.style.left='-9999px'; c.style.whiteSpace='nowrap';
+        p.appendChild(c); var w = c.getBoundingClientRect().width; p.removeChild(c); return w;
+      };
+      var gap = p.getBoundingClientRect().width - natural(l) - natural(r);
+      if (gap < space3) p.classList.add('stacked');
+    }
+  }
+  window.onload=function(){var go=function(){__fitPairs();setTimeout(function(){window.print();},120);};(document.fonts&&document.fonts.ready)?document.fonts.ready.then(go):go();window.onafterprint=function(){window.close();};};
+  <\/script>`;
+}
+
+function openPrintWindow(html) {
+  const w = window.open('', 'guru_print', 'width=900,height=760,scrollbars=yes');
+  if (w) { w.document.write(html); w.document.close(); }
+  else { showToast('Please allow pop-ups to use Print / PDF.', 'info'); }
+}
+
+export function printSavedBill(bill) {
+  const esc = printEsc;
+
+  // ─── Phase 27: merged empty/filled cylinder table ───
+  // Group customer lines by gas+size; within a group, pair returned-empty entries with
+  // handed-over-filled entries row by row. Personal (non-serialised) cylinders show
+  // "Personal Cylinder" instead of a serial. Rate/Amount populate only where a fill occurred
+  // (the Filled side of the row). No Qty column — a totals row carries the counts instead.
+  // Phase 28: personal (non-serialised) cylinders collapse to ONE row per group,
+  // shown as "Personal Cylinder ×N" — no longer one row per unit.
+  const groups = [];
+  const gmap = {};
+  for (const l of (bill.lines || [])) {
+    if (l.direction !== 'GIVEN' && l.direction !== 'RECEIVED') continue;
+    const key = (l.gas || '') + '||' + (l.size || '');
+    if (!gmap[key]) { gmap[key] = { gas: l.gas || '', size: l.size || '', empty: [], filled: [], pEmpty: 0, pFilled: 0, rate: 0 }; groups.push(gmap[key]); }
+    const g = gmap[key];
+    const serials = l.serials || [];
+    const pc = Number(l.personalCyl) || 0;
+    if (l.direction === 'RECEIVED') {
+      serials.forEach(s => g.empty.push({ label: s }));
+      g.pEmpty += pc;
+    } else {
+      const rate = Number(l.rate) || 0;
+      if (rate) g.rate = rate;
+      serials.forEach(s => g.filled.push({ label: s, rate }));
+      g.pFilled += pc;
+    }
+  }
+
+  let sr = 0, totEmpty = 0, totFilled = 0, totAmt = 0, body = '';
+  for (const g of groups) {
+    // Paired serialised rows (Phase 27 pairing).
+    const n = Math.max(g.empty.length, g.filled.length);
+    for (let i = 0; i < n; i++) {
+      const e = g.empty[i], f = g.filled[i];
+      if (e) totEmpty++;
+      let rateCell = '', amtCell = '';
+      if (f) { totFilled++; const a = Number(f.rate) || 0; rateCell = a.toFixed(2); amtCell = a.toFixed(2); totAmt += a; }
+      body += `<tr>
+        <td class="c">${++sr}</td><td>${esc(g.gas)}</td><td>${esc(g.size)}</td>
+        <td>${e ? esc(e.label) : ''}</td><td>${f ? esc(f.label) : ''}</td>
+        <td class="r">${rateCell}</td><td class="r">${amtCell}</td></tr>`;
+    }
+    // Phase 28: one consolidated personal-cylinder row per group.
+    if (g.pEmpty > 0 || g.pFilled > 0) {
+      totEmpty += g.pEmpty;
+      totFilled += g.pFilled;
+      const amt = g.pFilled * (Number(g.rate) || 0);
+      totAmt += amt;
+      const eCell = g.pEmpty > 0 ? `Personal Cylinder ×${g.pEmpty}` : '';
+      const fCell = g.pFilled > 0 ? `Personal Cylinder ×${g.pFilled}` : '';
+      const rateCell = g.pFilled > 0 ? (Number(g.rate) || 0).toFixed(2) : '';
+      const amtCell = g.pFilled > 0 ? amt.toFixed(2) : '';
+      body += `<tr>
+        <td class="c">${++sr}</td><td>${esc(g.gas)}</td><td>${esc(g.size)}</td>
+        <td>${eCell}</td><td>${fCell}</td>
+        <td class="r">${rateCell}</td><td class="r">${amtCell}</td></tr>`;
+    }
+  }
+
+  const mergedTable = groups.length ? `
+    <table class="ctab">
+      <thead><tr>
+        <th class="c" style="width:7%">Sr. No.</th><th>Gas Type</th><th>Size</th>
+        <th>Cylinder No. (Empty)</th><th>Cylinder No. (Filled)</th>
+        <th class="r" style="width:12%">Rate</th><th class="r" style="width:14%">Amount</th>
+      </tr></thead>
+      <tbody>${body}</tbody>
+      <tfoot><tr class="tot">
+        <td></td><td></td><td class="r">TOTAL</td>
+        <td class="c">${totEmpty}</td><td class="c">${totFilled}</td>
+        <td></td><td class="r">${totAmt.toFixed(2)}</td>
+      </tr></tfoot>
+    </table>` : '';
+
+  // Internal-transfer challans keep their own simple list (a move, not an empty/filled swap).
+  const transferLines = (bill.lines || []).filter(l => l.direction === 'TRANSFER');
+  let tSr = 0;
+  const transferRows = transferLines.map((l) => {
+    const nS = (l.serials || []).length, nP = Number(l.personalCyl) || 0;
+    let rows = '';
+    if (nS > 0) rows += `<tr><td class="c">${++tSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>${esc((l.serials || []).join(', '))}</td></tr>`;
+    if (nP > 0) rows += `<tr><td class="c">${++tSr}</td><td>${esc(l.gas)}</td><td>${esc(l.size)}</td><td>Personal Cylinder ×${nP}</td></tr>`;
+    return rows;
+  }).join('');
+  const transferSection = transferLines.length ? `
+    <div class="sec-title">Cylinders Transferred</div>
+    <table class="ctab">
+      <thead><tr><th class="c" style="width:8%">Sr. No.</th><th>Gas Type</th><th>Size</th><th>Cylinder No.</th></tr></thead>
+      <tbody>${transferRows}</tbody>
+    </table>` : '';
+
+  // Phase 28 patch: Vehicle moved out of the Ch.No. line — it now prints below GSTIN (see block).
+  const metaLeft = `Ch.No.: <b>${esc(bill.challan_no || '')}</b>`;
+  const metaRight = `Date: <b>${formatDate(bill.bill_date)}</b>`;
+
+  const docTitle = bill.customer_name ? esc(bill.customer_name) : 'Delivery Challan';
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${docTitle}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
+  <style>${printDocStyles()}</style></head><body>
+  ${printHeaderBox('Delivery Challan')}
+  ${printCustomerBlock(bill, metaLeft, metaRight, { showVehicle: true })}
+  ${mergedTable}
   ${transferSection}
   <div class="foot">
     <div class="note-h">નોંધ:</div>
@@ -195,12 +288,52 @@ export function printSavedBill(bill) {
     <div class="eng">First check the Goods and then take delivery.<br/>Subject to Palanpur Jurisdiction</div>
   </div>
   <div class="signs"><div>Customer Signature</div><div class="right">Guru Industries<br/>Authorised Signature</div></div>
-  <script>window.onload=function(){var go=function(){setTimeout(function(){window.print();},120);};(document.fonts&&document.fonts.ready)?document.fonts.ready.then(go):go();window.onafterprint=function(){window.close();};}<\/script>
+  ${printFitAndPrintScript()}
   </body></html>`;
 
-  const w = window.open('', 'guru_challan_print', 'width=900,height=760,scrollbars=yes');
-  if (w) { w.document.write(html); w.document.close(); }
-  else { showToast('Please allow pop-ups to use Print / PDF.', 'info'); }
+  openPrintWindow(html);
+}
+
+// ─── Phase 27: Currently Holding Cylinders statement ───
+// Reuses the challan header + customer block, but with a holding-status table and NO amounts
+// (this is a status document, not a billing document). `rows` come from the on-screen table.
+export function printHoldingStatement({ customer_name, customer_address, customer_contact, customer_gst, rows }) {
+  const esc = printEsc;
+  const bodyRows = (rows || []).map((r, i) => `
+    <tr>
+      <td class="c">${i + 1}</td>
+      <td>${esc(r.serial_number || '')}</td>
+      <td>${esc(r.gas_type || '')}</td>
+      <td>${esc(r.size || '')}</td>
+      <td class="c">${r.date_filled ? formatDate(r.date_filled) : ''}</td>
+      <td class="c">${r.days_held == null ? '' : esc(r.days_held)}</td>
+      <td>${esc(r.bill_number || '')}</td>
+      <td>${esc(r.challan_no || '')}</td>
+    </tr>`).join('');
+
+  const table = `
+    <table class="ctab">
+      <thead><tr>
+        <th class="c" style="width:6%">Sr.</th><th>Serial No.</th><th>Gas Type</th><th>Size</th>
+        <th class="c">Date Filled</th><th class="c">Days Held</th><th>Bill No.</th><th>Challan No.</th>
+      </tr></thead>
+      <tbody>${bodyRows || `<tr><td class="c" colspan="8">No cylinders currently held.</td></tr>`}</tbody>
+      <tfoot><tr class="tot"><td class="r" colspan="3">TOTAL HELD</td><td class="c">${(rows || []).length}</td><td colspan="4"></td></tr></tfoot>
+    </table>`;
+
+  const bill = { customer_name, customer_address, customer_contact, customer_gst };
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(customer_name || 'Currently Holding Cylinders')}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
+  <style>${printDocStyles()}</style></head><body>
+  ${printHeaderBox('Currently Holding Cylinders Statement')}
+  ${printCustomerBlock(bill, '', `Date: <b>${formatDate(new Date())}</b>`)}
+  ${table}
+  <div class="signs"><div>Customer Signature</div><div class="right">Guru Industries<br/>Authorised Signature</div></div>
+  ${printFitAndPrintScript()}
+  </body></html>`;
+
+  openPrintWindow(html);
 }
 
 // ─── Step-up verification modal (Phase 17 — consumed by Phase 18's gated actions) ───
@@ -343,6 +476,11 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   const [billDate, setBillDate] = useState(new Date().toISOString().split('T')[0]);
   const [challanNo, setChallanNo] = useState('');
   const [challanError, setChallanError] = useState('');
+  // Phase 27: Bill Number is prefilled from the sequence but freely editable (like Challan No.);
+  // Vehicle Number is optional and never blocks save.
+  const [billNumber, setBillNumber] = useState('');
+  const [billNumberEdited, setBillNumberEdited] = useState(false); // don't clobber a manual edit on refetch
+  const [vehicleNumber, setVehicleNumber] = useState('');
   const [remarks, setRemarks] = useState('');
   const [givenItems, setGivenItems] = useState([]);
   // Internal transfer PC quantities (Phase 11): [{ gas_type_id, cylinder_size_id, quantity }].
@@ -412,6 +550,20 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     fetchLocationContext();
   }, []);
 
+  // Phase 27: prefill Bill Number from the sequence. Only fills the default while the user
+  // hasn't hand-edited it and we're not editing/resuming an existing bill.
+  const fetchNextBillNumber = async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/bills/next-number`);
+      if (!res.ok) return;
+      const { bill_number } = await res.json();
+      setBillNumber(cur => (billNumberEdited || cur) ? cur : (bill_number || ''));
+    } catch { /* leave blank; backend still auto-numbers if empty */ }
+  };
+  useEffect(() => {
+    if (!editingBillId && !draftId && !billNumberEdited && !billNumber) fetchNextBillNumber();
+  }, []);
+
   // active_location drives the default site for this transaction (still changeable per-transaction);
   // the per-site challan prefixes come from the same endpoint.
   const fetchLocationContext = async () => {
@@ -463,6 +615,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     transactionType,
     billDate,
     challanNo,
+    billNumber,       // Phase 27
+    vehicleNumber,    // Phase 27
     location,
     fromLocation,
     toLocation,
@@ -519,6 +673,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     setTransactionType(p.transactionType || 'GIVEN');
     setBillDate(p.billDate || new Date().toISOString().split('T')[0]);
     setChallanNo(p.challanNo || '');
+    if (p.billNumber) { setBillNumber(p.billNumber); setBillNumberEdited(true); }
+    setVehicleNumber(p.vehicleNumber || '');
     if (p.location) setLocation(p.location);
     if (p.fromLocation) setFromLocation(p.fromLocation);
     if (p.toLocation) setToLocation(p.toLocation);
@@ -957,6 +1113,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
       bill_date: billDate,
       transaction_type: transactionType,
       challan_no: composeChallan(),
+      bill_number: billNumber.trim() || undefined, // Phase 27: user-editable; blank → backend auto-numbers
+      vehicle_number: vehicleNumber.trim(),        // Phase 27: optional
       location,
       remarks,
       given_items: activeGivenItems.length > 0 ? activeGivenItems.map(it => ({
@@ -998,7 +1156,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         const response = await apiFetch(`${API_URL}/bills/${editingBillId}`, {
           method: 'PUT',
           headers: stepUpAuth ? { 'x-step-up-token': stepUpAuth.step_up_token } : {},
-          body: JSON.stringify({ bill_date: billDate, challan_no: composeChallan(), transaction_type: transactionType, logEdit: false, line_items })
+          body: JSON.stringify({ bill_date: billDate, challan_no: composeChallan(), vehicle_number: vehicleNumber.trim(), transaction_type: transactionType, logEdit: false, line_items })
         });
         if (response.ok) {
           await response.json();
@@ -1008,6 +1166,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
             customer_name: selectedCustomer?.company_name || oneTimeCustomer.company_name,
             customer_address: selectedCustomer?.address || oneTimeCustomer.address || '',
             customer_gst: selectedCustomer?.gst_number || '',
+            customer_contact: selectedCustomer?.phone_primary || '',
+            vehicle_number: vehicleNumber.trim(),
             is_filling_vendor: isVendor,
             bill_date: billDate, transaction_type: transactionType, lines: summaryLines
           });
@@ -1036,6 +1196,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           customer_name: selectedCustomer?.company_name || oneTimeCustomer.company_name,
           customer_address: selectedCustomer?.address || oneTimeCustomer.address || '',
           customer_gst: selectedCustomer?.gst_number || '',
+          customer_contact: selectedCustomer?.phone_primary || '',
+          vehicle_number: vehicleNumber.trim(),
           is_filling_vendor: isVendor,
           bill_date: billDate,
           transaction_type: transactionType,
@@ -1061,6 +1223,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     // The challan input holds the full value now (Phase 14) — put it back verbatim.
     setChallanNo(savedBill.challan_no || '');
     setChallanError('');
+    // Phase 27: carry the bill number + vehicle number back into the form for the edit.
+    setBillNumber(savedBill.bill_number || '');
+    setBillNumberEdited(true);
+    setVehicleNumber(savedBill.vehicle_number || '');
 
     // Internal transfer (Phase 13): rebuild the transfer form — cylinders + PC quantities.
     if (savedBill.transaction_type === 'TRANSFER') {
@@ -1618,7 +1784,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
                         onClick={() => { setSelectedCustomer(c); setCustQuery(c.company_name); setCustOpen(false); }}
                         style={{padding:'0.5rem 0.75rem', cursor:'pointer', fontSize:'0.85rem', borderBottom:'1px solid #f1f5f9'}}>
                         <strong>{c.company_name}</strong>
-                        {c.contact_person ? ` · ${c.contact_person}` : ''} {c.phone_primary ? ` · ${c.phone_primary}` : ''}
+                        {c.contact_person ? ` · ${c.contact_person}` : ''} {displayContact(c.phone_primary) ? ` · ${displayContact(c.phone_primary)}` : ''}
                       </div>
                     ));
                   })()}
@@ -1629,7 +1795,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
             {selectedCustomer && (
               <div style={{marginTop: '1rem', padding: '1rem', backgroundColor: '#f8f9fa', borderRadius: '4px'}}>
                 <p><strong>Name:</strong> {selectedCustomer.company_name}</p>
-                <p><strong>Contact:</strong> {selectedCustomer.phone_primary}</p>
+                <p><strong>Contact:</strong> {displayContact(selectedCustomer.phone_primary)}</p>
                 <p><strong>Current Bill Amount:</strong> ₹{selectedCustomer.current_bill_amount?.toFixed(2)}</p>
                 <p><strong>Cylinders Held:</strong> {selectedCustomer.cylinders_held}</p>
                 <p><strong>Holding Limit:</strong> {selectedCustomer.is_filling_vendor ? '∞ Unlimited (filling vendor)' : selectedCustomer.holding_limit}</p>
@@ -1689,8 +1855,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           </div>
         )}
 
-        {/* Bill Details */}
-        <div className="form-row">
+        {/* Bill Details — Phase 27: two rows of three.
+            Row 1: Bill Date | Transaction Type | Location
+            Row 2: Bill Number | Vehicle Number | Challan No. (Challan sits under Location). */}
+        <div className="form-row cols-3">
           <div className="form-group">
             <label>Bill Date</label>
             <input
@@ -1701,7 +1869,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
               required
             />
           </div>
-          {!isInternal && (
+          {!isInternal ? (
             <div className="form-group">
               <label>Transaction Type</label>
               <select
@@ -1714,8 +1882,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
                 <option value="SWAP">{isVendor ? 'Swap (Send + Receive Filled)' : 'Swap (Filled + Empty)'}</option>
               </select>
             </div>
-          )}
-          {!isInternal && (
+          ) : <div className="form-group" aria-hidden="true" />}
+          {!isInternal ? (
             <div className="form-group">
               <label>Location *</label>
               <select
@@ -1726,7 +1894,31 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
                 {LOCATIONS.map(l => <option key={l} value={l}>{LOCATION_LABELS[l]}</option>)}
               </select>
             </div>
-          )}
+          ) : <div className="form-group" aria-hidden="true" />}
+        </div>
+        <div className="form-row cols-3">
+          <div className="form-group">
+            <label>Bill Number</label>
+            {/* Prefilled with the next number in sequence, but fully editable like Challan No. —
+                backspace/retype freely. Left blank, the backend assigns the next number. */}
+            <input
+              type="text"
+              className="form-control"
+              value={billNumber}
+              onChange={(e) => { setBillNumber(e.target.value); setBillNumberEdited(true); }}
+              placeholder="Auto (editable)"
+            />
+          </div>
+          <div className="form-group">
+            <label>Vehicle Number <span style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>(optional)</span></label>
+            <input
+              type="text"
+              className="form-control"
+              value={vehicleNumber}
+              onChange={(e) => setVehicleNumber(e.target.value.toUpperCase())}
+              placeholder="e.g. GJ08AB1234"
+            />
+          </div>
           <div className="form-group">
             <label>Challan No. *</label>
             {/* One ordinary editable input (Phase 14): pre-filled with the site's prefix as
@@ -1986,10 +2178,20 @@ export function CylinderItem({ item, index, gasTypes, cylinderSizes, availableCy
       const cyl = searchPool.find(c => c.rotational_number.toLowerCase() === text.toLowerCase())
         || pool.find(c => c.rotational_number.toLowerCase() === text.toLowerCase());
       if (cyl && !matchesLine(cyl)) { setLineError(mismatchMessage(cyl)); return; }
-      if (cyl) onSelectCylinder(cyl); // typed an exact available number without selecting: auto-fill + add
-      else if (notFoundMessage) { setLineError(notFoundMessage); return; }
-      else if (!item.gas_type_id || !item.cylinder_size_id) { setLineError('Select gas type and size first, then type the cylinder number.'); return; }
-      else onAddSerial(text);
+      if (cyl) { onSelectCylinder(cyl); } // typed an exact eligible number without selecting: auto-fill + add
+      else {
+        // Phase 28: restore existence/eligibility gate. A typed number that isn't in the
+        // eligible pool is NEVER added blindly — it's either fabricated (unknown to inventory)
+        // or a real cylinder in the wrong state/location. Give a specific message for each.
+        if (!item.gas_type_id || !item.cylinder_size_id) { setLineError('Select gas type and size first, then search the cylinder number.'); return; }
+        const knownCyl = [...knownRotational].some(r => String(r).toLowerCase() === text.toLowerCase());
+        if (knownCyl) {
+          setLineError(notFoundMessage || `Cylinder "${text}" isn't available for this line — check its gas type/size, and that it is in stock at this location (Filled) or currently with the customer (Empty).`);
+        } else {
+          setLineError(notFoundMessage || `Cylinder "${text}" was not found in inventory. Only registered cylinders can be added.`);
+        }
+        return;
+      }
     }
     setQuery('');
     setPendingCyl(null);
@@ -2293,7 +2495,7 @@ export function RentalSummaryModal({ customer, customerId, onClose, onGenerated 
       <div>
         <div><strong>M/s.: ${esc(c.customer.company_name)}</strong></div>
         ${c.customer.address ? `<div>${esc(c.customer.address)}</div>` : ''}
-        ${c.customer.phone_primary ? `<div>Phone: ${esc(c.customer.phone_primary)}</div>` : ''}
+        ${displayContact(c.customer.phone_primary) ? `<div>Phone: ${esc(displayContact(c.customer.phone_primary))}</div>` : ''}
         ${c.customer.gst_number ? `<div>GSTIN: ${esc(c.customer.gst_number)}</div>` : ''}
       </div>
       <div style="text-align:right">

@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
-import { TransactionEntry, StepUpVerificationModal } from './components.jsx';
+import { TransactionEntry, StepUpVerificationModal, displayContact } from './components.jsx';
 import { CustomerDetail, Payments, CylinderInventory, CylinderAgingReport, TransactionHistory, Reports, PaymentForm, FillingListPage } from './pages.jsx';
 
 export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
@@ -588,21 +588,32 @@ export function DashboardCharts({ stock, onNavigate }) {
 export const INITIAL_BATCH = 50;
 const BACKGROUND_BATCH = 200; // server clamps `limit` to 200 (utils/paginate.js)
 
-export function useBatchList(buildUrl, deps) {
+// Phase 29: an OPTIONAL cap for lists with unbounded growth (Transaction History). When
+// `options.cap` is set, "View All" batch-loads only the most recent `cap` records, then stops
+// auto-loading; beyond that the caller shows a "Load N more" control wired to `loadMore`, which
+// fetches exactly `options.increment` older records per click. When no options are passed the
+// behaviour is byte-identical to before — Customers and Cylinder Inventory are unaffected.
+export function useBatchList(buildUrl, deps, options = {}) {
+  const cap = Number(options.cap) || 0;              // 0 = uncapped (full background batch-load)
+  const increment = Number(options.increment) || 100;
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [loadingAll, setLoadingAll] = useState(false);
   const [loadedAll, setLoadedAll] = useState(false);
+  const [capReached, setCapReached] = useState(false); // hit `cap` with more still on the server
+  const [loadingMore, setLoadingMore] = useState(false);
 
   const buildRef = useRef(buildUrl);
   buildRef.current = buildUrl;              // always call the latest closure, never a stale one
   const reqRef = useRef(0);                 // guards against out-of-order responses
+  const rowsRef = useRef([]);
+  rowsRef.current = rows;                   // current length, read inside loadMore without stale closure
   const key = JSON.stringify(deps);
 
   const loadFirst = useCallback(async () => {
     const reqId = ++reqRef.current;
-    setLoading(true); setLoadingAll(false); setLoadedAll(false);
+    setLoading(true); setLoadingAll(false); setLoadedAll(false); setCapReached(false); setLoadingMore(false);
     try {
       const res = await apiFetch(buildRef.current(1, INITIAL_BATCH));
       const { ok, rows: got, pagination, error } = await readListResponse(res);
@@ -627,32 +638,89 @@ export function useBatchList(buildUrl, deps) {
     setLoadingAll(true);
     const acc = [];
     try {
-      const pages = Math.ceil(total / BACKGROUND_BATCH) || 1;
+      // Capped lists batch-load only the most recent `cap` rows; uncapped lists load everything.
+      const target = cap ? Math.min(total, cap) : total;
+      const pages = Math.ceil(target / BACKGROUND_BATCH) || 1;
       for (let p = 1; p <= pages; p++) {
         const res = await apiFetch(buildRef.current(p, BACKGROUND_BATCH));
         const { ok, rows: got, error } = await readListResponse(res);
         if (reqId !== reqRef.current) return; // filters changed mid-load — abandon quietly
         if (!ok) { showToast(error); break; }
         acc.push(...got);
-        setRows([...acc]);                  // grow in place; earlier rows keep their index
+        const capped = cap ? acc.slice(0, cap) : acc;
+        setRows([...capped]);               // grow in place; earlier rows keep their index
         if (got.length < BACKGROUND_BATCH) break;
+        if (cap && capped.length >= cap) break;
       }
-      if (reqId === reqRef.current) setLoadedAll(true);
+      if (reqId === reqRef.current) {
+        const loaded = cap ? Math.min(acc.length, cap) : acc.length;
+        // Reached the cap with more still on the server → switch to manual "Load N more".
+        if (cap && total > cap && loaded >= cap) setCapReached(true);
+        else setLoadedAll(true);
+      }
     } catch (e) {
       console.error('Background list load failed:', e);
     }
     if (reqId === reqRef.current) setLoadingAll(false);
-  }, [total]);
+  }, [total, cap]);
 
-  return { rows, total, loading, loadingAll, loadedAll, loadAll, reload: loadFirst };
+  // Phase 29: explicit "Load `increment` more" for capped lists — fetches the next block of older
+  // records (offset = rows already loaded). `cap` and `increment` are multiples of each other and
+  // of the row count, so page math stays exact until the final (possibly short) block.
+  const loadMore = useCallback(async () => {
+    const reqId = reqRef.current;
+    setLoadingMore(true);
+    try {
+      const offset = rowsRef.current.length;
+      const pageNum = Math.floor(offset / increment) + 1;
+      const res = await apiFetch(buildRef.current(pageNum, increment));
+      const { ok, rows: got, error } = await readListResponse(res);
+      if (reqId !== reqRef.current) return;
+      if (!ok) { showToast(error); }
+      else {
+        setRows(prev => [...prev, ...got]);
+        if (got.length < increment || offset + got.length >= total) setLoadedAll(true);
+      }
+    } catch (e) {
+      console.error('Load-more failed:', e);
+    }
+    if (reqId === reqRef.current) setLoadingMore(false);
+  }, [increment, total]);
+
+  return { rows, total, loading, loadingAll, loadedAll, loadAll, reload: loadFirst,
+           capReached, loadingMore, loadMore, increment };
 }
 
 // The "View All (N)" footer for a useBatchList-backed table.
-export function BatchListFooter({ shown, total, loadedAll, loadingAll, onLoadAll, noun = 'records' }) {
+// Phase 29: optional capped-mode props (cap/capReached/onLoadMore/loadingMore/increment). When
+// `cap` is 0 (the default) none of the new branches fire and the output is unchanged — so
+// Customers and Cylinder Inventory keep their exact "View All → full batch-load" footer.
+export function BatchListFooter({ shown, total, loadedAll, loadingAll, onLoadAll, noun = 'records',
+                                  cap = 0, capReached = false, onLoadMore, loadingMore = false, increment = 100 }) {
   if (loadingAll) {
+    const target = cap ? Math.min(total, cap) : total;
     return <div style={{ textAlign: 'center', padding: '1rem' }}>
-      <Spinner label={`Loading all ${total.toLocaleString()} ${noun}… (${shown.toLocaleString()} so far)`} />
+      <Spinner label={`Loading ${target.toLocaleString()} ${noun}… (${shown.toLocaleString()} so far)`} />
     </div>;
+  }
+  if (loadingMore) {
+    return <div style={{ textAlign: 'center', padding: '1rem' }}>
+      <Spinner label={`Loading ${increment} more…`} />
+    </div>;
+  }
+  // Capped list: most recent `cap` auto-loaded, more remain → manual "Load N more" from here on.
+  if (cap && capReached && shown < total) {
+    const remaining = total - shown;
+    return (
+      <div style={{ textAlign: 'center', padding: '1rem' }}>
+        <button className="btn btn-secondary" onClick={onLoadMore}>
+          Load {Math.min(increment, remaining).toLocaleString()} more →
+        </button>
+        <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: '0.35rem' }}>
+          Showing {shown.toLocaleString()} of {total.toLocaleString()} (most recent {cap.toLocaleString()} auto-loaded). Search covers all {total.toLocaleString()}.
+        </div>
+      </div>
+    );
   }
   if (loadedAll || shown >= total) {
     return <div style={{ textAlign: 'center', padding: '1rem', fontSize: '0.82rem', color: 'var(--text-muted)' }}>
@@ -1801,7 +1869,7 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
     { header: 'Type', cell: (item) => item.customer_type === 'ONE_TIME'
         ? <span className="badge badge-warning">One-Time</span> : <span className="badge badge-success">Regular</span> },
     { header: 'Contact', cell: (item) => item.contact_person || '-' },
-    { header: 'Phone', cell: (item) => item.phone_primary || '-' },
+    { header: 'Phone', cell: (item) => displayContact(item.phone_primary) || '-' },
     { header: 'Total Billed', cell: (item) => `₹${(item.total_billed || 0).toFixed(2)}` },
     { header: 'Total Paid', cell: (item) => `₹${(item.total_paid || 0).toFixed(2)}` },
     { header: 'Outstanding', cell: (item) => <strong style={{color:'#e74c3c'}}>₹{(item.outstanding_amount || 0).toFixed(2)}</strong> },
@@ -1843,7 +1911,7 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
                 'Customer': r.company_name,
                 'Type': r.customer_type,
                 'Contact': r.contact_person || '',
-                'Phone': r.phone_primary || '',
+                'Phone': displayContact(r.phone_primary),
                 'Total Billed': r.total_billed || 0,
                 'Total Paid': r.total_paid || 0,
                 'Outstanding': r.outstanding_amount || 0
@@ -1894,7 +1962,7 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
                       }
                     </td>
                     <td>{item.contact_person || '-'}</td>
-                    <td>{item.phone_primary || '-'}</td>
+                    <td>{displayContact(item.phone_primary) || '-'}</td>
                     <td>₹{(item.total_billed || 0).toFixed(2)}</td>
                     <td>₹{(item.total_paid || 0).toFixed(2)}</td>
                     <td><strong style={{color: '#e74c3c'}}>₹{(item.outstanding_amount || 0).toFixed(2)}</strong></td>
@@ -2784,7 +2852,7 @@ export function Dashboard({ onNavigate }) {
                     <td>{customer.cylinders_held}</td>
                     <td>{customer.holding_limit}</td>
                     <td><strong>{customer.cylinders_held - customer.holding_limit}</strong></td>
-                    <td>{customer.phone_primary}</td>
+                    <td>{displayContact(customer.phone_primary)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -2840,7 +2908,7 @@ export function CustomerMaster({ onNavigate, onSelectCustomer, initialFilter = n
     { header: 'Sr. No.', cell: (c, i) => i + 1 },
     { header: 'Customer Name', cell: (c) => <span className="clickable" onClick={() => { onSelectCustomer(c.customer_id); onNavigate('customer-detail'); }}>{c.company_name}{c.is_filling_vendor ? ' 🏭' : ''}</span> },
     { header: 'Contact Person', cell: (c) => c.contact_person || '-' },
-    { header: 'Phone', cell: (c) => c.phone_primary || '-' },
+    { header: 'Phone', cell: (c) => displayContact(c.phone_primary) || '-' },
     { header: 'GST No.', cell: (c) => c.gst_number || '-' },
     { header: 'Holding Limit', cell: (c) => c.is_filling_vendor ? 'Unlimited' : c.holding_limit },
     { header: 'Cylinders Held', cell: (c) => c.cylinders_held },
@@ -2931,7 +2999,7 @@ export function CustomerMaster({ onNavigate, onSelectCustomer, initialFilter = n
               'Sr.': i+1,
               'Company Name': c.company_name,
               'Contact Person': c.contact_person || '',
-              'Phone': c.phone_primary || '',
+              'Phone': displayContact(c.phone_primary),
               'Holding Limit': c.is_filling_vendor ? 'Unlimited' : (c.holding_limit || 0),
               'Cylinders Held': c.cylinders_held || 0,
               'Bill Amount': c.current_bill_amount || 0,

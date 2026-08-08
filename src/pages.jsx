@@ -8,7 +8,7 @@ import {
   LOCATIONS, LOCATION_LABELS, locationText, stockStateText, cylinderStateText,
   Pagination, useDebounce, useBatchList, BatchListFooter
 } from './App.jsx';
-import { printSavedBill, RentalSummaryModal, StepUpVerificationModal } from './components.jsx';
+import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact } from './components.jsx';
 
 const esc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -160,7 +160,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     const infoRows = [
       { Field: 'Company Name',        Value: customer.company_name || '' },
       { Field: 'Contact Person',       Value: customer.contact_person || '' },
-      { Field: 'Primary Contact',      Value: customer.phone_primary || '' },
+      { Field: 'Primary Contact',      Value: displayContact(customer.phone_primary) },
       { Field: 'Telephone Number',     Value: customer.phone_alternate || '' },
       { Field: 'Additional Contacts',  Value: contactsStr },
       { Field: 'Address',              Value: customer.address || '' },
@@ -232,7 +232,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       .map(c => c.name ? `${esc(c.name)}: ${esc(c.number)}` : esc(c.number)).join(', ');
 
     const infoTable = `<table style="width:auto;margin-bottom:8px">
-      <tr><td><b>Company</b></td><td>${esc(customer.company_name)}</td><td style="padding-left:20px"><b>Primary Contact</b></td><td>${esc(customer.phone_primary || '')}</td></tr>
+      <tr><td><b>Company</b></td><td>${esc(customer.company_name)}</td><td style="padding-left:20px"><b>Primary Contact</b></td><td>${esc(displayContact(customer.phone_primary))}</td></tr>
       <tr><td><b>Contact</b></td><td>${esc(customer.contact_person || '')}</td><td style="padding-left:20px"><b>Telephone</b></td><td>${esc(customer.phone_alternate || '')}</td></tr>
       <tr><td><b>GST</b></td><td>${esc(customer.gst_number || '')}</td><td style="padding-left:20px"><b>Cylinders Held</b></td><td>${customer.cylinders_held || 0}</td></tr>
       ${contactsStr ? `<tr><td><b>Other Contacts</b></td><td colspan="3">${contactsStr}</td></tr>` : ''}
@@ -436,7 +436,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
           <div>
             <p><strong>Company Name:</strong> {customer.company_name}</p>
             <p><strong>Contact Person:</strong> {customer.contact_person}</p>
-            <p><strong>Primary Contact:</strong> {customer.phone_primary}</p>
+            <p><strong>Primary Contact:</strong> {displayContact(customer.phone_primary)}</p>
             {customer.phone_alternate && <p><strong>Telephone Number:</strong> {customer.phone_alternate}</p>}
             {Array.isArray(customer.additional_contacts) && customer.additional_contacts.length > 0 && (
               <p><strong>Additional Contacts:</strong>{' '}
@@ -621,9 +621,24 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       <div className="card" id="currently-holding">
         <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
           <h2 style={{margin:0, border:'none', padding:0}}>Currently Holding Cylinders ({heldCylinders.length})</h2>
-          {customer.status === 'OVER LIMIT' && (
-            <span className="badge badge-danger">Over limit by {(customer.cylinders_held || 0) - (customer.holding_limit || 0)}</span>
-          )}
+          <div style={{display:'flex', alignItems:'center', gap:'0.5rem', flexWrap:'wrap'}}>
+            {customer.status === 'OVER LIMIT' && (
+              <span className="badge badge-danger">Over limit by {(customer.cylinders_held || 0) - (customer.holding_limit || 0)}</span>
+            )}
+            {/* Phase 27: print a holding-status statement (no amounts) reusing the challan header. */}
+            <button className="btn btn-secondary" disabled={!heldCylinders.length}
+              onClick={() => printHoldingStatement({
+                customer_name: customer.company_name,
+                customer_address: customer.address,
+                customer_contact: customer.phone_primary,
+                customer_gst: customer.gst_number,
+                rows: heldCylinders.map(c => ({
+                  serial_number: c.serial_number, gas_type: c.gas_type_name, size: c.size_label,
+                  date_filled: c.date_given, days_held: daysHeld(c.date_given),
+                  bill_number: c.bill_number, challan_no: c.challan_no
+                }))
+              })}>🖨 Print Statement</button>
+          </div>
         </div>
         <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
           Cylinders this customer holds right now. Any cylinder returned by another customer on their
@@ -1098,7 +1113,7 @@ export function getReportRows(reportType, data) {
       return data.map((c, i) => ({
         'Sr': i + 1,
         'Company Name': c.company_name || '',
-        'Phone': c.phone_primary || '',
+        'Phone': displayContact(c.phone_primary),
         'GST No': c.gst_number || '',
         'Security Deposit': rs(c.security_deposit),
         'Holding Limit': c.is_filling_vendor ? 'Unlimited' : (c.holding_limit || 0),
@@ -1110,7 +1125,7 @@ export function getReportRows(reportType, data) {
       return data.map((c, i) => ({
         'Sr': i + 1,
         'Company Name': c.company_name || '',
-        'Phone': c.phone_primary || '',
+        'Phone': displayContact(c.phone_primary),
         'Cylinders Held': c.cylinders_held || 0,
         'Holding Limit': c.holding_limit || 0,
         'Over By': (c.cylinders_held || 0) - (c.holding_limit || 0)
@@ -1120,7 +1135,7 @@ export function getReportRows(reportType, data) {
         'Sr': i + 1,
         'Company Name': o.company_name || '',
         'Contact Person': o.contact_person || '',
-        'Phone': o.phone_primary || '',
+        'Phone': displayContact(o.phone_primary),
         'Total Billed': rs(o.total_billed),
         'Total Paid': rs(o.total_paid),
         'Outstanding': rs(o.outstanding_amount)
@@ -1130,7 +1145,7 @@ export function getReportRows(reportType, data) {
         'Sr': i + 1,
         'Company Name': d.company_name || '',
         'Contact Person': d.contact_person || '',
-        'Phone': d.phone_primary || '',
+        'Phone': displayContact(d.phone_primary),
         'Security Deposit': rs(d.security_deposit)
       }));
     default:
@@ -1707,7 +1722,7 @@ export function ReportTable({ reportType, data }) {
             {visible.map((item, index) => (
               <tr key={item.customer_id || index} className="row-over-limit">
                 <td>{item.company_name || 'N/A'}</td>
-                <td>{item.phone_primary || 'N/A'}</td>
+                <td>{displayContact(item.phone_primary) || 'N/A'}</td>
                 <td>{item.cylinders_held || 0}</td>
                 <td>{item.holding_limit || 0}</td>
                 <td><strong>{(item.cylinders_held || 0) - (item.holding_limit || 0)}</strong></td>
@@ -1731,7 +1746,7 @@ export function ReportTable({ reportType, data }) {
             {visible.map((item, index) => (
               <tr key={item.customer_id || index}>
                 <td>{item.company_name || 'N/A'}</td>
-                <td>{item.phone_primary || 'N/A'}</td>
+                <td>{displayContact(item.phone_primary) || 'N/A'}</td>
                 <td>₹{(item.outstanding_amount || 0).toFixed(2)}</td>
               </tr>
             ))}
@@ -1755,7 +1770,7 @@ export function ReportTable({ reportType, data }) {
               <tr key={item.customer_id || index}>
                 <td>{item.company_name || 'N/A'}</td>
                 <td>{item.contact_person || 'N/A'}</td>
-                <td>{item.phone_primary || 'N/A'}</td>
+                <td>{displayContact(item.phone_primary) || 'N/A'}</td>
                 <td>₹{(item.security_deposit || 0).toFixed(2)}</td>
               </tr>
             ))}
@@ -1792,7 +1807,7 @@ export function ReportTable({ reportType, data }) {
                 >
                   <td>{index + 1}</td>
                   <td>{item.company_name || 'N/A'}</td>
-                  <td>{item.phone_primary || '-'}</td>
+                  <td>{displayContact(item.phone_primary) || '-'}</td>
                   <td><strong>₹{(item.bill_amount || 0).toFixed(2)}</strong></td>
                   <td>{item.cylinder_hold || 0}</td>
                   <td>{item.is_filling_vendor ? 'Unlimited' : (item.holding_limit || 0)}</td>
@@ -2081,10 +2096,10 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
                 ) : list.map(c => (
                   <div key={c._id}
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => { setFormData({ ...formData, customer_id: c._id }); setCustQuery(`${c.company_name}${c.phone_primary ? ' - ' + c.phone_primary : ''}`); setCustOpen(false); }}
+                    onClick={() => { setFormData({ ...formData, customer_id: c._id }); setCustQuery(`${c.company_name}${displayContact(c.phone_primary) ? ' - ' + displayContact(c.phone_primary) : ''}`); setCustOpen(false); }}
                     style={{padding:'0.5rem 0.75rem', cursor:'pointer', fontSize:'0.85rem', borderBottom:'1px solid #f1f5f9'}}>
                     <strong>{c.company_name}</strong>
-                    {c.contact_person ? ` · ${c.contact_person}` : ''} {c.phone_primary ? ` · ${c.phone_primary}` : ''}
+                    {c.contact_person ? ` · ${c.contact_person}` : ''} {displayContact(c.phone_primary) ? ` · ${displayContact(c.phone_primary)}` : ''}
                   </div>
                 ));
               })()}
@@ -2728,9 +2743,13 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
     if (debouncedSearch) url += `&search=${encodeURIComponent(debouncedSearch)}`;
     return url;
   };
+  // Phase 29: Transaction History grows without bound (~15–20/day → tens of thousands/yr), so cap
+  // the automatic "View All" batch-load at the most recent 2,000; beyond that the footer offers a
+  // manual "Load 100 more". Server-side search still queries the FULL dataset (buildUrl carries it).
   const {
-    rows: bills, total, loading, loadingAll, loadedAll, loadAll, reload: load
-  } = useBatchList(buildUrl, [dateFilter, debouncedSearch]);
+    rows: bills, total, loading, loadingAll, loadedAll, loadAll, reload: load,
+    capReached, loadingMore, loadMore, increment
+  } = useBatchList(buildUrl, [dateFilter, debouncedSearch], { cap: 2000, increment: 100 });
 
   useEffect(() => {
     (async () => {
@@ -2749,6 +2768,8 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
       date: b.bill_date,
       bill_number: b.bill_number,
       challan_no: b.challan_no || '',
+      vehicle_number: b.vehicle_number || '', // Phase 27
+
       company_name: isTransfer
         ? `Internal Transfer: ${locationText(b.from_location)} → ${locationText(b.to_location)}`
         : (b.company_name || ''),
@@ -2774,7 +2795,7 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
     if (dateFilter && localYMD(r.date) !== dateFilter) return false;
     if (locFilter && !r.locations.includes(locFilter)) return false;
     if (!term) return true;
-    return [r.bill_number, r.challan_no, r.company_name, formatDate(r.date), directionText(r.transaction_type)]
+    return [r.bill_number, r.challan_no, r.vehicle_number, r.company_name, formatDate(r.date), directionText(r.transaction_type)]
       .some(v => String(v || '').toLowerCase().includes(term));
   });
 
@@ -2902,7 +2923,7 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
                         <td>{r.sr}</td>
                         <td>{formatDate(r.date)}</td>
                         <td><strong>{r.bill_number}</strong>{r.edited && <span className="badge badge-warning" style={{marginLeft:'0.35rem', fontSize:'0.62rem'}}>Updated</span>}</td>
-                        <td>{r.challan_no || '-'}</td>
+                        <td>{r.challan_no || '-'}{r.vehicle_number ? <div style={{fontSize:'0.7rem', color:'var(--text-muted)'}}>🚚 {r.vehicle_number}</div> : null}</td>
                         <td>{r.company_name}</td>
                         <td>{directionLabel(r.transaction_type)}</td>
                         <td>{r.cylinders}</td>
@@ -2914,7 +2935,9 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
               </tbody>
             </table>
             <BatchListFooter shown={bills.length} total={total} loadedAll={loadedAll}
-              loadingAll={loadingAll} onLoadAll={loadAll} noun="transactions" />
+              loadingAll={loadingAll} onLoadAll={loadAll} noun="transactions"
+              cap={2000} capReached={capReached} onLoadMore={loadMore}
+              loadingMore={loadingMore} increment={increment} />
           </div>
         )}
       </div>
@@ -3024,7 +3047,10 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
       customer_name: bill.company_name,
       customer_address: bill.address,
       customer_gst: bill.gst_number || '',
+      customer_contact: bill.phone_primary || '',
       challan_no: bill.challan_no,
+      vehicle_number: bill.vehicle_number || '',
+      is_filling_vendor: bill.is_filling_vendor,
       amount: bill.total_bill_amount || 0,
       lines: (bill.line_items || []).map(li => ({
         direction: li.direction, gas: li.gas_type_name, size: li.size_label,
@@ -3090,6 +3116,9 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
                 : locationText(bill.location)}</div>
             </div>
             <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Challan No.</div><div>{bill.challan_no || '-'}</div></div>
+            {bill.vehicle_number ? (
+              <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Vehicle No.</div><div>{bill.vehicle_number}</div></div>
+            ) : null}
             <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Total Amount</div><div><strong>₹{(bill.total_bill_amount || 0).toFixed(2)}</strong></div></div>
           </div>
 
@@ -3557,7 +3586,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
       {loading ? <Spinner label="Loading bill…" /> : (
         <>
           <div style={{background:'#f8fafc', border:'1px solid var(--border)', borderRadius:'6px', padding:'0.5rem 0.85rem', marginBottom:'0.85rem', fontSize:'0.85rem'}}>
-            <strong>Bill No.:</strong> {meta.bill_number} &nbsp;·&nbsp; <strong>Customer:</strong> {meta.company_name} {meta.phone_primary ? `(${meta.phone_primary})` : ''}
+            <strong>Bill No.:</strong> {meta.bill_number} &nbsp;·&nbsp; <strong>Customer:</strong> {meta.company_name} {displayContact(meta.phone_primary) ? `(${displayContact(meta.phone_primary)})` : ''}
           </div>
 
           <div className="form-row cols-3">
