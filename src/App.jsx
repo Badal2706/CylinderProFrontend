@@ -56,6 +56,24 @@ export const LOCATION_LABELS = {
   AT_CHHAPI_OFFICE: 'Chhapi Office'
 };
 export function locationText(loc) { return LOCATION_LABELS[loc] || loc || '—'; }
+
+// ─── Active Location — per-browser preference (Phase 32) ───
+// The default site for new transactions and location-aware report tabs is now stored PER
+// BROWSER in localStorage, not shared on the account. Switching it in one browser never changes
+// what any other browser/device defaults to. First visit (no stored value) falls back to
+// Chandisar Plant. Everything else on the settings page (Manager Name / Contact / Challan
+// Prefix per site) remains shared/global on the account.
+const ACTIVE_LOCATION_KEY = 'cylinderpro_active_location';
+export function getActiveLocation() {
+  try {
+    const v = localStorage.getItem(ACTIVE_LOCATION_KEY);
+    if (v && LOCATIONS.includes(v)) return v;
+  } catch { /* localStorage unavailable */ }
+  return 'AT_PLANT_CHANDISAR'; // sensible first-visit default
+}
+export function setActiveLocation(loc) {
+  try { if (LOCATIONS.includes(loc)) localStorage.setItem(ACTIVE_LOCATION_KEY, loc); } catch { /* ignore */ }
+}
 // Cylinder stock_state display label (IN_STOCK / AT_CUSTOMER).
 export function stockStateText(s) { return s === 'AT_CUSTOMER' ? 'At Customer' : 'In Stock'; }
 // Full state label for a cylinder document — maintenance is an independent flag that
@@ -3786,7 +3804,9 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   const [showClear, setShowClear] = useState(false);
   // Location profiles (Phase 2): 3 fixed sites, each with manager/contact/challan prefix,
   // plus the user's active (default) location.
-  const [locData, setLocData] = useState({ active_location: 'AT_PLANT_CHANDISAR', profiles: [] });
+  // active_location comes from THIS browser (localStorage), not the shared account (Phase 32);
+  // profiles (manager/contact/challan) still come from the server and stay shared.
+  const [locData, setLocData] = useState({ active_location: getActiveLocation(), profiles: [] });
   const [pendingSwitch, setPendingSwitch] = useState(null); // location awaiting confirm dialog
 
   // Account form
@@ -3818,7 +3838,8 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         setAcct({ name: a.name || '', phone: a.phone || '', email: a.email || '', current_password: '' });
       }
       if (bRes.ok) setBusiness(await bRes.json());
-      if (lRes.ok) setLocData(await lRes.json());
+      // Take the shared profiles from the server but keep Active Location per-browser (Phase 32).
+      if (lRes.ok) { const ld = await lRes.json(); setLocData({ ...ld, active_location: getActiveLocation() }); }
     } catch (e) {
       showToast('Could not load profile.');
     }
@@ -3934,20 +3955,14 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     });
   };
 
-  // Switching only changes defaults/views — confirmed via a plain dialog, no password needed.
-  const confirmSwitch = async () => {
+  // Switching only changes THIS browser's default/views — Phase 32: stored per-browser in
+  // localStorage, never on the shared account, so other browsers/devices are unaffected.
+  const confirmSwitch = () => {
     const target = pendingSwitch;
     setPendingSwitch(null);
-    try {
-      const res = await apiFetch(`${API_URL}/profile/active-location`, {
-        method: 'PATCH',
-        body: JSON.stringify({ location: target })
-      });
-      if (res.ok) {
-        setLocData(prev => ({ ...prev, active_location: target }));
-        showToast(`Active location switched to ${locationText(target)}.`, 'success');
-      } else showToast(await apiErrorMessage(res));
-    } catch { showToast('Could not switch active location.'); }
+    setActiveLocation(target); // localStorage, this browser only
+    setLocData(prev => ({ ...prev, active_location: target }));
+    showToast(`Active location for this browser switched to ${locationText(target)}.`, 'success');
   };
 
   // ── Password change — step-up-gated (Phase 19) ON TOP of the current-password check ──
@@ -4100,7 +4115,8 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         <h2>Active Location</h2>
         <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
           The site you are currently operating as. New transactions default to it (still changeable per-transaction).
-          Switching never alters existing bills, cylinders, or customers.
+          Saved for <strong>this browser only</strong> — switching here never changes what other browsers or devices
+          default to, and never alters existing bills, cylinders, or customers.
         </p>
         <div style={{display:'flex', gap:'0.6rem', flexWrap:'wrap'}}>
           {LOCATIONS.map(l => (
@@ -4270,7 +4286,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
       {pendingSwitch && (
         <ConfirmModal
           title="Switch active location?"
-          message={`Switch to ${locationText(pendingSwitch)}? This changes your default view.`}
+          message={`Switch to ${locationText(pendingSwitch)}? This changes the default for this browser only.`}
           confirmLabel="Switch"
           danger={false}
           onConfirm={confirmSwitch}

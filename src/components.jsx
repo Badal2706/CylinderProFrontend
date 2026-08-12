@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, Modal, Spinner } from './App.jsx';
+import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
 // A Filled line's amount is ALWAYS rate × (inventory cylinders + personal cylinders returned),
@@ -297,7 +297,7 @@ export function printSavedBill(bill) {
 // ─── Phase 27: Currently Holding Cylinders statement ───
 // Reuses the challan header + customer block, but with a holding-status table and NO amounts
 // (this is a status document, not a billing document). `rows` come from the on-screen table.
-export function printHoldingStatement({ customer_name, customer_address, customer_contact, customer_gst, rows }) {
+export function printHoldingStatement({ customer_name, customer_address, customer_contact, customer_gst, rows, breakdown }) {
   const esc = printEsc;
   const bodyRows = (rows || []).map((r, i) => `
     <tr>
@@ -321,6 +321,28 @@ export function printHoldingStatement({ customer_name, customer_address, custome
       <tfoot><tr class="tot"><td class="r" colspan="3">TOTAL HELD</td><td class="c">${(rows || []).length}</td><td colspan="4"></td></tr></tfoot>
     </table>`;
 
+  // Breakdown by Type (Phase 31) — final section after the full list, using the SAME data the
+  // on-screen Breakdown by Type shows (customer.cylinder_breakdown). Omitted when empty.
+  // Phase 32: the PRINTED table shows only Gas Type / Size / Currently Holding — Total Filled and
+  // Total Empty are dropped here (the on-screen version still shows all five columns).
+  const bd = Array.isArray(breakdown) ? breakdown : [];
+  const breakdownTable = bd.length ? `
+    <table class="ctab" style="margin-top:14px">
+      <thead><tr>
+        <th>Gas Type</th><th>Size</th><th class="c">Currently Holding</th>
+      </tr></thead>
+      <tbody>${bd.map(item => `
+        <tr>
+          <td>${esc(item.gas_type_name || '')}</td>
+          <td>${esc(item.size_label || '')}</td>
+          <td class="c"><b>${esc(item.currently_held ?? 0)}</b></td>
+        </tr>`).join('')}</tbody>
+      <tfoot><tr class="tot">
+        <td class="r" colspan="2">TOTAL</td>
+        <td class="c">${bd.reduce((s, x) => s + (Number(x.currently_held) || 0), 0)}</td>
+      </tr></tfoot>
+    </table>` : '';
+
   const bill = { customer_name, customer_address, customer_contact, customer_gst };
   const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(customer_name || 'Currently Holding Cylinders')}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
@@ -329,6 +351,7 @@ export function printHoldingStatement({ customer_name, customer_address, custome
   ${printHeaderBox('Currently Holding Cylinders Statement')}
   ${printCustomerBlock(bill, '', `Date: <b>${formatDate(new Date())}</b>`)}
   ${table}
+  ${breakdownTable ? `<h3 style="margin:16px 0 6px;font-size:12px">Breakdown by Type</h3>${breakdownTable}` : ''}
   <div class="signs"><div>Customer Signature</div><div class="right">Guru Industries<br/>Authorised Signature</div></div>
   ${printFitAndPrintScript()}
   </body></html>`;
@@ -574,11 +597,12 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
       const map = {};
       (data.profiles || []).forEach(p => { map[p.location] = p; });
       setLocProfiles(map);
-      if (data.active_location && LOCATIONS.includes(data.active_location)) {
-        setLocation(data.active_location);
-        setFromLocation(data.active_location);
-        setToLocation(LOCATIONS.find(l => l !== data.active_location) || LOCATIONS[1]);
-      }
+      // Phase 32: the default site comes from THIS browser's Active Location (localStorage),
+      // not the shared account. Still overridable per-transaction as before.
+      const active = getActiveLocation();
+      setLocation(active);
+      setFromLocation(active);
+      setToLocation(LOCATIONS.find(l => l !== active) || LOCATIONS[1]);
     } catch (e) {
       console.error('Error fetching location profiles:', e);
     }
@@ -622,7 +646,11 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     toLocation,
     remarks,
     givenItems,
-    receivedItems
+    receivedItems,
+    // Internal-transfer personal-cylinder quantities live in their own state (transferPc), not
+    // in givenItems/receivedItems — so they must be saved explicitly or a resumed transfer draft
+    // loses them (Phase 31). Harmless for customer drafts (empty array).
+    transferPc
   });
 
   const saveForLater = async () => {
@@ -681,6 +709,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     setRemarks(p.remarks || '');
     setGivenItems(Array.isArray(p.givenItems) ? p.givenItems : []);
     setReceivedItems(Array.isArray(p.receivedItems) ? p.receivedItems : []);
+    // Restore internal-transfer personal-cylinder quantities (Phase 31).
+    setTransferPc(Array.isArray(p.transferPc) ? p.transferPc : []);
     setDraftId(d.draft_id);
     setDraftBillNo(d.bill_number);
     setShowDrafts(false);

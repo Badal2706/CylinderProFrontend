@@ -1,11 +1,11 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import {
-  API_URL, apiFetch, apiErrorMessage, readListResponse, showToast, formatDate, formatDateTime,
+  API_URL, apiFetch, apiErrorMessage, readListResponse, fetchAllPages, showToast, formatDate, formatDateTime,
   getExportFileName, exportToExcel, useViewAll, Spinner, EmptyState, Modal,
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
-  LOCATIONS, LOCATION_LABELS, locationText, stockStateText, cylinderStateText,
+  LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, stockStateText, cylinderStateText,
   Pagination, useDebounce, useBatchList, BatchListFooter
 } from './App.jsx';
 import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact } from './components.jsx';
@@ -315,6 +315,18 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     { header: 'Days Held', cell: (c) => { const d = daysHeld(c.date_given); return d === null ? '—' : d; } },
     { header: 'Bill No.', cell: (c) => c.bill_number || '-' },
     { header: 'Challan No.', cell: (c) => c.challan_no || '-' }
+  ];
+
+  // Cylinder Aging History pagination (Phase 31) — 10 rows + "View All", same pattern as
+  // Currently Holding above. agingRows is the full dataset, so search in the modal sees everything.
+  const [agingVisible, agingMore, agingOpen, setAgingOpen] = useViewAll(agingRows, 10);
+  const agingColumns = [
+    { header: 'Rotational No.', cell: (r) => <strong>{r.serial_number}</strong> },
+    { header: 'Gas Type', cell: (r) => r.gas_type },
+    { header: 'Size', cell: (r) => r.capacity },
+    { header: 'Issued From', cell: (r) => locationText(r.location) },
+    { header: 'Date Given', cell: (r) => formatDate(r.date_given) },
+    { header: 'Days Held', cell: (r) => <strong>{r.days_held}</strong> }
   ];
 
   const givenColumns = [
@@ -636,7 +648,9 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                   serial_number: c.serial_number, gas_type: c.gas_type_name, size: c.size_label,
                   date_filled: c.date_given, days_held: daysHeld(c.date_given),
                   bill_number: c.bill_number, challan_no: c.challan_no
-                }))
+                })),
+                // Same data as the on-screen "Breakdown by Type" table (Phase 31).
+                breakdown: customer.cylinder_breakdown || []
               })}>🖨 Print Statement</button>
           </div>
         </div>
@@ -703,7 +717,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {agingRows.map((r) => (
+                {agingVisible.map((r) => (
                   <tr key={r.serial_number}>
                     <td><strong>{r.serial_number}</strong></td>
                     <td>{r.gas_type}</td>
@@ -715,6 +729,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 ))}
               </tbody>
             </table>
+            {agingMore && <ViewAllButton count={agingRows.length} onClick={() => setAgingOpen(true)} />}
           </div>
         )}
         {agingRows.length > 0 && (
@@ -723,6 +738,13 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
           </div>
         )}
       </div>
+
+      {agingOpen && (
+        <ListModal title="Cylinder Aging History" items={agingRows} columns={agingColumns}
+          searchKeys={['serial_number', 'gas_type', 'capacity']}
+          searchPlaceholder="Search by rotational no., gas type, or size…"
+          onClose={() => setAgingOpen(false)} />
+      )}
 
       {showRental && (
         <RentalSummaryModal
@@ -1314,15 +1336,8 @@ export function DSRReport() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await apiFetch(`${API_URL}/profile/locations`);
-        const d = res.ok ? await res.json() : null;
-        setTab((d && LOCATIONS.includes(d.active_location)) ? d.active_location : 'ALL');
-      } catch { setTab('ALL'); }
-    })();
-  }, []);
+  // Default tab = this browser's Active Location (Phase 32, localStorage — no server round-trip).
+  useEffect(() => { setTab(getActiveLocation()); }, []);
 
   useEffect(() => {
     if (!tab) return;
@@ -1510,15 +1525,8 @@ export function StockSummaryReport() {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await apiFetch(`${API_URL}/profile/locations`);
-        const d = res.ok ? await res.json() : null;
-        setTab((d && LOCATIONS.includes(d.active_location)) ? d.active_location : LOCATIONS[0]);
-      } catch { setTab(LOCATIONS[0]); }
-    })();
-  }, []);
+  // Default tab = this browser's Active Location (Phase 32, localStorage — no server round-trip).
+  useEffect(() => { setTab(getActiveLocation()); }, []);
 
   // Per-location PC stock (Phase 11) — shown under the Filled/Empty tables.
   const [pcRows, setPcRows] = useState([]);
@@ -1608,6 +1616,11 @@ export function StockSummaryReport() {
       { header: data.empty_issue_label || 'Issue (Transfers Out)', get: (r) => r.empty.issue },
       { header: 'Closing', get: (r) => r.empty.closing }
     ])}
+    ${pcRows.length ? `<h3>Personal Cylinders at ${esc(data.location_label)}</h3>
+      <table><thead><tr><th>Gas</th><th>Size</th><th>Quantity</th></tr></thead>
+      <tbody>${pcRows.map(r => `<tr><td>${esc(r.gas_type)}</td><td>${esc(r.capacity)}</td><td>${r.qty}</td></tr>`).join('')}</tbody>
+      <tfoot><tr class="tot"><td colspan="2" class="r">TOTAL</td><td>${pcRows.reduce((s, r) => s + r.qty, 0)}</td></tr></tfoot>
+      </table>` : ''}
     <script>window.onload=function(){window.print();window.onafterprint=function(){window.close()}}<\/script>
     </body></html>`;
     const w = window.open('', '_blank', 'width=1000,height=700,scrollbars=yes');
@@ -3198,7 +3211,8 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>Close</button>
             <button type="button" className="btn btn-secondary" onClick={handleExport}>Export Excel</button>
-            {!locked && onEdit && bill.transaction_category !== 'INTERNAL_TRANSFER' && (
+            {/* Phase 31: internal transfers are now editable too (same 3-day lock, same step-up). */}
+            {!locked && onEdit && (
               <button type="button" className="btn btn-secondary" title="Requires approval from a trusted person"
                 onClick={() => setStepUpFor('edit')}>✏️ Edit</button>
             )}
@@ -3252,22 +3266,53 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
   const [invCyls, setInvCyls] = useState([]);   // inventory, for serial → gas/size auto-match
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState(null); // { message, onConfirm } — smart-dependency confirmation
+  // Internal-transfer edit (Phase 31): transfers use a different shape than customer bills, so
+  // they get their own form + save path (the backend's updateInternalTransfer already supports it).
+  const [isTransfer, setIsTransfer] = useState(false);
+  const [tForm, setTForm] = useState({ bill_number: '', bill_date: '', challan_no: '', from_location: '', to_location: '', serials: [], pc: [] });
+  const [tSerialInput, setTSerialInput] = useState('');
 
   useEffect(() => {
     let active = true;
     (async () => {
       try {
-        const [bRes, gRes, sRes, cRes] = await Promise.all([
+        const [bRes, gRes, sRes, cyls] = await Promise.all([
           apiFetch(`${API_URL}/bills/${billId}`),
           apiFetch(`${API_URL}/masters/gas-types`),
           apiFetch(`${API_URL}/masters/cylinder-sizes`),
-          apiFetch(`${API_URL}/cylinders`)
+          // /cylinders is paginated ({ data, pagination }); fetchAllPages returns the flat array
+          // so invCyls.find(...) on serial blur never throws (same root cause as the Filling List crash).
+          fetchAllPages(`${API_URL}/cylinders`)
         ]);
         const b = await bRes.json();
         if (!active) return;
         setGasTypes(await gRes.json());
         setSizes(await sRes.json());
-        setInvCyls(await cRes.json());
+        setInvCyls(Array.isArray(cyls) ? cyls : []);
+
+        // Internal transfer (Phase 31): populate the transfer form and stop — the customer-bill
+        // form below doesn't apply. Cylinder serials + PC quantities come off the TRANSFER lines.
+        if (b.transaction_category === 'INTERNAL_TRANSFER') {
+          const tLines = b.line_items || [];
+          setIsTransfer(true);
+          setMeta({ bill_number: b.bill_number, company_name: 'Internal Transfer', phone_primary: '' });
+          setTForm({
+            bill_number: b.bill_number || '',
+            bill_date: (b.bill_date || '').slice(0, 10),
+            challan_no: b.challan_no || '',
+            from_location: b.from_location || '',
+            to_location: b.to_location || '',
+            serials: tLines.filter(li => li.serial_number).map(li => li.serial_number),
+            pc: tLines.filter(li => (li.personalCylindersIn || 0) > 0).map(li => ({
+              gas_type_id: String(li.gas_type_id?._id || li.gas_type_id || ''),
+              cylinder_size_id: String(li.cylinder_size_id?._id || li.cylinder_size_id || ''),
+              quantity: li.personalCylindersIn
+            }))
+          });
+          setLoading(false);
+          return;
+        }
+
         setMeta({ bill_number: b.bill_number, company_name: b.company_name, phone_primary: b.phone_primary });
         setForm({
           bill_number: b.bill_number || '',
@@ -3450,6 +3495,50 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
     } catch { setError('Network error'); setSaving(false); }
   };
 
+  // ── Internal-transfer edit helpers (Phase 31) ──
+  const addTransferSerial = () => {
+    const v = tSerialInput.trim();
+    if (!v) return;
+    setTForm(f => f.serials.some(s => s.toLowerCase() === v.toLowerCase()) ? f : { ...f, serials: [...f.serials, v] });
+    setTSerialInput('');
+  };
+  const removeTransferSerial = (idx) => setTForm(f => ({ ...f, serials: f.serials.filter((_, j) => j !== idx) }));
+  const setPcField = (i, patch) => setTForm(f => ({ ...f, pc: f.pc.map((p, j) => j === i ? { ...p, ...patch } : p) }));
+  const addPcRow = () => setTForm(f => ({ ...f, pc: [...f.pc, { gas_type_id: '', cylinder_size_id: '', quantity: 1 }] }));
+  const removePcRow = (i) => setTForm(f => ({ ...f, pc: f.pc.filter((_, j) => j !== i) }));
+
+  const saveTransfer = async () => {
+    setError('');
+    if (!tForm.bill_number.trim()) { setError('Bill number cannot be empty.'); return; }
+    if (!tForm.challan_no.trim()) { setError('Challan number is required.'); return; }
+    if (!tForm.from_location || !tForm.to_location) { setError('From and To locations are required.'); return; }
+    if (tForm.from_location === tForm.to_location) { setError('From and To locations must be different.'); return; }
+    const pc = tForm.pc.filter(p => p.gas_type_id && p.cylinder_size_id && Number(p.quantity) > 0);
+    if (tForm.serials.length === 0 && pc.length === 0) { setError('Add at least one cylinder or personal-cylinder quantity to transfer.'); return; }
+    setSaving(true);
+    try {
+      const res = await apiFetch(`${API_URL}/bills/${billId}`, {
+        method: 'PUT',
+        headers: stepUpToken ? { 'x-step-up-token': stepUpToken } : {},
+        body: JSON.stringify({
+          bill_number: tForm.bill_number.trim(),
+          bill_date: tForm.bill_date,
+          challan_no: tForm.challan_no,
+          from_location: tForm.from_location,
+          to_location: tForm.to_location,
+          serial_numbers: tForm.serials,
+          personal_items: pc.map(p => ({ gas_type_id: p.gas_type_id, cylinder_size_id: p.cylinder_size_id, quantity: Number(p.quantity) })),
+          logEdit: !sameSession
+        })
+      });
+      const data = await res.json();
+      if (!res.ok) { setError(data.error || 'Failed to update transfer'); setSaving(false); return; }
+      showToast('Transfer updated.', 'success');
+      setSaving(false);
+      onSaved && onSaved(billId);
+    } catch { setError('Network error'); setSaving(false); }
+  };
+
   // Render one direction's lines as a section (blue = given, red = received):
   // an OUR CYLINDERS (inventory) table, then ONE grouped "Personal Cylinders" table —
   // each rendered only when it has entries.
@@ -3581,9 +3670,123 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
     );
   };
 
+  // ── Internal-transfer editor (Phase 31) — mirrors the transfer form; PUTs the transfer shape. ──
+  const renderTransferEditor = () => {
+    const gasOptions = sortGasTypes(gasTypes, g => g.gas_type_name);
+    const sizesForPc = (gasId) => {
+      const gn = gasTypes.find(g => String(g._id) === String(gasId))?.gas_type_name;
+      const valid = gn ? (GAS_CAPACITIES[gn] || null) : null;
+      const list = valid ? sizes.filter(s => valid.includes(s.size_label)) : sizes;
+      return sortCapacities(list, s => s.size_label);
+    };
+    return (
+      <>
+        <div style={{background:'#f8fafc', border:'1px solid var(--border)', borderRadius:'6px', padding:'0.5rem 0.85rem', marginBottom:'0.85rem', fontSize:'0.85rem'}}>
+          <strong>⇄ Internal Transfer</strong> &nbsp;·&nbsp; Bill No.: {meta.bill_number}
+        </div>
+        <div className="form-row cols-3">
+          <div className="form-group">
+            <label>Bill No. *</label>
+            <input type="text" className="form-control" value={tForm.bill_number}
+              onChange={e => setTForm({ ...tForm, bill_number: e.target.value })} />
+            <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>Must stay unique across all bills.</small>
+          </div>
+          <div className="form-group">
+            <label>Bill Date</label>
+            <input type="date" className="form-control" value={tForm.bill_date} onChange={e => setTForm({ ...tForm, bill_date: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>Challan No. *</label>
+            <input type="text" className="form-control" value={tForm.challan_no} onChange={e => setTForm({ ...tForm, challan_no: e.target.value })} />
+          </div>
+          <div className="form-group">
+            <label>From *</label>
+            <select className="form-control" value={tForm.from_location} onChange={e => setTForm({ ...tForm, from_location: e.target.value })}>
+              <option value="">-- Select --</option>
+              {LOCATIONS.map(l => <option key={l} value={l}>{LOCATION_LABELS[l]}</option>)}
+            </select>
+          </div>
+          <div className="form-group">
+            <label>To *</label>
+            <select className="form-control" value={tForm.to_location} onChange={e => setTForm({ ...tForm, to_location: e.target.value })}>
+              <option value="">-- Select --</option>
+              {LOCATIONS.map(l => <option key={l} value={l}>{LOCATION_LABELS[l]}</option>)}
+            </select>
+          </div>
+        </div>
+
+        <div className="txn-section" style={{marginTop:'1rem'}}>
+          <h3>Cylinders to Transfer ({tForm.serials.length})</h3>
+          <div style={{display:'flex', gap:'0.4rem', margin:'0.5rem 0'}}>
+            <input type="text" className="form-control" style={{maxWidth:'220px'}} placeholder="Cylinder No." value={tSerialInput}
+              onChange={e => setTSerialInput(e.target.value)}
+              onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addTransferSerial(); } }} />
+            <button type="button" className="btn btn-secondary" onClick={addTransferSerial}>+ Add</button>
+          </div>
+          {tForm.serials.length > 0 && (
+            <div style={{display:'flex', flexWrap:'wrap', gap:'0.4rem'}}>
+              {tForm.serials.map((s, i) => (
+                <span key={i} className="badge" style={{background:'var(--border)', color:'var(--text)', padding:'0.25rem 0.5rem', display:'inline-flex', alignItems:'center', gap:'0.35rem'}}>
+                  {s}
+                  <button type="button" className="link-btn" style={{color:'var(--danger, #DC2626)'}} onClick={() => removeTransferSerial(i)}>×</button>
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+
+        <div className="txn-section" style={{marginTop:'1rem'}}>
+          <h3>Personal Cylinders</h3>
+          {tForm.pc.length > 0 && (
+            <div className="table-container">
+              <table>
+                <thead><tr><th>Gas Type</th><th>Size</th><th>Quantity</th><th></th></tr></thead>
+                <tbody>
+                  {tForm.pc.map((p, i) => (
+                    <tr key={i}>
+                      <td>
+                        <select className="form-control" style={{minWidth:'110px'}} value={p.gas_type_id}
+                          onChange={e => setPcField(i, { gas_type_id: e.target.value, cylinder_size_id: '' })}>
+                          <option value="">--</option>
+                          {gasOptions.map(g => <option key={g._id} value={g._id}>{g.gas_type_name}</option>)}
+                        </select>
+                      </td>
+                      <td>
+                        <select className="form-control" style={{minWidth:'95px'}} value={p.cylinder_size_id}
+                          onChange={e => setPcField(i, { cylinder_size_id: e.target.value })}>
+                          <option value="">--</option>
+                          {sizesForPc(p.gas_type_id).map(s => <option key={s._id} value={s._id}>{s.size_label}</option>)}
+                        </select>
+                      </td>
+                      <td>
+                        <input type="number" className="form-control" style={{width:'90px'}} min="1" step="1"
+                          value={(Number(p.quantity) || 0) === 0 ? '' : p.quantity}
+                          onChange={e => { const v = e.target.value; setPcField(i, { quantity: v === '' ? 0 : Math.max(0, parseInt(v, 10) || 0) }); }} />
+                      </td>
+                      <td><button type="button" className="btn btn-danger" style={{padding:'0.25rem 0.5rem'}} onClick={() => removePcRow(i)}>×</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <div style={{display:'flex', justifyContent:'flex-end', marginTop:'0.5rem'}}>
+            <button type="button" className="btn btn-secondary" onClick={addPcRow}>+ Add Personal Cylinder</button>
+          </div>
+        </div>
+
+        {error && <div className="alert alert-danger" style={{marginTop:'0.75rem'}}>{error}</div>}
+        <div className="modal-actions">
+          <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
+          <button type="button" className="btn btn-primary" onClick={saveTransfer} disabled={saving}>{saving ? 'Saving…' : 'Save Changes'}</button>
+        </div>
+      </>
+    );
+  };
+
   return (
-    <Modal title={`Edit Bill — ${meta.bill_number || ''}`} size="wide" onClose={onClose}>
-      {loading ? <Spinner label="Loading bill…" /> : (
+    <Modal title={`Edit ${isTransfer ? 'Transfer' : 'Bill'} — ${meta.bill_number || ''}`} size="wide" onClose={onClose}>
+      {loading ? <Spinner label="Loading bill…" /> : isTransfer ? renderTransferEditor() : (
         <>
           <div style={{background:'#f8fafc', border:'1px solid var(--border)', borderRadius:'6px', padding:'0.5rem 0.85rem', marginBottom:'0.85rem', fontSize:'0.85rem'}}>
             <strong>Bill No.:</strong> {meta.bill_number} &nbsp;·&nbsp; <strong>Customer:</strong> {meta.company_name} {displayContact(meta.phone_primary) ? `(${displayContact(meta.phone_primary)})` : ''}
@@ -3653,16 +3856,8 @@ export function CylinderAgingReport({ onViewCustomer }) {
   // Location tab: defaults to the user's active_location (Phase 2) once loaded.
   const [locTab, setLocTab] = useState(null); // null = not yet resolved
 
-  // Resolve the default tab from active_location (read, not duplicated).
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await apiFetch(`${API_URL}/profile/locations`);
-        const data = res.ok ? await res.json() : null;
-        setLocTab((data && LOCATIONS.includes(data.active_location)) ? data.active_location : LOCATIONS[0]);
-      } catch { setLocTab(LOCATIONS[0]); }
-    })();
-  }, []);
+  // Default tab = this browser's Active Location (Phase 32, localStorage — no server round-trip).
+  useEffect(() => { setLocTab(getActiveLocation()); }, []);
 
   const fetchReport = async () => {
     setLoading(true);
@@ -3904,10 +4099,11 @@ export function FillingListPage() {
   useEffect(() => { load(); }, [date]);
   useEffect(() => {
     (async () => {
-      try {
-        const res = await apiFetch(`${API_URL}/cylinders`);
-        if (res.ok) setCylinders(await res.json());
-      } catch {}
+      // /cylinders is a PAGINATED endpoint ({ data, pagination }); reading it raw made
+      // `cylinders` an object, so `cylinders.find(...)` below threw the moment a cylinder
+      // number was typed (the Filling List crash). fetchAllPages returns the full flat array.
+      try { setCylinders(await fetchAllPages(`${API_URL}/cylinders`)); }
+      catch { setCylinders([]); }
     })();
   }, []);
 
