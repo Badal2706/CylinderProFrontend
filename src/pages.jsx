@@ -8,7 +8,10 @@ import {
   LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, stockStateText, cylinderStateText,
   Pagination, useDebounce, useBatchList, BatchListFooter
 } from './App.jsx';
-import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact } from './components.jsx';
+import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
+
+// Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time into a local datetime the backend parses.
+const combineDT = (date, time) => date ? `${date}T${/^\d{2}:\d{2}/.test(time || '') ? time : '00:00'}` : date;
 
 const esc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -2192,7 +2195,9 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
     try {
       const url = isEdit ? `${API_URL}/cylinders/${cylinder._id}` : `${API_URL}/cylinders`;
       const method = isEdit ? 'PUT' : 'POST';
-      const res = await apiFetch(url, { method, body: JSON.stringify(formData) });
+      // active_location lets the backend log a manual edit's "Performed by" as this browser's
+      // active site's manager (Phase 33). Ignored on create; harmless passthrough field.
+      const res = await apiFetch(url, { method, body: JSON.stringify({ ...formData, active_location: getActiveLocation() }) });
       const data = await res.json();
       if (!res.ok) {
         setError(data.error || 'Something went wrong');
@@ -2315,6 +2320,72 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
   );
 }
 
+// Per-cylinder history popup (Phase 33) — the 15 most recent events, newest first.
+const HISTORY_ICONS = { MIGRATED: '📦', RECEIVED: '📥', GIVEN: '📤', TRANSFER: '🔄', FILLED: '⛽', MANUAL_EDIT: '✏️' };
+export function CylinderHistoryModal({ cylinder, onClose }) {
+  const [data, setData] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const a11yRef = useModalA11y(onClose);
+
+  useEffect(() => {
+    let alive = true;
+    (async () => {
+      try {
+        const res = await apiFetch(`${API_URL}/cylinders/${cylinder._id}/history`);
+        if (!alive) return;
+        if (res.ok) setData(await res.json());
+        else { setData({ history: [] }); showToast(await apiErrorMessage(res, 'Could not load history')); }
+      } catch { if (alive) { setData({ history: [] }); showToast('Could not load history'); } }
+      if (alive) setLoading(false);
+    })();
+    return () => { alive = false; };
+  }, [cylinder._id]);
+
+  const rows = data?.history || [];
+  const performerOf = (r) => r.performed_by || LOCATION_LABELS[r.performed_at_location] || '—';
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" ref={a11yRef} onClick={(e) => e.stopPropagation()} style={{maxWidth:'820px', width:'94vw'}}>
+        <div className="modal-header">
+          <span>🕘 History — Cylinder {cylinder.rotational_number}</span>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div style={{fontSize:'0.82rem', color:'var(--text-muted)', marginBottom:'0.75rem'}}>
+            {cylinder.gas_type} · {cylinder.capacity}
+            {!loading && ` — most recent ${rows.length} event${rows.length === 1 ? '' : 's'} (max 15)`}
+          </div>
+          {loading ? (
+            <Spinner label="Loading history…" />
+          ) : rows.length === 0 ? (
+            <EmptyState icon="🕘" message="No history yet" hint="Events will appear here as this cylinder is transferred, filled, given, or received." />
+          ) : (
+            <div style={{display:'flex', flexDirection:'column', gap:'0.4rem'}}>
+              {rows.map(r => (
+                <div key={r.id} style={{display:'flex', gap:'0.65rem', alignItems:'baseline', padding:'0.5rem 0.7rem', border:'1px solid var(--border)', borderRadius:'8px'}}>
+                  <div style={{fontSize:'1.05rem', lineHeight:1.1}}>{HISTORY_ICONS[r.event_type] || '•'}</div>
+                  {/* One line per event: description on the left, meta on the right, no wrapping. */}
+                  <div style={{flex:1, minWidth:0, display:'flex', justifyContent:'space-between', alignItems:'baseline', gap:'1rem', flexWrap:'wrap'}}>
+                    <span style={{fontWeight:600, fontSize:'0.9rem'}}>{r.description}</span>
+                    <span style={{fontSize:'0.76rem', color:'var(--text-muted)', display:'flex', gap:'0.9rem', flexWrap:'wrap', justifyContent:'flex-end'}}>
+                      {/* Two distinct times: when the event happened vs when it was typed in. */}
+                      <span title="Real-world transaction date & time (may be backdated)" style={{whiteSpace:'nowrap'}}>🗓 {formatDateTime(r.event_at)}</span>
+                      <span>by <strong>{performerOf(r)}</strong></span>
+                      {r.document_ref && <span>Ref: {r.document_ref}</span>}
+                      {r.entered_at && <span title="When this was entered into CylinderPro" style={{whiteSpace:'nowrap', opacity:0.8}}>⌨ entered {formatDateTime(r.entered_at)}</span>}
+                    </span>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // Cylinder Inventory Page
 export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilterConsumed }) {
   const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
@@ -2328,6 +2399,7 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
   const [deleting, setDeleting] = useState(false);
   const [maintTarget, setMaintTarget] = useState(null);
   const [maintSaving, setMaintSaving] = useState(false);
+  const [historyCylinder, setHistoryCylinder] = useState(null);
   const [holders, setHolders] = useState({});
   const [counts, setCounts] = useState({ total: 0, inStock: 0, atCustomer: 0, maintenance: 0, byLocation: {} });
 
@@ -2471,6 +2543,9 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
   const rowActions = (c) => (
     <div style={{display:'flex', gap:'0.4rem', justifyContent:'flex-start', whiteSpace:'nowrap'}}>
       {maintenanceButton(c)}
+      <button className="btn btn-secondary" title="History"
+        style={{padding:'0.25rem 0.55rem'}}
+        onClick={(e) => { e.stopPropagation(); setCylOpen(false); setHistoryCylinder(c); }}>🕘</button>
       <button className="btn btn-secondary" title="Edit"
         style={{padding:'0.25rem 0.55rem'}}
         onClick={(e) => { e.stopPropagation(); setCylOpen(false); setModalCylinder(c); }}>✏️</button>
@@ -2635,6 +2710,9 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
                       <td onClick={(e) => e.stopPropagation()}>
                         <div style={{display:'flex', gap:'0.4rem', justifyContent:'flex-start', whiteSpace:'nowrap'}}>
                           {maintenanceButton(c)}
+                          <button className="btn btn-secondary" title="History"
+                            style={{padding:'0.3rem 0.6rem'}}
+                            onClick={() => setHistoryCylinder(c)}>🕘</button>
                           <button className="btn btn-secondary" title="Edit"
                             style={{padding:'0.3rem 0.6rem'}}
                             onClick={() => setModalCylinder(c)}>✏️</button>
@@ -2694,6 +2772,13 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
           loading={maintSaving}
           onConfirm={confirmMaintenance}
           onCancel={() => setMaintTarget(null)}
+        />
+      )}
+
+      {historyCylinder && (
+        <CylinderHistoryModal
+          cylinder={historyCylinder}
+          onClose={() => setHistoryCylinder(null)}
         />
       )}
     </div>
@@ -3260,7 +3345,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [meta, setMeta] = useState({ bill_number: '', company_name: '', phone_primary: '' });
-  const [form, setForm] = useState({ bill_number: '', bill_date: '', challan_no: '', transaction_type: 'GIVEN', lines: [] });
+  const [form, setForm] = useState({ bill_number: '', bill_date: '', bill_time: '', challan_no: '', transaction_type: 'GIVEN', lines: [] });
   const [gasTypes, setGasTypes] = useState([]);
   const [sizes, setSizes] = useState([]);
   const [invCyls, setInvCyls] = useState([]);   // inventory, for serial → gas/size auto-match
@@ -3269,7 +3354,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
   // Internal-transfer edit (Phase 31): transfers use a different shape than customer bills, so
   // they get their own form + save path (the backend's updateInternalTransfer already supports it).
   const [isTransfer, setIsTransfer] = useState(false);
-  const [tForm, setTForm] = useState({ bill_number: '', bill_date: '', challan_no: '', from_location: '', to_location: '', serials: [], pc: [] });
+  const [tForm, setTForm] = useState({ bill_number: '', bill_date: '', bill_time: '', challan_no: '', from_location: '', to_location: '', serials: [], pc: [] });
   const [tSerialInput, setTSerialInput] = useState('');
 
   useEffect(() => {
@@ -3299,6 +3384,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
           setTForm({
             bill_number: b.bill_number || '',
             bill_date: (b.bill_date || '').slice(0, 10),
+            bill_time: billTimeFrom(b.bill_date),
             challan_no: b.challan_no || '',
             from_location: b.from_location || '',
             to_location: b.to_location || '',
@@ -3317,6 +3403,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
         setForm({
           bill_number: b.bill_number || '',
           bill_date: (b.bill_date || '').slice(0, 10),
+          bill_time: billTimeFrom(b.bill_date),
           challan_no: b.challan_no || '',
           transaction_type: b.transaction_type,
           // Split into inventory lines (serial set) and standalone personal rows
@@ -3462,7 +3549,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
         headers: stepUpToken ? { 'x-step-up-token': stepUpToken } : {},
         body: JSON.stringify({
           bill_number: form.bill_number.trim(), // uniqueness re-validated server-side on every edit
-          bill_date: form.bill_date,
+          bill_date: combineDT(form.bill_date, form.bill_time),
           challan_no: form.challan_no,
           transaction_type: form.transaction_type,
           logEdit: !sameSession,
@@ -3522,7 +3609,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
         headers: stepUpToken ? { 'x-step-up-token': stepUpToken } : {},
         body: JSON.stringify({
           bill_number: tForm.bill_number.trim(),
-          bill_date: tForm.bill_date,
+          bill_date: combineDT(tForm.bill_date, tForm.bill_time),
           challan_no: tForm.challan_no,
           from_location: tForm.from_location,
           to_location: tForm.to_location,
@@ -3692,8 +3779,11 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
             <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>Must stay unique across all bills.</small>
           </div>
           <div className="form-group">
-            <label>Bill Date</label>
-            <input type="date" className="form-control" value={tForm.bill_date} onChange={e => setTForm({ ...tForm, bill_date: e.target.value })} />
+            <label>Bill Date &amp; Time</label>
+            <div style={{display:'flex', gap:'0.4rem'}}>
+              <input type="date" className="form-control" style={{flex:'1 1 58%'}} value={tForm.bill_date} onChange={e => setTForm({ ...tForm, bill_date: e.target.value })} />
+              <input type="time" className="form-control" style={{flex:'1 1 42%'}} value={tForm.bill_time} onChange={e => setTForm({ ...tForm, bill_time: e.target.value })} />
+            </div>
           </div>
           <div className="form-group">
             <label>Challan No. *</label>
@@ -3800,8 +3890,11 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
               <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>Must stay unique across all bills.</small>
             </div>
             <div className="form-group">
-              <label>Bill Date</label>
-              <input type="date" className="form-control" value={form.bill_date} onChange={e => setForm({ ...form, bill_date: e.target.value })} />
+              <label>Bill Date &amp; Time</label>
+              <div style={{display:'flex', gap:'0.4rem'}}>
+                <input type="date" className="form-control" style={{flex:'1 1 58%'}} value={form.bill_date} onChange={e => setForm({ ...form, bill_date: e.target.value })} />
+                <input type="time" className="form-control" style={{flex:'1 1 42%'}} value={form.bill_time} onChange={e => setForm({ ...form, bill_time: e.target.value })} />
+              </div>
             </div>
             <div className="form-group">
               <label>Challan No. *</label>

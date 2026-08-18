@@ -2,6 +2,20 @@ import React, { useState, useEffect } from 'react';
 import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
+// Phase 34: Bill Date time-of-day helpers. nowHHMM() seeds the time input with the current time;
+// billTimeFrom() extracts local HH:MM from a stored bill_date (existing date-only bills read back
+// as their stored midnight-UTC, i.e. 05:30 in IST — a neutral default, not a fabricated time).
+export function nowHHMM() {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+export function billTimeFrom(v) {
+  if (!v) return nowHHMM();
+  const d = new Date(v);
+  if (isNaN(d)) return '00:00';
+  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+}
+
 // A Filled line's amount is ALWAYS rate × (inventory cylinders + personal cylinders returned),
 // derived on demand. Personal cylinders returned to the customer are refilled service items and
 // are charged at the same rate as inventory cylinders. Deriving (rather than trusting a stored
@@ -497,6 +511,13 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   const [fromLocation, setFromLocation] = useState('AT_PLANT_CHANDISAR');
   const [toLocation, setToLocation] = useState('AT_PALANPUR_OFFICE');
   const [billDate, setBillDate] = useState(new Date().toISOString().split('T')[0]);
+  // Phase 34: time-of-day on the Bill Date, defaulting to now, always editable (incl. backdating).
+  const [billTime, setBillTime] = useState(() => nowHHMM());
+  // Pre-software confirmation (Phase 34 item 4): set to { cylinders, message, onConfirm } when a
+  // backdated entry contradicts only the migration placeholder; cleared on confirm/cancel.
+  const [preSoftware, setPreSoftware] = useState(null);
+  // Combine the date + time inputs into a local datetime the backend parses as the intended moment.
+  const combinedBillDate = () => billDate ? `${billDate}T${/^\d{2}:\d{2}/.test(billTime) ? billTime : '00:00'}` : billDate;
   const [challanNo, setChallanNo] = useState('');
   const [challanError, setChallanError] = useState('');
   // Phase 27: Bill Number is prefilled from the sequence but freely editable (like Challan No.);
@@ -638,6 +659,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     one_time_customer: oneTimeCustomer,
     transactionType,
     billDate,
+    billTime,         // Phase 34
     challanNo,
     billNumber,       // Phase 27
     vehicleNumber,    // Phase 27
@@ -700,6 +722,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     setOneTimeCustomer(p.one_time_customer || { company_name: '', contact_person: '', phone_primary: '', address: '' });
     setTransactionType(p.transactionType || 'GIVEN');
     setBillDate(p.billDate || new Date().toISOString().split('T')[0]);
+    setBillTime(p.billTime || nowHHMM());
     setChallanNo(p.challanNo || '');
     if (p.billNumber) { setBillNumber(p.billNumber); setBillNumberEdited(true); }
     setVehicleNumber(p.vehicleNumber || '');
@@ -1052,7 +1075,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           body: JSON.stringify({
             transaction_category: 'INTERNAL_TRANSFER',
             draft_id: editingBillId ? undefined : (draftId || undefined), // finalizing a draft keeps its bill number
-            bill_date: billDate,
+            bill_date: combinedBillDate(),
             challan_no: composeChallan(),
             from_location: fromLocation,
             to_location: toLocation,
@@ -1073,7 +1096,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
             challan_no: result.challan_no || composeChallan(),
             amount: 0, customer_id: null,
             customer_name: `Internal Transfer: ${locationText(fromLocation)} → ${locationText(toLocation)}`,
-            customer_address: '', bill_date: billDate, transaction_type: 'TRANSFER',
+            customer_address: '', bill_date: combinedBillDate(), transaction_type: 'TRANSFER',
             from_location: fromLocation, to_location: toLocation,
             lines: summaryLines
           });
@@ -1140,7 +1163,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
       customer_id: selectedCustomer?.customer_id,
       customer_type: customerType,
       one_time_customer: customerType === 'ONE_TIME' ? oneTimeCustomer : null,
-      bill_date: billDate,
+      bill_date: combinedBillDate(),
       transaction_type: transactionType,
       challan_no: composeChallan(),
       bill_number: billNumber.trim() || undefined, // Phase 27: user-editable; blank → backend auto-numbers
@@ -1186,7 +1209,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         const response = await apiFetch(`${API_URL}/bills/${editingBillId}`, {
           method: 'PUT',
           headers: stepUpAuth ? { 'x-step-up-token': stepUpAuth.step_up_token } : {},
-          body: JSON.stringify({ bill_date: billDate, challan_no: composeChallan(), vehicle_number: vehicleNumber.trim(), transaction_type: transactionType, logEdit: false, line_items })
+          body: JSON.stringify({ bill_date: combinedBillDate(), challan_no: composeChallan(), vehicle_number: vehicleNumber.trim(), transaction_type: transactionType, logEdit: false, line_items })
         });
         if (response.ok) {
           await response.json();
@@ -1199,7 +1222,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
             customer_contact: selectedCustomer?.phone_primary || '',
             vehicle_number: vehicleNumber.trim(),
             is_filling_vendor: isVendor,
-            bill_date: billDate, transaction_type: transactionType, lines: summaryLines
+            bill_date: combinedBillDate(), transaction_type: transactionType, lines: summaryLines
           });
           setEditingBillId(null); setEditingBillNo('');
           showToast(`Bill ${editingBillNo} updated.`, 'success');
@@ -1210,13 +1233,8 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         return;
       }
 
-      const response = await apiFetch(`${API_URL}/bills`, {
-        method: 'POST',
-        body: JSON.stringify(billData)
-      });
-
-      if (response.ok) {
-        const result = await response.json();
+      // Reusable success handler (shared by the direct save and the pre-software confirm path).
+      const finishCreate = (result) => {
         setSavedBill({
           bill_id: result.bill_id,
           bill_number: result.bill_number,
@@ -1229,13 +1247,36 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           customer_contact: selectedCustomer?.phone_primary || '',
           vehicle_number: vehicleNumber.trim(),
           is_filling_vendor: isVendor,
-          bill_date: billDate,
+          bill_date: combinedBillDate(),
           transaction_type: transactionType,
           lines: summaryLines
         });
         showToast(`Bill ${result.bill_number} saved.`, 'success');
         setDraftId(null); setDraftBillNo(''); // draft (if any) was finalized
         fetchCustomers(); // refresh personalCylindersAtPlant / holdings for follow-up transactions
+      };
+      const postBill = (extra) => apiFetch(`${API_URL}/bills`, {
+        method: 'POST', body: JSON.stringify(extra ? { ...billData, ...extra } : billData)
+      });
+
+      const response = await postBill();
+      if (response.ok) {
+        const result = await response.json();
+        // Phase 34: backdated entry that contradicts only the migration placeholder — confirm first.
+        if (result.requires_pre_software_confirmation) {
+          setPreSoftware({
+            cylinders: result.cylinders || [],
+            message: result.message,
+            onConfirm: async () => {
+              setPreSoftware(null);
+              const r2 = await postBill({ confirm_pre_software: true });
+              if (r2.ok) finishCreate(await r2.json());
+              else showToast(await apiErrorMessage(r2, 'Error creating bill'));
+            }
+          });
+          return;
+        }
+        finishCreate(result);
       } else {
         showToast(await apiErrorMessage(response, 'Error creating bill'));
       }
@@ -1250,6 +1291,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     setEditingBillId(savedBill.bill_id);
     setEditingBillNo(savedBill.bill_number);
     setBillDate((savedBill.bill_date || '').slice(0, 10) || new Date().toISOString().split('T')[0]);
+    setBillTime(billTimeFrom(savedBill.bill_date));
     // The challan input holds the full value now (Phase 14) — put it back verbatim.
     setChallanNo(savedBill.challan_no || '');
     setChallanError('');
@@ -1605,6 +1647,36 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     />
   ) : null;
 
+  // Phase 34: pre-software confirmation — a backdated entry that contradicts only the migration
+  // placeholder. Confirming saves it as genuine pre-software history; it never moves live stock.
+  const preSoftwareModal = preSoftware ? (
+    <div className="modal-overlay" onClick={() => setPreSoftware(null)}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{maxWidth:'560px'}}>
+        <div className="modal-header">
+          <span>⏳ Confirm pre-software entry</span>
+          <button className="modal-close" onClick={() => setPreSoftware(null)}>✕</button>
+        </div>
+        <div className="modal-body">
+          <p style={{marginTop:0}}>{preSoftware.message}</p>
+          <ul style={{margin:'0.5rem 0 1rem', paddingLeft:'1.2rem'}}>
+            {preSoftware.cylinders.map(c => (
+              <li key={c.serial} style={{marginBottom:'0.3rem'}}>
+                <strong>Cylinder {c.serial}</strong> — earliest record shows <em>{c.snapshot}</em>; you're recording it as {c.direction === 'received' ? 'received back' : 'given out'}.
+              </li>
+            ))}
+          </ul>
+          <div className="alert alert-warning" style={{fontSize:'0.85rem'}}>
+            Confirm only if this reflects genuine history from before CylinderPro. It won't change the cylinder's current location or stock.
+          </div>
+          <div className="modal-actions">
+            <button className="btn btn-secondary" onClick={() => setPreSoftware(null)}>Cancel</button>
+            <button className="btn btn-primary" onClick={preSoftware.onConfirm}>Confirm &amp; Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   if (savedBill) {
     return (
       <div className="card">
@@ -1612,6 +1684,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           ✓ Bill <strong>{savedBill.bill_number}</strong> created successfully!
         </div>
         {stepUpModal}
+        {preSoftwareModal}
 
         {/* Bill summary */}
         <div style={{padding:'1rem', background:'#f8f9fa', borderRadius:'8px', marginBottom:'1rem'}}>
@@ -1705,6 +1778,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   return (
     <div className="card">
       {stepUpModal}
+      {preSoftwareModal}
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
         <h2 style={{margin:0, border:'none', padding:0}}>New Transaction / Bill</h2>
         {!editingBillId && (
@@ -1890,14 +1964,26 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
             Row 2: Bill Number | Vehicle Number | Challan No. (Challan sits under Location). */}
         <div className="form-row cols-3">
           <div className="form-group">
-            <label>Bill Date</label>
-            <input
-              type="date"
-              className="form-control"
-              value={billDate}
-              onChange={(e) => setBillDate(e.target.value)}
-              required
-            />
+            <label>Bill Date &amp; Time</label>
+            <div style={{display:'flex', gap:'0.4rem'}}>
+              <input
+                type="date"
+                className="form-control"
+                style={{flex:'1 1 58%'}}
+                value={billDate}
+                onChange={(e) => setBillDate(e.target.value)}
+                required
+              />
+              <input
+                type="time"
+                className="form-control"
+                style={{flex:'1 1 42%'}}
+                value={billTime}
+                onChange={(e) => setBillTime(e.target.value)}
+                title="Defaults to the current time — edit it for a backdated entry"
+                required
+              />
+            </div>
           </div>
           {!isInternal ? (
             <div className="form-group">
