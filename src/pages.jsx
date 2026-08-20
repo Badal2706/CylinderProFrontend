@@ -10,8 +10,15 @@ import {
 } from './App.jsx';
 import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
 
-// Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time into a local datetime the backend parses.
-const combineDT = (date, time) => date ? `${date}T${/^\d{2}:\d{2}/.test(time || '') ? time : '00:00'}` : date;
+// Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time (the user's LOCAL wall-clock) into an
+// absolute UTC instant, so a server in a different timezone stores the exact moment and re-edits
+// never drift. See combinedBillDate() in components.jsx for the full rationale.
+const combineDT = (date, time) => {
+  if (!date) return date;
+  const t = /^\d{2}:\d{2}/.test(time || '') ? time : '00:00';
+  const d = new Date(`${date}T${t}`);
+  return isNaN(d.getTime()) ? `${date}T${t}` : d.toISOString();
+};
 
 const esc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');

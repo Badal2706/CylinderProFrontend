@@ -516,8 +516,16 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   // Pre-software confirmation (Phase 34 item 4): set to { cylinders, message, onConfirm } when a
   // backdated entry contradicts only the migration placeholder; cleared on confirm/cancel.
   const [preSoftware, setPreSoftware] = useState(null);
-  // Combine the date + time inputs into a local datetime the backend parses as the intended moment.
-  const combinedBillDate = () => billDate ? `${billDate}T${/^\d{2}:\d{2}/.test(billTime) ? billTime : '00:00'}` : billDate;
+  // Combine the date + time inputs into an absolute UTC instant. The inputs are the user's LOCAL
+  // wall-clock; `new Date('YYYY-MM-DDTHH:MM')` parses them in the browser's timezone, and
+  // .toISOString() converts to UTC so the server (which may run in a different timezone, e.g. UTC on
+  // the droplet vs IST in the browser) stores the exact moment — no offset, and no drift on re-edit.
+  const combinedBillDate = () => {
+    if (!billDate) return billDate;
+    const t = /^\d{2}:\d{2}/.test(billTime) ? billTime : '00:00';
+    const d = new Date(`${billDate}T${t}`);
+    return isNaN(d.getTime()) ? `${billDate}T${t}` : d.toISOString();
+  };
   const [challanNo, setChallanNo] = useState('');
   const [challanError, setChallanError] = useState('');
   // Phase 27: Bill Number is prefilled from the sequence but freely editable (like Challan No.);
