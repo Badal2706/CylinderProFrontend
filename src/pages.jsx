@@ -23,6 +23,17 @@ const combineDT = (date, time) => {
 const esc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 
+// Date with a faded time-of-day beside it (Phase 34 — bills now carry a real time). Used in the
+// transaction detail popup so the time shows without competing with the date for attention (the
+// Transaction History list stays date-only to keep rows scannable).
+function dateWithTime(d) {
+  if (!d) return '-';
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return formatDate(d);
+  const t = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
+  return <>{formatDate(d)} <span style={{ color: 'var(--text-muted)', fontSize: '0.82em', fontWeight: 400 }}>{t}</span></>;
+}
+
 // Human label for a payment mode. 'ONLINE' is legacy data → shown as "UPI Transfer".
 export function paymentModeLabel(mode) {
   if (mode === 'UPI' || mode === 'ONLINE') return 'UPI Transfer';
@@ -3211,7 +3222,7 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
           </div>
 
           <div className="form-row cols-3" style={{marginBottom:'0.5rem'}}>
-            <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Date</div><div>{formatDate(bill.bill_date)}</div></div>
+            <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Date</div><div>{dateWithTime(bill.bill_date)}</div></div>
             <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Customer</div><div>{bill.company_name}</div></div>
             <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Type</div><div>{directionLabel(bill.transaction_type)}</div></div>
             <div>
@@ -3358,6 +3369,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
   const [invCyls, setInvCyls] = useState([]);   // inventory, for serial → gas/size auto-match
   const [error, setError] = useState('');
   const [confirm, setConfirm] = useState(null); // { message, onConfirm } — smart-dependency confirmation
+  const [origTransferSerials, setOrigTransferSerials] = useState([]); // Phase 35: to detect newly-added cylinders on a transfer edit
   // Internal-transfer edit (Phase 31): transfers use a different shape than customer bills, so
   // they get their own form + save path (the backend's updateInternalTransfer already supports it).
   const [isTransfer, setIsTransfer] = useState(false);
@@ -3387,6 +3399,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
         if (b.transaction_category === 'INTERNAL_TRANSFER') {
           const tLines = b.line_items || [];
           setIsTransfer(true);
+          setOrigTransferSerials(tLines.filter(li => li.serial_number).map(li => li.serial_number)); // Phase 35
           setMeta({ bill_number: b.bill_number, company_name: 'Internal Transfer', phone_primary: '' });
           setTForm({
             bill_number: b.bill_number || '',
@@ -3609,6 +3622,20 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
     if (tForm.from_location === tForm.to_location) { setError('From and To locations must be different.'); return; }
     const pc = tForm.pc.filter(p => p.gas_type_id && p.cylinder_size_id && Number(p.quantity) > 0);
     if (tForm.serials.length === 0 && pc.length === 0) { setError('Add at least one cylinder or personal-cylinder quantity to transfer.'); return; }
+    // Phase 35: adding cylinders to a transfer moves them as of NOW — make the operator confirm the
+    // cylinders were genuinely received/returned at the source first (the en-route collection case).
+    const added = tForm.serials.filter(s => !origTransferSerials.includes(s));
+    if (added.length) {
+      setConfirm({
+        message: `You're adding ${added.length} cylinder(s) to this transfer: ${added.join(', ')}.\n\nConfirm these were already received/returned at ${LOCATION_LABELS[tForm.from_location] || tForm.from_location} BEFORE this transfer. On confirm, they move to ${LOCATION_LABELS[tForm.to_location] || tForm.to_location} as of now. (Cylinders not actually in stock at the source will be rejected.)`,
+        onConfirm: () => doSaveTransfer(pc)
+      });
+      return;
+    }
+    doSaveTransfer(pc);
+  };
+
+  const doSaveTransfer = async (pc) => {
     setSaving(true);
     try {
       const res = await apiFetch(`${API_URL}/bills/${billId}`, {
