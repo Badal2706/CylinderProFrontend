@@ -2394,11 +2394,26 @@ export function CylinderHistoryModal({ cylinder, onClose }) {
                     <span style={{fontWeight:600, fontSize:'0.9rem'}}>{r.description}</span>
                     <span style={{fontSize:'0.76rem', color:'var(--text-muted)', display:'flex', gap:'0.9rem', flexWrap:'wrap', justifyContent:'flex-end'}}>
                       {/* Two distinct times: when the event happened vs when it was typed in. */}
-                      <span title="Real-world transaction date & time (may be backdated)" style={{whiteSpace:'nowrap'}}>🗓 {formatDateTime(r.event_at)}</span>
+                      <span title="The bill's date & time — the moment this actually happened. Follows the bill if its date is edited." style={{whiteSpace:'nowrap'}}>🗓 {formatDateTime(r.event_at)}</span>
                       <span>by <strong>{performerOf(r)}</strong></span>
                       {r.document_ref && <span style={{whiteSpace:'nowrap'}}>Ref: {r.document_ref}</span>}
                       {r.challan_no && <span style={{whiteSpace:'nowrap'}}>Challan: {r.challan_no}</span>}
-                      {r.entered_at && <span title="When this was entered into CylinderPro" style={{whiteSpace:'nowrap', opacity:0.8}}>⌨ entered {formatDateTime(r.entered_at)}</span>}
+                      {/* Second time: when the entry was last touched. Says "entered" until the bill
+                          is edited, then "changed" with the moment of that edit. */}
+                      {(() => {
+                        const entered = r.entered_at, changed = r.changed_at;
+                        const wasEdited = entered && changed && (new Date(changed) - new Date(entered) > 60000);
+                        const shown = wasEdited ? changed : entered;
+                        if (!shown) return null;
+                        return (
+                          <span title={wasEdited
+                            ? 'When this entry was last changed (the bill was edited)'
+                            : 'When this was entered into CylinderPro'}
+                            style={{whiteSpace:'nowrap', opacity:0.8}}>
+                            {wasEdited ? '✏️ changed ' : '⌨ entered '}{formatDateTime(shown)}
+                          </span>
+                        );
+                      })()}
                     </span>
                   </div>
                 </div>
@@ -3369,6 +3384,8 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
 export function EditBillModal({ billId, sameSession = false, stepUpToken = '', onClose, onSaved }) {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  // Set when the backend reports the new bill date contradicts the cylinders' own history.
+  const [dateConflict, setDateConflict] = useState(null);
   const [meta, setMeta] = useState({ bill_number: '', company_name: '', phone_primary: '' });
   const [form, setForm] = useState({ bill_number: '', bill_date: '', bill_time: '', challan_no: '', transaction_type: 'GIVEN', lines: [] });
   const [gasTypes, setGasTypes] = useState([]);
@@ -3553,7 +3570,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
 
   const hasBlockingErrors = () => form.lines.some(l => l._val && l._val.state === 'error');
 
-  const save = async () => {
+  const save = async (forceDateChange = false) => {
     setError('');
     if (!form.bill_number.trim()) { setError('Bill number cannot be empty.'); return; }
     if (!form.challan_no.trim()) { setError('Challan number is required.'); return; }
@@ -3580,6 +3597,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
           challan_no: form.challan_no,
           transaction_type: form.transaction_type,
           logEdit: !sameSession,
+          confirm_date_change: forceDateChange || undefined,
           // Inventory rows carry the serial and no personal counts; each personal row becomes a
           // personal-only line (serial '') with its count on Out (Filled) / In (Empty) — the shape
           // the backend already accepts. Amount rule is recomputed server-side: rate × (qty + out).
@@ -3599,6 +3617,9 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
       });
       const data = await res.json();
       if (!res.ok) { setError(data.error || 'Failed to update bill'); setSaving(false); return; }
+      // Moving the date to a moment that contradicts the cylinders' own history: show what breaks
+      // and let the operator decide, rather than silently writing a state the replay disagrees with.
+      if (data.requires_date_change_confirmation) { setDateConflict(data); setSaving(false); return; }
       if (data.amount_changed) {
         showToast(`Bill amount changed from ₹${(data.old_amount || 0).toFixed(2)} to ₹${(data.new_amount || 0).toFixed(2)}. Existing payments are not affected.`, 'info');
       } else {
@@ -3958,9 +3979,39 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
 
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
-            <button type="button" className="btn btn-primary" onClick={save} disabled={saving || hasBlockingErrors()}>{saving ? 'Saving…' : 'Save Changes'}</button>
+            {/* arrow-wrapped: a bare onClick={save} would pass the click event as the force flag */}
+            <button type="button" className="btn btn-primary" onClick={() => save()} disabled={saving || hasBlockingErrors()}>{saving ? 'Saving…' : 'Save Changes'}</button>
           </div>
         </>
+      )}
+
+      {dateConflict && (
+        <Modal title="⚠️ This date doesn't match the cylinders' history" size="wide" onClose={() => setDateConflict(null)}>
+          <p style={{marginTop:0}}>{dateConflict.message}</p>
+          <p style={{fontSize:'0.85rem', color:'var(--text-muted)'}}>
+            Moving <strong>{dateConflict.from}</strong> → <strong>{dateConflict.to}</strong>
+          </p>
+          <div className="table-container" style={{maxHeight:'40vh', overflowY:'auto'}}>
+            <table>
+              <thead><tr><th>Cylinder</th><th>What contradicts it</th></tr></thead>
+              <tbody>
+                {(dateConflict.conflicts || []).map((c, i) => (
+                  <tr key={i}><td><strong>{c.serial}</strong></td><td>{c.problem}</td></tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+          <p style={{fontSize:'0.85rem', marginBottom:0}}>
+            Fix the other entries first if this is a mistake. If the paperwork really was out of
+            order, you can force the change — the cylinder locations will be recalculated from the
+            new dates.
+          </p>
+          <div className="modal-actions">
+            <button type="button" className="btn btn-secondary" onClick={() => setDateConflict(null)}>Go back</button>
+            <button type="button" className="btn btn-danger"
+              onClick={() => { setDateConflict(null); save(true); }}>Change anyway</button>
+          </div>
+        </Modal>
       )}
 
       {confirm && (
