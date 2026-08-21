@@ -1,19 +1,19 @@
 import React, { useState, useEffect } from 'react';
-import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
+import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, istDateInput, istTimeInput, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
 // Phase 34: Bill Date time-of-day helpers. nowHHMM() seeds the time input with the current time;
 // billTimeFrom() extracts local HH:MM from a stored bill_date (existing date-only bills read back
 // as their stored midnight-UTC, i.e. 05:30 in IST — a neutral default, not a fabricated time).
+// Both read the IST wall-clock, so a device set to another timezone still records plant time.
 export function nowHHMM() {
-  const d = new Date();
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return istTimeInput(new Date());
 }
 export function billTimeFrom(v) {
   if (!v) return nowHHMM();
   const d = new Date(v);
   if (isNaN(d)) return '00:00';
-  return `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`;
+  return istTimeInput(d);
 }
 
 // A Filled line's amount is ALWAYS rate × (inventory cylinders + personal cylinders returned),
@@ -510,7 +510,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   // Internal transfer: source and destination sites (must differ).
   const [fromLocation, setFromLocation] = useState('AT_PLANT_CHANDISAR');
   const [toLocation, setToLocation] = useState('AT_PALANPUR_OFFICE');
-  const [billDate, setBillDate] = useState(new Date().toISOString().split('T')[0]);
+  const [billDate, setBillDate] = useState(istDateInput());
   // Phase 34: time-of-day on the Bill Date, defaulting to now, always editable (incl. backdating).
   const [billTime, setBillTime] = useState(() => nowHHMM());
   // Pre-software confirmation (Phase 34 item 4): set to { cylinders, message, onConfirm } when a
@@ -520,10 +520,16 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   // wall-clock; `new Date('YYYY-MM-DDTHH:MM')` parses them in the browser's timezone, and
   // .toISOString() converts to UTC so the server (which may run in a different timezone, e.g. UTC on
   // the droplet vs IST in the browser) stores the exact moment — no offset, and no drift on re-edit.
+  // Built from numeric parts on purpose: `new Date('YYYY-MM-DDTHH:MM')` is NOT parsed consistently
+  // across browsers (Safari returns Invalid Date for the seconds-less form), and the old fallback
+  // then sent a naive local string the server stored verbatim as UTC — a silent +5:30 shift for
+  // IST users that pushed bills into the future and corrupted cylinder ordering.
   const combinedBillDate = () => {
     if (!billDate) return billDate;
     const t = /^\d{2}:\d{2}/.test(billTime) ? billTime : '00:00';
-    const d = new Date(`${billDate}T${t}`);
+    const [y, mo, da] = String(billDate).split('-').map(Number);
+    const [hh, mi] = t.split(':').map(Number);
+    const d = new Date(y, (mo || 1) - 1, da || 1, hh || 0, mi || 0, 0, 0);
     return isNaN(d.getTime()) ? `${billDate}T${t}` : d.toISOString();
   };
   const [challanNo, setChallanNo] = useState('');
@@ -729,7 +735,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     }
     setOneTimeCustomer(p.one_time_customer || { company_name: '', contact_person: '', phone_primary: '', address: '' });
     setTransactionType(p.transactionType || 'GIVEN');
-    setBillDate(p.billDate || new Date().toISOString().split('T')[0]);
+    setBillDate(p.billDate || istDateInput());
     setBillTime(p.billTime || nowHHMM());
     setChallanNo(p.challanNo || '');
     if (p.billNumber) { setBillNumber(p.billNumber); setBillNumberEdited(true); }
@@ -1298,7 +1304,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     if (!savedBill) return;
     setEditingBillId(savedBill.bill_id);
     setEditingBillNo(savedBill.bill_number);
-    setBillDate((savedBill.bill_date || '').slice(0, 10) || new Date().toISOString().split('T')[0]);
+    setBillDate(savedBill.bill_date ? istDateInput(savedBill.bill_date) : istDateInput());
     setBillTime(billTimeFrom(savedBill.bill_date));
     // The challan input holds the full value now (Phase 14) — put it back verbatim.
     setChallanNo(savedBill.challan_no || '');

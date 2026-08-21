@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import {
-  API_URL, apiFetch, apiErrorMessage, readListResponse, fetchAllPages, showToast, formatDate, formatDateTime,
+  API_URL, apiFetch, apiErrorMessage, readListResponse, fetchAllPages, showToast, formatDate, formatDateTime, formatTime, istDateInput,
   getExportFileName, exportToExcel, useViewAll, Spinner, EmptyState, Modal,
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
@@ -13,10 +13,17 @@ import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerifi
 // Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time (the user's LOCAL wall-clock) into an
 // absolute UTC instant, so a server in a different timezone stores the exact moment and re-edits
 // never drift. See combinedBillDate() in components.jsx for the full rationale.
+// Local date + time inputs -> absolute UTC instant. Built from numeric parts on purpose:
+// `new Date('YYYY-MM-DDTHH:MM')` is NOT parsed consistently across browsers (Safari returns
+// Invalid Date for the seconds-less form), and the old fallback then sent a naive local string
+// that the server stored verbatim as UTC — a silent +5:30 shift for IST users that pushed bills
+// into the future and corrupted cylinder ordering. Component form works in every browser.
 const combineDT = (date, time) => {
   if (!date) return date;
   const t = /^\d{2}:\d{2}/.test(time || '') ? time : '00:00';
-  const d = new Date(`${date}T${t}`);
+  const [y, mo, da] = String(date).split('-').map(Number);
+  const [hh, mi] = t.split(':').map(Number);
+  const d = new Date(y, (mo || 1) - 1, da || 1, hh || 0, mi || 0, 0, 0);
   return isNaN(d.getTime()) ? `${date}T${t}` : d.toISOString();
 };
 
@@ -30,8 +37,7 @@ function dateWithTime(d) {
   if (!d) return '-';
   const dt = new Date(d);
   if (isNaN(dt.getTime())) return formatDate(d);
-  const t = dt.toLocaleTimeString('en-US', { hour: 'numeric', minute: '2-digit', hour12: true });
-  return <>{formatDate(d)} <span style={{ color: 'var(--text-muted)', fontSize: '0.82em', fontWeight: 400 }}>{t}</span></>;
+  return <>{formatDate(d)} <span style={{ color: 'var(--text-muted)', fontSize: '0.82em', fontWeight: 400 }}>{formatTime(d)}</span></>;
 }
 
 // Human label for a payment mode. 'ONLINE' is legacy data → shown as "UPI Transfer".
@@ -1021,7 +1027,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
 // Payment Form Component
 export function PaymentForm({ customerId, billId, challanNo, onSuccess, onCancel }) {
   const [formData, setFormData] = useState({
-    date: new Date().toISOString().split('T')[0],
+    date: istDateInput(),
     amount_received: '',
     discount: 0,
     payment_mode: 'CASH',
@@ -1352,7 +1358,7 @@ export function Reports() {
 // One date, live from bill data. Tabs: All Locations + the 3 sites (default = active_location).
 // Reporting person auto-fills from the site's LocationProfile manager; PC has its own columns.
 export function DSRReport() {
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  const [date, setDate] = useState(istDateInput());
   const [tab, setTab] = useState(null); // null = resolving default; 'ALL' | location
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -1541,7 +1547,7 @@ export function DSRReport() {
 
 // ─── Stock Summary — Filled + Empty tables per location per day (Phase 5, best-effort) ───
 export function StockSummaryReport() {
-  const [date, setDate] = useState(new Date().toISOString().split('T')[0]);
+  const [date, setDate] = useState(istDateInput());
   const [tab, setTab] = useState(null);
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
@@ -2053,7 +2059,7 @@ export function Payments({ onNavigate }) {
 export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
   const [formData, setFormData] = useState({
     customer_id: '',
-    date: new Date().toISOString().split('T')[0],
+    date: istDateInput(),
     amount_received: '',
     discount: 0,
     payment_mode: 'CASH',
@@ -2390,7 +2396,8 @@ export function CylinderHistoryModal({ cylinder, onClose }) {
                       {/* Two distinct times: when the event happened vs when it was typed in. */}
                       <span title="Real-world transaction date & time (may be backdated)" style={{whiteSpace:'nowrap'}}>🗓 {formatDateTime(r.event_at)}</span>
                       <span>by <strong>{performerOf(r)}</strong></span>
-                      {r.document_ref && <span>Ref: {r.document_ref}</span>}
+                      {r.document_ref && <span style={{whiteSpace:'nowrap'}}>Ref: {r.document_ref}</span>}
+                      {r.challan_no && <span style={{whiteSpace:'nowrap'}}>Challan: {r.challan_no}</span>}
                       {r.entered_at && <span title="When this was entered into CylinderPro" style={{whiteSpace:'nowrap', opacity:0.8}}>⌨ entered {formatDateTime(r.entered_at)}</span>}
                     </span>
                   </div>
@@ -3403,7 +3410,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
           setMeta({ bill_number: b.bill_number, company_name: 'Internal Transfer', phone_primary: '' });
           setTForm({
             bill_number: b.bill_number || '',
-            bill_date: (b.bill_date || '').slice(0, 10),
+            bill_date: b.bill_date ? istDateInput(b.bill_date) : '',
             bill_time: billTimeFrom(b.bill_date),
             challan_no: b.challan_no || '',
             from_location: b.from_location || '',
@@ -3422,7 +3429,7 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
         setMeta({ bill_number: b.bill_number, company_name: b.company_name, phone_primary: b.phone_primary });
         setForm({
           bill_number: b.bill_number || '',
-          bill_date: (b.bill_date || '').slice(0, 10),
+          bill_date: b.bill_date ? istDateInput(b.bill_date) : '',
           bill_time: billTimeFrom(b.bill_date),
           challan_no: b.challan_no || '',
           transaction_type: b.transaction_type,

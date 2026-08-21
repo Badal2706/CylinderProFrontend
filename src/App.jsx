@@ -105,20 +105,49 @@ export function sortCapacities(list, labelOf) {
 }
 
 // ─── Date formatting ───
+// The business runs on IST, so EVERY date and time in the UI is rendered in Asia/Kolkata
+// regardless of the device's own timezone — a phone or laptop set to another zone must never
+// show a different day or hour than the plant does. Times are 12-hour with AM/PM.
 // Always returns DD/MM/YYYY — do not inline date formatting anywhere else.
+export const IST_TZ = 'Asia/Kolkata';
+function istParts(dt) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: IST_TZ, day: '2-digit', month: '2-digit', year: 'numeric',
+    hour: 'numeric', minute: '2-digit', hour12: true
+  }).formatToParts(dt).reduce((a, x) => { a[x.type] = x.value; return a; }, {});
+}
 export function formatDate(d) {
   if (!d) return '';
   const dt = new Date(d);
   if (isNaN(dt.getTime())) return '';
-  const p = (n) => String(n).padStart(2, '0');
-  return `${p(dt.getDate())}/${p(dt.getMonth() + 1)}/${dt.getFullYear()}`;
+  const p = istParts(dt);
+  return `${p.day}/${p.month}/${p.year}`;
+}
+// "4:53 PM" in IST.
+export function formatTime(d) {
+  if (!d) return '';
+  const dt = new Date(d);
+  if (isNaN(dt.getTime())) return '';
+  const p = istParts(dt);
+  return `${p.hour}:${p.minute} ${String(p.dayPeriod || '').toUpperCase()}`;
 }
 export function formatDateTime(d) {
   if (!d) return '';
   const dt = new Date(d);
   if (isNaN(dt.getTime())) return '';
-  const p = (n) => String(n).padStart(2, '0');
-  return `${formatDate(dt)} ${p(dt.getHours())}:${p(dt.getMinutes())}`;
+  return `${formatDate(d)} ${formatTime(d)}`;
+}
+// YYYY-MM-DD for <input type="date"> — the IST calendar day, not the UTC one (which is a day
+// behind between midnight and 5:30 AM IST).
+export function istDateInput(d = new Date()) {
+  const p = istParts(new Date(d));
+  return `${p.year}-${p.month}-${p.day}`;
+}
+// HH:MM (24h) for <input type="time"> — IST wall-clock.
+export function istTimeInput(d = new Date()) {
+  return new Intl.DateTimeFormat('en-GB', {
+    timeZone: IST_TZ, hour: '2-digit', minute: '2-digit', hour12: false
+  }).format(new Date(d));
 }
 
 // Avatar initials from a name ("Acme Gas Co" -> "AG").
@@ -2189,7 +2218,7 @@ export function App() {
     { key: 'reports',         icon: '📈', label: 'Reports' },
   ];
 
-  const today = new Date().toLocaleDateString('en-IN', { weekday:'long', year:'numeric', month:'long', day:'numeric' });
+  const today = new Date().toLocaleDateString('en-IN', { timeZone: IST_TZ, weekday:'long', year:'numeric', month:'long', day:'numeric' });
 
   return (
     <div className="app-shell">
