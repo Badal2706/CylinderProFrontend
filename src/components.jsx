@@ -26,11 +26,12 @@ export function lineAmount(item) {
   return (Number(item.rate) || 0) * qty;
 }
 
-// Print a transaction as the GURU Industries Delivery Challan.
-// Fixed company letterhead (NOT driven by Business Profile). Two stacked sections:
+// Print a transaction as the Delivery Challan. Two stacked sections:
 //   "Cylinders Empty from Customer" (no Rate/Amount) above, "Cylinders Filled to Customer" (with Rate/Amount + TOTAL) below.
 // A section is omitted entirely when it has no lines, so Given-only / Received-only / Swap all render correctly.
-// The logo is loaded from /guru-logo.png (served from the frontend's public/ folder).
+// Phase GEN-A: the letterhead (logo, name, GSTIN, certification, address, per-site contacts,
+// e-mail, products line) is read from BusinessProfile + LocationProfile at print time. No
+// business-identity string is hardcoded here — see RULES.md R74.
 // Shared print helper (Phase 27): HTML-escape for print templates.
 const printEsc = (s) => String(s == null ? '' : s)
   .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
@@ -63,6 +64,20 @@ function printDocStyles() {
     /* Phase 27: Plot line now lives inside the company box, under the ISO line. */
     .hcol.company .plot-in { margin-top:3px; }
     .hcol.contact { width:28%; }
+    /* Phase GEN-A: letterhead lines print EXACTLY as typed in Settings — capitals stay capitals
+       and a new line stays a new line. pre-wrap keeps both while still wrapping long text.
+       The elements using this must carry no leading whitespace in the template, or it prints. */
+    .hcol .ll, .mfg { white-space:pre-wrap; }
+    /* A blank field drops its whole column, so the remaining ones must still fill the box, and
+       whichever ends up last must not draw a border against the box's own right edge. */
+    .hdr-cols.no-logo .hcol.company { width:65%; }
+    .hdr-cols.no-logo .hcol.contact { width:35%; }
+    .hdr-cols.no-contact .hcol.logo { width:40%; }
+    .hdr-cols.no-contact .hcol.company { width:60%; }
+    .hcol:last-child { border-right:none; }
+    /* Rental Summary body (shares this stylesheet from Phase GEN-A onward). */
+    .meta { display:flex; justify-content:space-between; margin-bottom:8px; }
+    .terms { font-size:11px; color:#333; margin-top:6px; }
     /* Phase 27: Mfg stays below the box, font bumped one point (10 -> 11). */
     .mfg { font-size:11px; margin-top:5px; margin-bottom:8px; }
     .info { padding:6px 0; border-top:1px solid #000; border-bottom:1px solid #000; margin-bottom:10px; }
@@ -95,29 +110,50 @@ function printDocStyles() {
     @page { margin-top:10mm; margin-bottom:10mm; margin-left:10mm; margin-right:10mm; }`;
 }
 
-// Shared company header box (logo + company info + contact), used by both print documents.
-function printHeaderBox(title) {
-  const LOGO_URL = window.location.origin + '/guru-logo.png';
+// Shared company letterhead, driven entirely by BusinessProfile + LocationProfile (Phase GEN-A).
+// Two rules hold everywhere in here:
+//   1. Every value prints EXACTLY as typed in Settings — no prefix, label or capitalisation is
+//      invented by the template. That is what lets one site carry two numbers on one line.
+//   2. A blank field renders NOTHING — never an orphan label like "GSTIN: " with no value.
+function printHeaderBox(title, business) {
+  const b = business || {};
+  const e = printEsc;
+  const has = (v) => !!(v && String(v).trim());
+  // `ll` = letterhead line: printed verbatim (see the .ll rule in printDocStyles).
+  const ll = (v, cls) => has(v) ? `<div class="${cls ? cls + ' ' : ''}ll">${e(v)}</div>` : '';
+
+  // 100% keeps the size the letterhead has always had; the logo scales alone, text is untouched.
+  // max-width stays capped at 100% in CSS so a large value can never push past its column.
+  const scale = Number(b.logo_scale) > 0 ? Number(b.logo_scale) : 100;
+  const logoBox = has(b.logo)
+    ? `<div class="hcol logo"><img src="${e(b.logo)}" alt="" style="max-height:${Math.round(1.5 * scale)}px" onerror="this.style.display='none'"/></div>`
+    : '';
+
+  const companyInner = ll(b.business_name, 'co')
+    + (has(b.gst_number) ? `<div class="ll">GSTIN: ${e(b.gst_number)}</div>` : '')
+    + ll(b.certification_line)
+    + ll(b.business_address, 'plot-in');
+  const companyBox = companyInner ? `<div class="hcol company">${companyInner}</div>` : '';
+
+  // Contact box: each entry is one block of letterhead text, printed in order and verbatim, so a
+  // newline typed in Settings is a newline on the page and a site can carry two numbers.
+  const contactLines = (Array.isArray(b.contact_lines) ? b.contact_lines : [])
+    .map((v) => ll(v))
+    .join('');
+  const emailLine = has(b.business_email) ? `<div class="ll">E-mail: ${e(b.business_email)}</div>` : '';
+  const contactBox = (contactLines || emailLine)
+    ? `<div class="hcol contact">${contactLines}${emailLine}</div>` : '';
+
+  const colsClass = 'hdr-cols'
+    + (logoBox ? '' : ' no-logo')
+    + (contactBox ? '' : ' no-contact');
+
   return `
   <div class="hdr-box">
-    <div class="hdr-title">${title}</div>
-    <div class="hdr-cols">
-      <div class="hcol logo"><img src="${LOGO_URL}" alt="GURU Industries" onerror="this.style.display='none'"/></div>
-      <div class="hcol company">
-        <div class="co">GURU Industries</div>
-        <div>GSTIN: 24AAJFG7415N1Z3</div>
-        <div>ISO 9001:2015 Certified Company</div>
-        <div class="plot-in">Plot No.: 114/47, Chandisar G.I.D.C., Palanpur-385 001. (B.K.) Gujarat.</div>
-      </div>
-      <div class="hcol contact">
-        <div>Chandisar: M 7600076251, 7600076254</div>
-        <div>Palanpur: M 7600076255</div>
-        <div>Chaapi: M 9624650959</div>
-        <div>E-mail: gurugases@yahoo.com</div>
-      </div>
-    </div>
+    <div class="hdr-title">${e(title)}</div>
+    <div class="${colsClass}">${logoBox}${companyBox}${contactBox}</div>
   </div>
-  <div class="mfg">Mfg.: Industrial &amp; Medical Oxygen, CO2, Nitrogen, Argon etc gases.</div>`;
+  ${ll(b.products_line, 'mfg')}`;
 }
 
 // Shared customer info block: M/s + right-slot GSTIN, address, contact, and a right-aligned
@@ -179,13 +215,38 @@ function printFitAndPrintScript() {
   <\/script>`;
 }
 
-function openPrintWindow(html) {
-  const w = window.open('', 'guru_print', 'width=900,height=760,scrollbars=yes');
-  if (w) { w.document.write(html); w.document.close(); }
-  else { showToast('Please allow pop-ups to use Print / PDF.', 'info'); }
+// Phase GEN-A: opening the window and writing to it are now two steps, because the letterhead
+// has to be fetched in between. openPrintTarget() MUST be the first synchronous statement of a
+// print handler — once an await has run, the window.open() is no longer a direct result of the
+// user's click and browsers block it as a popup.
+function openPrintTarget(name = 'guru_print') {
+  const w = window.open('', name, 'width=900,height=760,scrollbars=yes');
+  if (!w) showToast('Please allow pop-ups to use Print / PDF.', 'info');
+  return w;
 }
 
-export function printSavedBill(bill) {
+function writePrintDoc(w, html) {
+  if (!w) return;
+  w.document.write(html);
+  w.document.close();
+}
+
+// The letterhead is read FRESH on every print, never from mount-time state — editing Business
+// Info in another tab must never print a stale address. A failed fetch prints the document with
+// an empty letterhead rather than not printing at all.
+async function fetchPrintIdentity() {
+  try {
+    const res = await apiFetch(`${API_URL}/profile/business`);
+    return { business: (res.ok ? await res.json() : {}) || {} };
+  } catch {
+    return { business: {} };
+  }
+}
+
+export async function printSavedBill(bill) {
+  const w = openPrintTarget();                       // FIRST statement — before any await
+  if (!w) return;
+  const { business } = await fetchPrintIdentity();
   const esc = printEsc;
 
   // ─── Phase 27: merged empty/filled cylinder table ───
@@ -287,7 +348,7 @@ export function printSavedBill(bill) {
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
   <style>${printDocStyles()}</style></head><body>
-  ${printHeaderBox('Delivery Challan')}
+  ${printHeaderBox('Delivery Challan', business)}
   ${printCustomerBlock(bill, metaLeft, metaRight, { showVehicle: true })}
   ${mergedTable}
   ${transferSection}
@@ -301,17 +362,20 @@ export function printSavedBill(bill) {
     </div>
     <div class="eng">First check the Goods and then take delivery.<br/>Subject to Palanpur Jurisdiction</div>
   </div>
-  <div class="signs"><div>Customer Signature</div><div class="right">Guru Industries<br/>Authorised Signature</div></div>
+  <div class="signs"><div>Customer Signature</div><div class="right">${esc(business.business_name || '')}<br/>Authorised Signature</div></div>
   ${printFitAndPrintScript()}
   </body></html>`;
 
-  openPrintWindow(html);
+  writePrintDoc(w, html);
 }
 
 // ─── Phase 27: Currently Holding Cylinders statement ───
 // Reuses the challan header + customer block, but with a holding-status table and NO amounts
 // (this is a status document, not a billing document). `rows` come from the on-screen table.
-export function printHoldingStatement({ customer_name, customer_address, customer_contact, customer_gst, rows, breakdown }) {
+export async function printHoldingStatement({ customer_name, customer_address, customer_contact, customer_gst, rows, breakdown }) {
+  const w = openPrintTarget();                       // FIRST statement — before any await
+  if (!w) return;
+  const { business } = await fetchPrintIdentity();
   const esc = printEsc;
   const bodyRows = (rows || []).map((r, i) => `
     <tr>
@@ -362,15 +426,15 @@ export function printHoldingStatement({ customer_name, customer_address, custome
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
   <style>${printDocStyles()}</style></head><body>
-  ${printHeaderBox('Currently Holding Cylinders Statement')}
+  ${printHeaderBox('Currently Holding Cylinders Statement', business)}
   ${printCustomerBlock(bill, '', `Date: <b>${formatDate(new Date())}</b>`)}
   ${table}
   ${breakdownTable ? `<h3 style="margin:16px 0 6px;font-size:12px">Breakdown by Type</h3>${breakdownTable}` : ''}
-  <div class="signs"><div>Customer Signature</div><div class="right">Guru Industries<br/>Authorised Signature</div></div>
+  <div class="signs"><div>Customer Signature</div><div class="right">${esc(business.business_name || '')}<br/>Authorised Signature</div></div>
   ${printFitAndPrintScript()}
   </body></html>`;
 
-  openPrintWindow(html);
+  writePrintDoc(w, html);
 }
 
 // ─── Step-up verification modal (Phase 17 — consumed by Phase 18's gated actions) ───
@@ -2538,7 +2602,6 @@ export function RentalSummaryModal({ customer, customerId, onClose, onGenerated 
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(true);
   const [rows, setRows] = useState([]);           // current holdings with days_unbilled
-  const [business, setBusiness] = useState(null); // shared BusinessProfile for the printout
   const [freeDays, setFreeDays] = useState(10);
   const [rate, setRate] = useState(0);
   const [selected, setSelected] = useState({});   // serial_number -> checked
@@ -2548,12 +2611,8 @@ export function RentalSummaryModal({ customer, customerId, onClose, onGenerated 
   useEffect(() => {
     (async () => {
       try {
-        const [aRes, bRes] = await Promise.all([
-          apiFetch(`${API_URL}/customers/${customerId}/aging`),
-          apiFetch(`${API_URL}/profile/business`)
-        ]);
+        const aRes = await apiFetch(`${API_URL}/customers/${customerId}/aging`);
         setRows(aRes.ok ? await aRes.json() : []);
-        setBusiness(bRes.ok ? await bRes.json() : null);
       } catch (e) { console.error('Error loading rental data:', e); }
       setLoading(false);
     })();
@@ -2587,40 +2646,24 @@ export function RentalSummaryModal({ customer, customerId, onClose, onGenerated 
     setSaving(false);
   };
 
-  // Printable summary: shared BusinessProfile header + customer details + charged lines.
-  const printSummary = () => {
+  // Printable summary. Phase GEN-A: same printDocStyles() + printHeaderBox() shell as the challan
+  // and the holding statement, so all three documents share one letterhead. Only the body differs.
+  const printSummary = async () => {
     const c = savedCharge;
     if (!c) return;
+    const w = openPrintTarget('rental_summary_print');   // FIRST — before any await
+    if (!w) return;
+    const { business } = await fetchPrintIdentity();
     const esc = (s) => String(s == null ? '' : s)
       .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    const bizName = (business && business.business_name) || 'GURU Industries';
     const lines = (c.line_items || []).map((l, i) => `
       <tr><td class="c">${i + 1}</td><td>${esc(l.serial_number)}</td><td>${esc(l.gas_type)}</td><td>${esc(l.capacity)}</td>
       <td class="c">${formatDate(l.charged_from)} – ${formatDate(l.charged_through)}</td>
       <td class="c">${l.days_held}</td><td class="c">${l.days_charged}</td>
       <td class="r">${(l.amount || 0).toFixed(2)}</td></tr>`).join('');
     const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(c.customer.company_name)} — Rental Summary</title>
-    <style>
-      * { margin:0; padding:0; box-sizing:border-box; }
-      body { font-family: Arial, sans-serif; color:#000; font-size:12px; padding:14px; }
-      .hdr { border:1.5px solid #000; padding:8px 10px; margin-bottom:10px; }
-      .hdr .co { font-size:16px; font-weight:bold; }
-      .title { text-align:center; font-size:14px; font-weight:bold; margin:8px 0; }
-      .meta { display:flex; justify-content:space-between; margin-bottom:8px; }
-      table { width:100%; border-collapse:collapse; margin-bottom:8px; }
-      th, td { border:1px solid #000; padding:5px 7px; font-size:12px; }
-      th { font-weight:700; text-align:left; }
-      td.c, th.c { text-align:center; } td.r, th.r { text-align:right; }
-      .tot { font-weight:700; }
-      .terms { font-size:11px; color:#333; margin-top:6px; }
-    </style></head><body>
-    <div class="hdr">
-      <div class="co">${esc(bizName)}</div>
-      ${business && business.business_address ? `<div>${esc(business.business_address)}</div>` : ''}
-      ${business && business.business_phone ? `<div>Phone: ${esc(business.business_phone)}</div>` : ''}
-      ${business && business.gst_number ? `<div>GSTIN: ${esc(business.gst_number)}</div>` : ''}
-    </div>
-    <div class="title">Cylinder Rental Summary</div>
+    <style>${printDocStyles()}</style></head><body>
+    ${printHeaderBox('Cylinder Rental Summary', business)}
     <div class="meta">
       <div>
         <div><strong>M/s.: ${esc(c.customer.company_name)}</strong></div>
@@ -2634,18 +2677,16 @@ export function RentalSummaryModal({ customer, customerId, onClose, onGenerated 
         <div>Rate/day: <strong>₹${(c.rate_per_day || 0).toFixed(2)}</strong></div>
       </div>
     </div>
-    <table>
+    <table class="ctab">
       <thead><tr><th class="c" style="width:6%">Sr.</th><th>Cylinder No.</th><th>Gas</th><th>Size</th>
       <th class="c">Period</th><th class="c">Days Held</th><th class="c">Days Charged</th><th class="r">Amount</th></tr></thead>
       <tbody>${lines}</tbody>
-      <tfoot><tr><td colspan="7" class="r tot">TOTAL...</td><td class="r tot">${(c.total_amount || 0).toFixed(2)}</td></tr></tfoot>
+      <tfoot><tr class="tot"><td colspan="7" class="r">TOTAL...</td><td class="r">${(c.total_amount || 0).toFixed(2)}</td></tr></tfoot>
     </table>
     <div class="terms">Days charged = days held (since last charge) minus ${c.free_days} free day(s), at ₹${(c.rate_per_day || 0).toFixed(2)} per day per cylinder.</div>
-    <script>window.onload=function(){setTimeout(function(){window.print();},120);window.onafterprint=function(){window.close();};}<\/script>
+    ${printFitAndPrintScript()}
     </body></html>`;
-    const w = window.open('', 'rental_summary_print', 'width=900,height=760,scrollbars=yes');
-    if (w) { w.document.write(html); w.document.close(); }
-    else { showToast('Please allow pop-ups to use Print / PDF.', 'info'); }
+    writePrintDoc(w, html);
   };
 
   return (

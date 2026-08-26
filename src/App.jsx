@@ -3826,7 +3826,8 @@ export function ImportDataSection() {
 
 export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   const [account, setAccount] = useState(null);
-  const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'', logo:'' });
+  const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'',
+    certification_line:'', business_email:'', products_line:'', contact_lines:[], logo_scale:100, logo:'' });
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
@@ -3935,7 +3936,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     e.preventDefault();
     setStepUpAsk({
       title: 'Approve saving Business Information',
-      context: 'save Business Information changes (name, address, GST, logo)',
+      context: 'save Business Information changes (name, address, GST, certification line, e-mail, products line, printed contact lines, logo)',
       action: async (auth) => {
         try {
           const res = await apiFetch(`${API_URL}/profile/business`, {
@@ -4054,7 +4055,8 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
       <div className="card">
         <h2>Business Information</h2>
         <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
-          Shown on bill headers and printed/PDF invoices.
+          Shown on bill headers and printed/PDF invoices. Every field prints <strong>exactly as typed</strong> —
+          capitals stay capitals, and a blank field is left off the page entirely.
         </p>
         <form onSubmit={saveBusiness}>
           <div className="form-row">
@@ -4085,11 +4087,63 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
               <input type="file" accept="image/*" className="form-control" onChange={onLogoChange} />
             </div>
           </div>
+          <div className="form-row">
+            <div className="form-group">
+              <label>Certification Line</label>
+              <input className="form-control" value={business.certification_line}
+                placeholder="e.g. ISO 9001:2015 Certified Company"
+                onChange={(e) => setBusiness({...business, certification_line: e.target.value})} />
+            </div>
+            <div className="form-group">
+              <label>Business Email</label>
+              <input className="form-control" value={business.business_email}
+                placeholder="e.g. gurugases@yahoo.com"
+                onChange={(e) => setBusiness({...business, business_email: e.target.value})} />
+            </div>
+          </div>
+          <div className="form-group">
+            <label>Products / Manufacturing Line</label>
+            <input className="form-control" value={business.products_line}
+              placeholder="e.g. Mfg.: Industrial &amp; Medical Oxygen, CO2, Nitrogen, Argon etc gases."
+              onChange={(e) => setBusiness({...business, products_line: e.target.value})} />
+          </div>
+          <div className="form-group">
+            <label>Printed Contact Lines</label>
+            <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(200px, 1fr))', gap:'0.75rem'}}>
+              {LOCATIONS.map((loc, i) => (
+                <div key={loc}>
+                  <label style={{fontSize:'0.78rem', color:'var(--text-muted)', fontWeight:500}}>{LOCATION_LABELS[loc]}</label>
+                  <textarea className="form-control" rows="2"
+                    style={{resize:'vertical'}}
+                    placeholder={'e.g. ' + LOCATION_LABELS[loc].split(' ')[0] + ': M 7600076251'}
+                    value={(business.contact_lines || [])[i] || ''}
+                    onChange={(e) => {
+                      const next = [...(business.contact_lines || [])];
+                      while (next.length < LOCATIONS.length) next.push('');
+                      next[i] = e.target.value;
+                      setBusiness({...business, contact_lines: next});
+                    }} />
+                </div>
+              ))}
+            </div>
+          </div>
           {business.logo && (
-            <div style={{marginBottom:'1rem'}}>
-              <img src={business.logo} alt="Logo" style={{maxHeight:'64px', borderRadius:'6px', border:'1px solid var(--border)'}} />
-              <button type="button" className="link-btn" style={{marginLeft:'1rem', fontSize:'0.8rem'}}
+            <div style={{marginBottom:'1rem', display:'flex', alignItems:'center', gap:'1rem', flexWrap:'wrap'}}>
+              <button type="button" className="link-btn" style={{fontSize:'0.8rem'}}
                 onClick={() => setBusiness({...business, logo:''})}>Remove logo</button>
+              <div style={{display:'flex', alignItems:'center', gap:'0.4rem'}}>
+                <label style={{fontSize:'0.78rem', color:'var(--text-muted)', fontWeight:500, whiteSpace:'nowrap'}}>
+                  Logo Size on Print
+                </label>
+                <input type="number" className="form-control" min="25" max="400" step="5"
+                  style={{width:'5.5rem'}}
+                  value={business.logo_scale ?? 100}
+                  onChange={(e) => setBusiness({...business, logo_scale: e.target.value})} />
+                <span style={{color:'var(--text-muted)'}}>%</span>
+              </div>
+              <img src={business.logo} alt="Logo"
+                style={{maxHeight:`${Math.max(24, 64 * (Number(business.logo_scale) || 100) / 100)}px`,
+                        borderRadius:'6px', border:'1px solid var(--border)'}} />
             </div>
           )}
           <button type="submit" className="btn btn-primary">Save Business Info</button>
@@ -4120,6 +4174,10 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                 <label>Contact Number</label>
                 <input className="form-control" value={p.contact_number}
                   onChange={(e) => setLocField(p.location, 'contact_number', e.target.value)} />
+                <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                  This site's own contact. The numbers printed on challans are set separately, under
+                  Business Information.
+                </small>
               </div>
               <div className="form-group">
                 <label>Challan Prefix</label>
