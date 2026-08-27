@@ -48,7 +48,13 @@ export function directionText(d) {
 }
 
 // ── Business sites (multi-location cylinder tracking) ──
-// Mirrors backend/config/locations.js — keep both in sync manually (same convention as GAS_CAPACITIES).
+// Phase GEN-B2: these are no longer constants. They start as the seed set so the very first render
+// (before the fetch lands) is never empty, then refreshLocations() replaces their CONTENTS with
+// whatever the account actually has.
+//
+// CRITICAL: never reassign these bindings. Twenty-odd modules did `import { LOCATIONS }` and hold
+// a reference to THIS array object; `LOCATIONS = [...]` would leave every one of them pointing at
+// the old one. Mutate in place — splice and Object.keys/delete — so every importer sees the change.
 export const LOCATIONS = ['AT_PLANT_CHANDISAR', 'AT_PALANPUR_OFFICE', 'AT_CHHAPI_OFFICE'];
 export const LOCATION_LABELS = {
   AT_PLANT_CHANDISAR: 'Chandisar Plant',
@@ -56,6 +62,48 @@ export const LOCATION_LABELS = {
   AT_CHHAPI_OFFICE: 'Chhapi Office'
 };
 export function locationText(loc) { return LOCATION_LABELS[loc] || loc || '—'; }
+
+// The full records behind the two exports above — label, filling flag, manager, etc. Read by the
+// settings screen; everything else only needs codes and labels.
+export let LOCATION_PROFILES = [];
+export function fillingLocationCode() {
+  const f = LOCATION_PROFILES.find(p => p.is_filling_location);
+  return f ? f.location : null;
+}
+
+// Mutating the arrays does not re-render anything on its own — React has no idea they changed.
+// Components that RENDER a location list call useLocations() so this event forces them to redraw.
+export function useLocations() {
+  const [, bump] = useState(0);
+  useEffect(() => {
+    const onChange = () => bump(n => n + 1);
+    window.addEventListener('locations-updated', onChange);
+    return () => window.removeEventListener('locations-updated', onChange);
+  }, []);
+  return { LOCATIONS, LOCATION_LABELS, LOCATION_PROFILES };
+}
+
+// Pull the account's real locations and publish them. Safe to call repeatedly; a failed fetch
+// leaves whatever was already loaded rather than emptying every dropdown in the app.
+export async function refreshLocations() {
+  try {
+    const res = await apiFetch(`${API_URL}/profile/locations`);
+    if (!res.ok) return false;
+    const data = await res.json();
+    const profiles = (data && data.profiles) || [];
+    if (!profiles.length) return false;
+
+    LOCATION_PROFILES = profiles;
+    LOCATIONS.splice(0, LOCATIONS.length, ...profiles.map(p => p.location));
+    Object.keys(LOCATION_LABELS).forEach(k => { delete LOCATION_LABELS[k]; });
+    profiles.forEach(p => { LOCATION_LABELS[p.location] = p.label || p.location; });
+
+    window.dispatchEvent(new CustomEvent('locations-updated'));
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 // ─── Active Location — per-browser preference (Phase 32) ───
 // The default site for new transactions and location-aware report tabs is now stored PER
@@ -518,6 +566,9 @@ export function todayISO() {
 const GAS_COLORS = ['#2563EB', '#0891B2', '#7C3AED', '#DB2777', '#EA580C', '#16A34A', '#CA8A04', '#64748B'];
 
 function StackedLocationBar({ byLocationState, onNavigate }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const locs = LOCATIONS.filter(l => byLocationState && byLocationState[l]);
   if (!locs.length) return <EmptyState icon="📍" message="No cylinders to chart yet" />;
   const max = Math.max(...locs.map(l => (byLocationState[l].IN_STOCK || 0) + (byLocationState[l].AT_CUSTOMER || 0)), 1);
@@ -1060,12 +1111,12 @@ export const IMPORT_SCHEMAS = {
       { key: 'physical_number',   required: false, note: 'Unique per account when provided.' },
       { key: 'gas_type',          required: true,  note: 'Must match a VALID GAS TYPE exactly.' },
       { key: 'capacity',          required: true,  note: 'Must be valid FOR the row’s gas type.' },
-      { key: 'location',          required: false, note: 'AT_PLANT_CHANDISAR, AT_PALANPUR_OFFICE or AT_CHHAPI_OFFICE. Blank = AT_PLANT_CHANDISAR.' },
+      { key: 'location',          required: false, note: 'Any of your configured location codes or names (see Settings → Location Profiles). Blank = your default site.' },
       { key: 'stock_state',       required: false, note: 'IN_STOCK or AT_CUSTOMER. Blank = IN_STOCK.' }
     ],
     legend: {
       required: 'rotational_number, gas_type, capacity',
-      optional: 'physical_number, location (blank = AT_PLANT_CHANDISAR), stock_state (blank = IN_STOCK)'
+      optional: 'physical_number, location (blank = your default site), stock_state (blank = IN_STOCK)'
     },
     example: {
       rotational_number: 'EXAMPLE-ROT-001 (delete this row)',
@@ -2109,6 +2160,10 @@ export function App() {
 
   // Load the live gas → sizes catalog once at startup (Phase 10).
   useEffect(() => { loadGasCatalog(); }, []);
+
+  // Phase GEN-B2: pull the account's real locations as soon as there is a session. Until this
+  // lands the seed set is used, so nothing renders empty.
+  useEffect(() => { if (authToken) refreshLocations(); }, [authToken]);
 
   const handleAuthSuccess = (data) => {
     localStorage.setItem('authToken', data.token);
@@ -3825,6 +3880,9 @@ export function ImportDataSection() {
 }
 
 export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [account, setAccount] = useState(null);
   const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'',
     certification_line:'', business_email:'', products_line:'', contact_lines:[], logo_scale:100, logo:'' });
@@ -3837,6 +3895,9 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // active_location comes from THIS browser (localStorage), not the shared account (Phase 32);
   // profiles (manager/contact/challan) still come from the server and stay shared.
   const [locData, setLocData] = useState({ active_location: getActiveLocation(), profiles: [] });
+  // Phase GEN-B2: adding a site, and moving the filling flag.
+  const [addLoc, setAddLoc] = useState(null);   // null = form closed
+  const currentFilling = (locData.profiles || []).find(p => p.is_filling_location) || null;
   const [pendingSwitch, setPendingSwitch] = useState(null); // location awaiting confirm dialog
 
   // Account form
@@ -3959,6 +4020,18 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   };
 
   // ── Location profiles (Phase 2) ──
+  // Re-pull just the location cards (after adding one or moving the filling flag), without
+  // reloading the whole profile page.
+  const reloadLocationProfiles = async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/profile/locations`);
+      if (res.ok) {
+        const ld = await res.json();
+        setLocData({ ...ld, active_location: getActiveLocation() });
+      }
+    } catch { /* the toast from the caller already reported the real failure */ }
+  };
+
   const setLocField = (location, field, value) => setLocData(prev => ({
     ...prev,
     profiles: prev.profiles.map(p => p.location === location ? { ...p, [field]: value } : p)
@@ -3993,6 +4066,72 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     setActiveLocation(target); // localStorage, this browser only
     setLocData(prev => ({ ...prev, active_location: target }));
     showToast(`Active location for this browser switched to ${locationText(target)}.`, 'success');
+  };
+
+  // ── Phase GEN-B2: add a location ──
+  // The CODE is generated server-side from the name and is permanent; only the name and the
+  // editable side-fields are sent.
+  const submitAddLocation = (e) => {
+    e.preventDefault();
+    const name = (addLoc.label || '').trim();
+    if (!name) { showToast('Give the location a name.', 'info'); return; }
+    setStepUpAsk({
+      title: `Approve adding ${name}`,
+      context: `add a new location "${name}"${addLoc.is_filling_location ? ' and make it the filling location' : ''}`,
+      action: async (auth) => {
+        try {
+          const res = await apiFetch(`${API_URL}/profile/locations`, {
+            method: 'POST',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({ ...addLoc, label: name })
+          });
+          if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not add the location')); return; }
+          const out = await res.json();
+          await refreshLocations();          // every dropdown and tab in the app picks it up
+          await reloadLocationProfiles();      // and this card redraws with the new card
+          setAddLoc(null);
+          showToast(`${out.profile.label} added (code ${out.profile.location}).`, 'success');
+        } catch { showToast('Could not add the location'); }
+      }
+    });
+  };
+
+  // ── Phase GEN-B2: move the filling flag ──
+  // Not a cosmetic edit: DSR, Stock Summary, the maintenance gate and the filling log all pivot on
+  // it, so this is confirmed AND step-up gated.
+  const makeFillingLocation = (p) => {
+    const from = currentFilling ? locationText(currentFilling.location) : 'nowhere';
+    const ok = window.confirm(
+      `Make ${locationText(p.location)} the filling location?\n\n` +
+      (currentFilling
+        ? `${locationText(currentFilling.location)} will stop being the filling location.\n\n`
+        : 'No location currently fills.\n\n') +
+      'This changes how the system behaves from now on:\n' +
+      '  • DSR and Stock Summary classify transfers around the filling location\n' +
+      '  • Cylinders can only be put under maintenance there\n' +
+      '  • Gas type / capacity can only be edited there\n' +
+      '  • Filling log entries are recorded against it\n\n' +
+      'Existing bills, cylinders and history are NOT changed — but reports covering past dates ' +
+      'will be recalculated using the new filling location.'
+    );
+    if (!ok) return;
+    setStepUpAsk({
+      title: `Approve changing the filling location`,
+      context: `make "${locationText(p.location)}" the filling location (currently ${from}) — this changes DSR, Stock Summary, the maintenance gate and the filling log`,
+      action: async (auth) => {
+        try {
+          const res = await apiFetch(`${API_URL}/profile/locations/${p.location}`, {
+            method: 'PUT',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({ is_filling_location: true })
+          });
+          if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not change the filling location')); return; }
+          await refreshLocations();
+          await reloadLocationProfiles();
+          showToast(`${locationText(p.location)} is now the filling location.`, 'success');
+        } catch { showToast('Could not change the filling location'); }
+      }
+    });
   };
 
   // ── Password change — step-up-gated (Phase 19) ON TOP of the current-password check ──
@@ -4156,6 +4295,71 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
           Per-site manager, contact number, and challan prefix. Business Information above stays shared across all sites.
         </p>
+        {!addLoc && (
+          <div style={{marginBottom:'1rem'}}>
+            <button type="button" className="btn btn-secondary"
+              onClick={() => setAddLoc({ label:'', is_filling_location:false, manager_name:'', contact_number:'', challan_prefix:'' })}>
+              + Add Location
+            </button>
+          </div>
+        )}
+        {addLoc && (
+          <form onSubmit={submitAddLocation}
+            style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'1rem', marginBottom:'1rem'}}>
+            <div style={{fontWeight:700, marginBottom:'0.75rem'}}>New Location</div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Location Name</label>
+                <input className="form-control" autoFocus value={addLoc.label}
+                  placeholder="e.g. Deesa Depot"
+                  onChange={(e) => setAddLoc({...addLoc, label: e.target.value})} />
+                <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                  A permanent code is generated from this name. The name can be changed later; the code cannot.
+                </small>
+              </div>
+              <div className="form-group">
+                <label>Manager Name</label>
+                <input className="form-control" value={addLoc.manager_name}
+                  onChange={(e) => setAddLoc({...addLoc, manager_name: e.target.value})} />
+              </div>
+            </div>
+            <div className="form-row">
+              <div className="form-group">
+                <label>Contact Number</label>
+                <input className="form-control" value={addLoc.contact_number}
+                  onChange={(e) => setAddLoc({...addLoc, contact_number: e.target.value})} />
+              </div>
+              <div className="form-group">
+                <label>Challan Prefix</label>
+                <input className="form-control" value={addLoc.challan_prefix} placeholder="e.g. D-"
+                  onChange={(e) => setAddLoc({...addLoc, challan_prefix: e.target.value})} />
+              </div>
+            </div>
+            <div className="form-group">
+              <label style={{display:'flex', alignItems:'center', gap:'0.5rem', cursor: currentFilling ? 'not-allowed' : 'pointer'}}
+                title={currentFilling
+                  ? `${locationText(currentFilling.location)} is already the filling location. Add this site first, then use "Set as filling location" on its card.`
+                  : 'Only one location can fill cylinders.'}>
+                <input type="checkbox" disabled={!!currentFilling}
+                  checked={!!addLoc.is_filling_location}
+                  onChange={(e) => setAddLoc({...addLoc, is_filling_location: e.target.checked})} />
+                <span style={{color: currentFilling ? 'var(--text-muted)' : 'inherit'}}>
+                  This is my filling location
+                </span>
+              </label>
+              {currentFilling && (
+                <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                  {locationText(currentFilling.location)} currently fills. Add this site, then use
+                  “Set as filling location” on its card to move it.
+                </small>
+              )}
+            </div>
+            <div style={{display:'flex', gap:'0.6rem'}}>
+              <button type="submit" className="btn btn-primary">Add Location</button>
+              <button type="button" className="btn btn-secondary" onClick={() => setAddLoc(null)}>Cancel</button>
+            </div>
+          </form>
+        )}
         <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))', gap:'1rem'}}>
           {locData.profiles.map(p => (
             <div key={p.location} style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
@@ -4164,7 +4368,24 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                 {locData.active_location === p.location && (
                   <span className="badge badge-success" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}>Active</span>
                 )}
+                {p.is_filling_location && (
+                  <span className="badge badge-info" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}
+                    title="Cylinders are filled here. DSR, Stock Summary, maintenance and the filling log all anchor on this site.">
+                    Filling location
+                  </span>
+                )}
               </div>
+              <div style={{fontSize:'0.7rem', color:'var(--text-muted)', marginTop:'-0.4rem', marginBottom:'0.6rem'}}>
+                {p.location}
+              </div>
+              {!p.is_filling_location && (
+                <div style={{marginBottom:'0.6rem'}}>
+                  <button type="button" className="link-btn" style={{fontSize:'0.78rem'}}
+                    onClick={() => makeFillingLocation(p)}>
+                    Set as filling location
+                  </button>
+                </div>
+              )}
               <div className="form-group">
                 <label>Manager Name</label>
                 <input className="form-control" value={p.manager_name}

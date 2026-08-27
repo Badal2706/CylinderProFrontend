@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, istDateInput, istTimeInput, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
+import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, istDateInput, istTimeInput, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, useLocations, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
 // Phase 34: Bill Date time-of-day helpers. nowHHMM() seeds the time input with the current time;
@@ -563,6 +563,9 @@ export function StepUpVerificationModal({ title = 'Approval required', message =
 
 // Transaction Entry Component
 export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   // customerType 'INTERNAL' = internal transfer between our own sites (no customer).
   const [customerType, setCustomerType] = useState('REGULAR');
   const [selectedCustomer, setSelectedCustomer] = useState(null);

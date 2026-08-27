@@ -6,7 +6,7 @@ import {
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
   LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, stockStateText, cylinderStateText,
-  Pagination, useDebounce, useBatchList, BatchListFooter
+  Pagination, useDebounce, useBatchList, BatchListFooter, useLocations
 } from './App.jsx';
 import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
 
@@ -1358,6 +1358,9 @@ export function Reports() {
 // One date, live from bill data. Tabs: All Locations + the 3 sites (default = active_location).
 // Reporting person auto-fills from the site's LocationProfile manager; PC has its own columns.
 export function DSRReport() {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [date, setDate] = useState(istDateInput());
   const [tab, setTab] = useState(null); // null = resolving default; 'ALL' | location
   const [data, setData] = useState(null);
@@ -1547,6 +1550,9 @@ export function DSRReport() {
 
 // ─── Stock Summary — Filled + Empty tables per location per day (Phase 5, best-effort) ───
 export function StockSummaryReport() {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [date, setDate] = useState(istDateInput());
   const [tab, setTab] = useState(null);
   const [data, setData] = useState(null);
@@ -2187,6 +2193,9 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
 
 // Cylinder Add / Edit Modal
 export function CylinderModal({ cylinder, onClose, onSaved }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const isEdit = !!cylinder;
   const [formData, setFormData] = useState({
     rotational_number: cylinder?.rotational_number || '',
@@ -2428,6 +2437,9 @@ export function CylinderHistoryModal({ cylinder, onClose }) {
 
 // Cylinder Inventory Page
 export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilterConsumed }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
   const debouncedSearch = useDebounce(searchTerm, 300);
   // Seeded from a dashboard KPI/chart click, then cleared so it does not stick on the next visit.
@@ -2859,6 +2871,9 @@ export function directionLabel(d, opts = {}) {
 }
 
 export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [payments, setPayments] = useState([]);
   const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
   const debouncedSearch = useDebounce(searchTerm, 300);
@@ -3382,6 +3397,9 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
 // Edit Bill modal (item 11). Editable date/challan/type + line items; saves via PUT /api/bills/:id.
 // sameSession=true (used from the just-created screen) skips the audit-log entry.
 export function EditBillModal({ billId, sameSession = false, stepUpToken = '', onClose, onSaved }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   // Set when the backend reports the new bill date contradicts the cylinders' own history.
@@ -4030,6 +4048,9 @@ export function EditBillModal({ billId, sameSession = false, stepUpToken = '', o
 
 // Cylinder Aging Report Page
 export function CylinderAgingReport({ onViewCustomer }) {
+  // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
+  // cannot see on its own. This subscribes to the refresh so the list below redraws.
+  useLocations();
   const [rows, setRows] = useState([]);
   const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState('gte');        // 'gte' (default) | 'range'
