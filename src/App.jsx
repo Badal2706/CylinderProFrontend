@@ -1586,6 +1586,11 @@ export function ForgotPasswordPanel({ initialEmail = '', onCancel, onDone }) {
 }
 
 export function AuthPage({ onAuthSuccess, notice }) {
+  // GEN-C: signing up with an address that already has an account used to be a dead end — the
+  // error appeared and there was nothing to click. Matched against the exact backend message
+  // (auth.service.js throws it from both the pre-check and the post-OTP create).
+  const EMAIL_TAKEN = 'Email is already registered';
+
   const [mode, setMode] = useState('signin');
   const [formData, setFormData] = useState({ name: '', email: '', password: '', developer_token: '' });
   const [remember, setRemember] = useState(false);
@@ -1798,7 +1803,28 @@ export function AuthPage({ onAuthSuccess, notice }) {
               </label>
             )}
 
-            {error && <div className="alert alert-danger" style={{marginBottom: '1rem'}}>{error}</div>}
+            {error && (
+              <div className="alert alert-danger" style={{marginBottom: '1rem'}}>
+                {error}
+                {/* GEN-C: the one error with an obvious next step gets a way to take it. */}
+                {error === EMAIL_TAKEN && (
+                  <button
+                    type="button"
+                    className="link-btn"
+                    style={{display:'block', marginTop:'0.5rem', fontWeight:600}}
+                    onClick={() => {
+                      // Keep the email they just typed — retyping it is the whole friction here.
+                      setMode('signin');
+                      setError('');
+                      setOtpStep(false);
+                      setFormData(f => ({ ...f, password: '', name: '', developer_token: '' }));
+                    }}
+                  >
+                    Log in instead →
+                  </button>
+                )}
+              </div>
+            )}
 
             <button type="submit" className="btn btn-primary auth-submit" disabled={loading}>
               {loading ? 'Please wait...' : (mode === 'signin' ? 'Sign In' : 'Create Account')}
@@ -1824,114 +1850,6 @@ export function AuthPage({ onAuthSuccess, notice }) {
   );
 }
 
-// Clear All Data Modal
-// Phase 21: password alone is no longer enough — clearing everything also needs an
-// OWNER-ONLY step-up approval (no other trusted person can authorize it).
-export function ClearDataModal({ onClose, onCleared }) {
-  const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
-  const [loading, setLoading] = useState(false);
-  const [confirmed, setConfirmed] = useState(false);
-  const [askOwner, setAskOwner] = useState(false);
-
-  const doClear = async (auth) => {
-    setError('');
-    setLoading(true);
-    try {
-      const res = await apiFetch(`${API_URL}/auth/clear-data`, {
-        method: 'POST',
-        headers: { 'x-step-up-token': auth.step_up_token },
-        body: JSON.stringify({ password })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        setError(data.error || 'Something went wrong');
-      } else {
-        onCleared();
-      }
-    } catch {
-      setError('Network error');
-    }
-    setLoading(false);
-  };
-
-  // Password submit now leads to the owner-approval step instead of firing directly.
-  const handleClear = (e) => {
-    e.preventDefault();
-    setError('');
-    setAskOwner(true);
-  };
-
-  const a11yRef = useModalA11y(onClose);
-
-  return (
-    <div className="modal-overlay" onClick={onClose}>
-      <div className="modal-card" ref={a11yRef} onClick={(e) => e.stopPropagation()}>
-        <div className="modal-header danger">
-          <span>🗑️ Clear All Data</span>
-          <button className="modal-close" onClick={onClose}>✕</button>
-        </div>
-
-        <div className="modal-body">
-          <div className="alert alert-danger">
-            <strong>Warning: This action cannot be undone.</strong><br />
-            All your customers, bills, and payments will be permanently deleted.
-          </div>
-
-          {!confirmed ? (
-            <div style={{textAlign:'center', marginTop:'1rem'}}>
-              <p style={{marginBottom:'1rem', color:'var(--text-2)'}}>
-                Are you sure you want to delete all your data?
-              </p>
-              <div className="btn-group" style={{justifyContent:'center'}}>
-                <button className="btn btn-danger" onClick={() => setConfirmed(true)}>
-                  Yes, I want to clear all data
-                </button>
-                <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
-              </div>
-            </div>
-          ) : (
-            <form onSubmit={handleClear} style={{marginTop:'1rem'}}>
-              <div className="form-group">
-                <label>Enter your password to confirm</label>
-                <input
-                  type="password"
-                  className="form-control"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  placeholder="Your account password"
-                  autoFocus
-                  required
-                />
-              </div>
-              {error && <div className="alert alert-danger">{error}</div>}
-              <div className="btn-group">
-                <button type="submit" className="btn btn-danger" disabled={loading || !password}>
-                  {loading ? 'Deleting...' : 'Continue to owner approval'}
-                </button>
-                <button type="button" className="btn btn-secondary" onClick={onClose}>Cancel</button>
-              </div>
-              <p style={{fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.5rem'}}>
-                👑 Next step: only the account owner can approve clearing all data.
-              </p>
-            </form>
-          )}
-        </div>
-        {askOwner && (
-          <StepUpVerificationModal
-            title="Owner approval — clear all data"
-            context="permanently clear ALL business data (customers, transactions, payments, cylinders) for this account"
-            ownerOnly
-            onVerified={(auth) => { setAskOwner(false); doClear(auth); }}
-            onClose={() => setAskOwner(false)}
-          />
-        )}
-      </div>
-    </div>
-  );
-}
-
-// Outstanding Receivables Component
 export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
   const [data, setData] = useState([]);
   const [loading, setLoading] = useState(true);
@@ -3885,11 +3803,12 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   useLocations();
   const [account, setAccount] = useState(null);
   const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'',
-    certification_line:'', business_email:'', products_line:'', contact_lines:[], logo_scale:100, logo:'' });
+    certification_line:'', business_email:'', products_line:'', contact_lines:[], logo_scale:100, logo:'',
+    // GEN-C numbering. fy_choice_locked / fy_lock_date are read-only, computed by the server.
+    fy_reset_numbering:false, fy_choice_locked:false, fy_lock_date:null });
   const [loading, setLoading] = useState(true);
   const [exporting, setExporting] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
-  const [showClear, setShowClear] = useState(false);
   // Location profiles (Phase 2): 3 fixed sites, each with manager/contact/challan prefix,
   // plus the user's active (default) location.
   // active_location comes from THIS browser (localStorage), not the shared account (Phase 32);
@@ -4005,6 +3924,35 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           });
           if (res.ok) showToast('Business profile saved.', 'success');
           else showToast(await apiErrorMessage(res));
+        } catch {}
+      }
+    });
+  };
+
+  // GEN-C: the numbering choice saves on its own rather than riding along with the letterhead.
+  // It posts ONLY fy_reset_numbering, so a locked account editing its letterhead can never be
+  // mistaken for an attempt to change the frozen setting.
+  const saveNumbering = (wanted) => {
+    setStepUpAsk({
+      title: 'Approve the financial-year numbering choice',
+      context: wanted
+        ? 'restart bill and receipt numbers at the start of every financial year (1 April)'
+        : 'keep one continuous bill and receipt number series for the life of the account',
+      action: async (auth) => {
+        try {
+          const res = await apiFetch(`${API_URL}/profile/business`, {
+            method:'PUT',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({ fy_reset_numbering: wanted })
+          });
+          if (res.ok) {
+            setBusiness(prev => ({ ...prev, fy_reset_numbering: wanted }));
+            showToast(wanted
+              ? 'Numbering will restart each 1 April.'
+              : 'Numbering will run continuously.', 'success');
+          } else {
+            showToast(await apiErrorMessage(res));
+          }
         } catch {}
       }
     });
@@ -4177,6 +4125,119 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     setExporting(false);
   };
 
+  // ── Phase GEN-C: full backup (step-up gated) ──
+  // Deliberately separate from "Download All My Data" above. That one is five XLSX report sheets
+  // to READ; this is every document, in a form that RESTORES. Same file extension, entirely
+  // different purpose — hence the different label, icon and description.
+  const [backingUp, setBackingUp] = useState(false);
+  const downloadBackup = () => {
+    setStepUpAsk({
+      title: 'Approve downloading a full backup',
+      context: 'download a complete backup of every customer, cylinder, bill, payment and history record',
+      action: async (auth) => {
+        setBackingUp(true);
+        try {
+          const res = await apiFetch(`${API_URL}/profile/backup`, {
+            headers: { 'x-step-up-token': auth.step_up_token }
+          });
+          if (!res.ok) { showToast(await apiErrorMessage(res, 'Backup failed.')); setBackingUp(false); return; }
+
+          // The server names the file (it knows the business name and the timestamp); fall back
+          // only if the header is missing.
+          const disp = res.headers.get('content-disposition') || '';
+          const m = /filename="([^"]+)"/.exec(disp);
+          const blob = await res.blob();
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = m ? m[1] : `CylinderPro-backup-${istDateInput(new Date())}.zip`;
+          document.body.appendChild(a); a.click(); a.remove();
+          URL.revokeObjectURL(url);
+          showToast('Backup downloaded. Keep it somewhere safe and off this machine.', 'success');
+        } catch { showToast('Backup failed.'); }
+        setBackingUp(false);
+      }
+    });
+  };
+
+  // ── Phase GEN-C: restore from a backup ──
+  // Three steps, deliberately separated so nobody can restore by accident: choose a file →
+  // read what is in it → confirm. The upload itself writes nothing; only the confirm does.
+  const [rsFile, setRsFile] = useState(null);
+  const [rsBusy, setRsBusy] = useState('');          // '' | 'checking' | 'restoring'
+  const [rsPreview, setRsPreview] = useState(null);
+  const [rsStatus, setRsStatus] = useState(null);
+  const rsInput = useRef(null);
+
+  const rsReset = () => { setRsFile(null); setRsPreview(null); setRsStatus(null); setRsBusy('');
+    if (rsInput.current) rsInput.current.value = ''; };
+
+  // Step 1 — upload and inspect. The body is the raw .zip: the server streams it to disk without
+  // going through the JSON body parser, so there is no size limit and no base64 inflation.
+  const rsCheck = (file) => {
+    setStepUpAsk({
+      title: 'Approve reading this backup',
+      context: `inspect the backup file "${file.name}" (nothing is written yet)`,
+      action: async (auth) => {
+        setRsBusy('checking'); setRsPreview(null); setRsStatus(null);
+        try {
+          const res = await apiFetch(`${API_URL}/profile/restore/preview`, {
+            method: 'POST',
+            headers: { 'x-step-up-token': auth.step_up_token, 'Content-Type': 'application/zip' },
+            body: file
+          });
+          const data = await res.json();
+          if (!res.ok) { showToast(data.error || 'Could not read that backup.'); setRsBusy(''); return; }
+          setRsPreview(data);
+        } catch { showToast('Could not read that backup.'); }
+        setRsBusy('');
+      }
+    });
+  };
+
+  // Step 2 — the irreversible one.
+  const rsConfirm = () => {
+    setStepUpAsk({
+      title: 'Approve restoring this backup',
+      context: `restore ${rsPreview.manifest.total} records into this account`,
+      action: async (auth) => {
+        setRsBusy('restoring');
+        try {
+          const res = await apiFetch(`${API_URL}/profile/restore/confirm`, {
+            method: 'POST',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({ restore_token: rsPreview.restore_token })
+          });
+          const data = await res.json();
+          if (!res.ok) { showToast(data.error || 'Could not start the restore.'); setRsBusy(''); return; }
+          rsPoll(data.job_id);
+        } catch { showToast('Could not start the restore.'); setRsBusy(''); }
+      }
+    });
+  };
+
+  // Step 3 — poll. The request that started the restore has already returned; a restore of
+  // several hundred thousand records must not depend on one connection staying open.
+  const rsPoll = async (jobId) => {
+    for (let i = 0; i < 3600; i++) {
+      try {
+        const res = await apiFetch(`${API_URL}/profile/restore/status/${jobId}`);
+        if (res.ok) {
+          const st = await res.json();
+          setRsStatus(st);
+          if (['DONE', 'FAILED', 'ROLLBACK_FAILED', 'CANCELLED'].includes(st.status)) {
+            setRsBusy('');
+            if (st.status === 'DONE') showToast('Restore complete. Set up your Trusted People now.', 'success');
+            else showToast('The restore did not finish — see the details below.');
+            return;
+          }
+        }
+      } catch {}
+      await new Promise(r => setTimeout(r, 1000));
+    }
+    setRsBusy('');
+  };
+
   // ── Logout all sessions ──
   const logoutAll = async () => {
     try {
@@ -4236,14 +4297,14 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             <div className="form-group">
               <label>Business Email</label>
               <input className="form-control" value={business.business_email}
-                placeholder="e.g. gurugases@yahoo.com"
+                placeholder="e.g. sales@yourcompany.com"
                 onChange={(e) => setBusiness({...business, business_email: e.target.value})} />
             </div>
           </div>
           <div className="form-group">
             <label>Products / Manufacturing Line</label>
             <input className="form-control" value={business.products_line}
-              placeholder="e.g. Mfg.: Industrial &amp; Medical Oxygen, CO2, Nitrogen, Argon etc gases."
+              placeholder="e.g. Mfg.: Industrial &amp; Medical gases"
               onChange={(e) => setBusiness({...business, products_line: e.target.value})} />
           </div>
           <div className="form-group">
@@ -4254,7 +4315,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                   <label style={{fontSize:'0.78rem', color:'var(--text-muted)', fontWeight:500}}>{LOCATION_LABELS[loc]}</label>
                   <textarea className="form-control" rows="2"
                     style={{resize:'vertical'}}
-                    placeholder={'e.g. ' + LOCATION_LABELS[loc].split(' ')[0] + ': M 7600076251'}
+                    placeholder={'e.g. ' + LOCATION_LABELS[loc].split(' ')[0] + ': M 90000 00000'}
                     value={(business.contact_lines || [])[i] || ''}
                     onChange={(e) => {
                       const next = [...(business.contact_lines || [])];
@@ -4287,6 +4348,60 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           )}
           <button type="submit" className="btn btn-primary">Save Business Info</button>
         </form>
+      </div>
+
+      {/* A1b. Bill & Receipt Numbering (Phase GEN-C) */}
+      <div className="card">
+        <h2>Bill &amp; Receipt Numbering</h2>
+        <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
+          Whether your bill and receipt numbers start again at the beginning of each financial year.
+        </p>
+
+        <div style={{display:'flex', flexDirection:'column', gap:'0.6rem'}}>
+          {[
+            { value:false, title:'One continuous series',
+              detail:'Numbers keep counting up for the life of the account — 1A001, 1A002, … and on past 1 April.' },
+            { value:true, title:'Restart every financial year',
+              detail:'On 1 April the series begins again at 1A001 and RCP-0001. Last year\u2019s numbers stay exactly as they were printed.' }
+          ].map(opt => {
+            const selected = !!business.fy_reset_numbering === opt.value;
+            return (
+              <label key={String(opt.value)}
+                style={{
+                  display:'flex', gap:'0.7rem', alignItems:'flex-start', padding:'0.75rem 0.9rem',
+                  border:`1px solid ${selected ? 'var(--primary, #2563eb)' : 'var(--border)'}`,
+                  borderRadius:'8px',
+                  background: selected ? 'color-mix(in srgb, var(--primary, #2563eb) 7%, transparent)' : 'transparent',
+                  cursor: business.fy_choice_locked ? 'not-allowed' : 'pointer',
+                  opacity: business.fy_choice_locked && !selected ? 0.55 : 1
+                }}>
+                <input type="radio" name="fy_reset_numbering" style={{marginTop:'0.2rem'}}
+                  checked={selected}
+                  disabled={business.fy_choice_locked}
+                  onChange={() => { if (!business.fy_choice_locked) saveNumbering(opt.value); }} />
+                <span>
+                  <span style={{fontWeight:600, fontSize:'0.9rem', display:'block'}}>{opt.title}</span>
+                  <span style={{fontSize:'0.8rem', color:'var(--text-muted)'}}>{opt.detail}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        {business.fy_choice_locked ? (
+          <div className="alert alert-info" style={{marginTop:'1rem', fontSize:'0.82rem'}}>
+            🔒 This choice is now permanent. It locked on{' '}
+            <strong>{business.fy_lock_date ? formatDate(business.fy_lock_date) : '1 April'}</strong> — the first
+            1 April after this account was created. A full year of bills has been issued under it, so changing
+            it now would either repeat numbers already given to customers or skip a year.
+          </div>
+        ) : (
+          <div className="alert alert-warning" style={{marginTop:'1rem', fontSize:'0.82rem'}}>
+            ⏳ You can change this until{' '}
+            <strong>{business.fy_lock_date ? formatDate(business.fy_lock_date) : '1 April'}</strong>, after which
+            it is permanent. Pick it before your first 1 April — it cannot be undone later.
+          </div>
+        )}
       </div>
 
       {/* A2. Location Profiles — one card per fixed site (manager / contact / challan prefix) */}
@@ -4522,12 +4637,164 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
       {/* D. Data & Privacy */}
       <div className="card">
         <h2>Data &amp; Privacy</h2>
-        <div style={{display:'flex', flexWrap:'wrap', gap:'1rem', alignItems:'center'}}>
-          <button className="btn btn-secondary" onClick={downloadData} disabled={exporting}>
-            {exporting ? 'Generating…' : '⬇ Download All My Data (ZIP)'}
-          </button>
-          {exporting && <Spinner label="Preparing export…" />}
+
+        {/* Two downloads that must never be confused for one another. */}
+        <div style={{display:'grid', gap:'1rem', gridTemplateColumns:'repeat(auto-fit, minmax(280px, 1fr))'}}>
+
+          <div style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+            <div style={{fontWeight:600, fontSize:'0.9rem', marginBottom:'0.25rem'}}>📊 Reports to read</div>
+            <p style={{fontSize:'0.8rem', color:'var(--text-muted)', margin:'0 0 0.75rem'}}>
+              Customers, transactions, payments, inventory and aging as Excel sheets — for reading,
+              printing or sharing with your accountant. It cannot be used to restore the system.
+            </p>
+            <button className="btn btn-secondary" onClick={downloadData} disabled={exporting}>
+              {exporting ? 'Generating…' : '⬇ Download All My Data (ZIP)'}
+            </button>
+            {exporting && <div style={{marginTop:'0.5rem'}}><Spinner label="Preparing export…" /></div>}
+          </div>
+
+          <div style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+            <div style={{fontWeight:600, fontSize:'0.9rem', marginBottom:'0.25rem'}}>🛟 Backup for disaster recovery</div>
+            <p style={{fontSize:'0.8rem', color:'var(--text-muted)', margin:'0 0 0.75rem'}}>
+              Every record exactly as stored, in a form that can rebuild this account on a new
+              server. Not readable in Excel. Needs approval, and should be kept somewhere off this
+              machine. Your login and Trusted People are <strong>not</strong> included — those are
+              set up fresh after a restore.
+            </p>
+            <button className="btn btn-secondary" onClick={downloadBackup} disabled={backingUp}>
+              {backingUp ? 'Building backup…' : '🛟 Download Backup'}
+            </button>
+            {backingUp && <div style={{marginTop:'0.5rem'}}><Spinner label="Streaming every record…" /></div>}
+          </div>
+
         </div>
+        {/* Restore (Phase GEN-C) */}
+        <div style={{marginTop:'1.5rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>
+          <h3 style={{fontSize:'1rem'}}>Restore from a Backup</h3>
+          <p style={{fontSize:'0.82rem', color:'var(--text-muted)'}}>
+            Loads a backup into this account. It only works on an account that is completely
+            empty — there is no overwrite and no way to force it, so an existing account can never
+            be damaged by a restore.
+          </p>
+
+          <input ref={rsInput} type="file" accept=".zip,application/zip" style={{display:'none'}}
+            onChange={(e) => { const f = e.target.files[0]; if (f) { setRsFile(f); rsCheck(f); } }} />
+
+          {!rsPreview && !rsStatus && (
+            <button className="btn btn-secondary" disabled={rsBusy === 'checking'}
+              onClick={() => rsInput.current && rsInput.current.click()}>
+              {rsBusy === 'checking' ? 'Reading backup…' : '📂 Choose a Backup File…'}
+            </button>
+          )}
+          {rsBusy === 'checking' && <div style={{marginTop:'0.5rem'}}><Spinner label="Reading the backup…" /></div>}
+
+          {/* What is in the file — shown BEFORE anything is written. */}
+          {rsPreview && !rsStatus && (
+            <div style={{marginTop:'0.9rem', border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+              <div style={{fontWeight:600, marginBottom:'0.35rem'}}>
+                {rsPreview.manifest.business_name || '(no business name)'}
+              </div>
+              <div style={{fontSize:'0.8rem', color:'var(--text-muted)', marginBottom:'0.75rem'}}>
+                Taken {rsPreview.manifest.exported_at ? formatDateTime(rsPreview.manifest.exported_at) : '—'}
+                {rsPreview.manifest.account_email ? ` · ${rsPreview.manifest.account_email}` : ''}
+                {rsPreview.manifest.account_code ? ` · code ${rsPreview.manifest.account_code}` : ''}
+              </div>
+
+              <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(150px, 1fr))', gap:'0.35rem',
+                           fontSize:'0.8rem', marginBottom:'0.75rem'}}>
+                {Object.entries(rsPreview.manifest.counts || {}).filter(([, n]) => n > 0).map(([k, n]) => (
+                  <div key={k} style={{display:'flex', justifyContent:'space-between', gap:'0.5rem'}}>
+                    <span style={{color:'var(--text-muted)'}}>{k}</span><strong>{n}</strong>
+                  </div>
+                ))}
+              </div>
+              <div style={{fontSize:'0.82rem', marginBottom:'0.75rem'}}>
+                <strong>{rsPreview.manifest.total}</strong> records in total.
+              </div>
+
+              {(rsPreview.problems || []).length > 0 && (
+                <div className="alert alert-danger" style={{fontSize:'0.82rem'}}>
+                  <strong>This backup cannot be restored here:</strong>
+                  <ul style={{margin:'0.4rem 0 0', paddingLeft:'1.1rem'}}>
+                    {rsPreview.problems.map((x, i) => <li key={i}>{x}</li>)}
+                  </ul>
+                </div>
+              )}
+              {(rsPreview.warnings || []).length > 0 && (
+                <div className="alert alert-warning" style={{fontSize:'0.82rem'}}>
+                  <ul style={{margin:0, paddingLeft:'1.1rem'}}>
+                    {rsPreview.warnings.map((x, i) => <li key={i}>{x}</li>)}
+                  </ul>
+                </div>
+              )}
+
+              <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap', marginTop:'0.75rem'}}>
+                <button className="btn btn-primary" disabled={!rsPreview.can_restore || rsBusy === 'restoring'}
+                  onClick={rsConfirm}>
+                  {rsBusy === 'restoring' ? 'Restoring…' : '⚠ Restore This Backup'}
+                </button>
+                <button className="btn btn-secondary" onClick={rsReset}>Cancel</button>
+              </div>
+            </div>
+          )}
+
+          {/* Progress, then the result. */}
+          {rsStatus && (
+            <div style={{marginTop:'0.9rem', border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+              {rsStatus.status === 'RUNNING' && (
+                <>
+                  <div style={{fontSize:'0.85rem', marginBottom:'0.5rem'}}>
+                    Restoring <strong>{rsStatus.progress.collection || '…'}</strong> — {rsStatus.progress.done} of {rsStatus.progress.total}
+                  </div>
+                  <div style={{height:'8px', background:'var(--border)', borderRadius:'4px', overflow:'hidden'}}>
+                    <div style={{height:'100%', width:`${rsStatus.progress.percent}%`, background:'var(--primary, #2563eb)',
+                                 transition:'width 0.3s'}} />
+                  </div>
+                </>
+              )}
+
+              {rsStatus.status === 'DONE' && (
+                <>
+                  <div className="alert alert-success" style={{fontSize:'0.85rem'}}>
+                    ✅ Restore complete — {rsStatus.progress.done} records written.
+                  </div>
+                  <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(150px, 1fr))', gap:'0.35rem', fontSize:'0.8rem'}}>
+                    {Object.entries(rsStatus.counts_written || {}).filter(([, n]) => n > 0).map(([k, n]) => (
+                      <div key={k} style={{display:'flex', justifyContent:'space-between', gap:'0.5rem'}}>
+                        <span style={{color:'var(--text-muted)'}}>{k}</span><strong>{n}</strong>
+                      </div>
+                    ))}
+                  </div>
+                  <div className="alert alert-warning" style={{fontSize:'0.82rem', marginTop:'0.75rem'}}>
+                    <strong>Set up your Trusted People now.</strong> Approvals, passwords and two-factor
+                    setup are never part of a backup, so this account currently has only whoever was
+                    created at signup. Until that is done, nobody else can approve anything.
+                  </div>
+                </>
+              )}
+
+              {['FAILED', 'ROLLBACK_FAILED'].includes(rsStatus.status) && (
+                <div className={`alert ${rsStatus.status === 'FAILED' ? 'alert-danger' : 'alert-danger'}`} style={{fontSize:'0.82rem'}}>
+                  <strong>{rsStatus.status === 'FAILED'
+                    ? 'The restore failed and everything it had written was removed.'
+                    : 'The restore failed AND could not undo itself — this account needs manual attention.'}</strong>
+                  <div style={{marginTop:'0.4rem'}}>{rsStatus.error}</div>
+                </div>
+              )}
+
+              {(rsStatus.mismatches || []).length > 0 && (
+                <ul style={{fontSize:'0.8rem', marginTop:'0.5rem', paddingLeft:'1.1rem'}}>
+                  {rsStatus.mismatches.map((m, i) => <li key={i}>{m}</li>)}
+                </ul>
+              )}
+
+              {rsStatus.status !== 'RUNNING' && (
+                <button className="btn btn-secondary" style={{marginTop:'0.75rem'}} onClick={rsReset}>Done</button>
+              )}
+            </div>
+          )}
+        </div>
+
         <div style={{marginTop:'1.5rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>
           <h3 style={{fontSize:'1rem'}}>Active Session</h3>
           <p style={{fontSize:'0.85rem', color:'var(--text-2)'}}>
@@ -4555,17 +4822,9 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           or permanently delete your account and everything in it.
         </p>
         <div style={{display:'flex', flexWrap:'wrap', gap:'0.5rem'}}>
-          <button className="btn btn-danger" onClick={() => setShowClear(true)}>🗑️ Clear All Data</button>
           <button className="btn btn-danger" onClick={() => setShowDelete(true)}>Delete Account</button>
         </div>
       </div>
-
-      {showClear && (
-        <ClearDataModal
-          onClose={() => setShowClear(false)}
-          onCleared={() => { setShowClear(false); showToast('All data has been cleared.', 'success'); }}
-        />
-      )}
       {showDelete && <DeleteAccountModal onClose={() => setShowDelete(false)} onDeleted={onLoggedOut} />}
       {stepUpAsk && (
         <StepUpVerificationModal title={stepUpAsk.title} context={stepUpAsk.context}
@@ -4613,6 +4872,28 @@ export function DeleteAccountModal({ onClose, onDeleted }) {
   const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [askOwner, setAskOwner] = useState(false);
+  const [pwError, setPwError] = useState('');
+
+  // Check the password FIRST. It used to be verified only at the very end, so a typo sent the
+  // operator through the whole owner-approval flow — find a trusted person, get a code, enter it —
+  // and only then said "Incorrect password". Now a wrong password stops here, in the field where
+  // it was typed.
+  const continueToApproval = async () => {
+    setPwError('');
+    if (!password) { setPwError('Enter your password to continue.'); return; }
+    setBusy(true);
+    try {
+      const res = await apiFetch(`${API_URL}/profile/verify-password`, {
+        method: 'POST',
+        body: JSON.stringify({ password })
+      });
+      if (res.ok) setAskOwner(true);
+      else setPwError(await apiErrorMessage(res, 'Incorrect password'));
+    } catch {
+      setPwError('Network error — is the server running?');
+    }
+    setBusy(false);
+  };
 
   const doDelete = async (auth) => {
     setBusy(true);
@@ -4654,12 +4935,17 @@ export function DeleteAccountModal({ onClose, onDeleted }) {
           <div className="form-group">
             <label>Enter your password to confirm</label>
             <input type="password" className="form-control" value={password}
-              onChange={(e) => setPassword(e.target.value)} autoFocus />
+              onChange={(e) => { setPassword(e.target.value); setPwError(''); }}
+              onKeyDown={(e) => { if (e.key === 'Enter' && understood && password && !busy) continueToApproval(); }}
+              autoFocus />
+            {pwError && (
+              <div className="alert alert-danger" style={{marginTop:'0.5rem', fontSize:'0.82rem'}}>{pwError}</div>
+            )}
           </div>
           <div className="btn-group" style={{justifyContent:'flex-end'}}>
             <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
-            <button className="btn btn-danger" onClick={() => setAskOwner(true)} disabled={!understood || !password || busy}>
-              {busy ? 'Deleting…' : 'Continue to owner approval'}
+            <button className="btn btn-danger" onClick={continueToApproval} disabled={!understood || !password || busy}>
+              {busy ? 'Checking…' : 'Continue to owner approval'}
             </button>
           </div>
           <p style={{fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.5rem', textAlign:'right'}}>

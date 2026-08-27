@@ -2355,10 +2355,56 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
 
 // Per-cylinder history popup (Phase 33) — the 15 most recent events, newest first.
 const HISTORY_ICONS = { MIGRATED: '📦', RECEIVED: '📥', GIVEN: '📤', TRANSFER: '🔄', FILLED: '⛽', MANUAL_EDIT: '✏️' };
+// One history row. Shared by the default 15-row view and the step-up-gated full view, so the two
+// can never drift into rendering the same event differently.
+function HistoryRow({ r }) {
+  const performer = r.performed_by || LOCATION_LABELS[r.performed_at_location] || '—';
+  return (
+    <div style={{display:'flex', gap:'0.65rem', alignItems:'baseline', padding:'0.5rem 0.7rem', border:'1px solid var(--border)', borderRadius:'8px'}}>
+      <div style={{fontSize:'1.05rem', lineHeight:1.1}}>{HISTORY_ICONS[r.event_type] || '•'}</div>
+      {/* One line per event: description on the left, meta on the right, no wrapping. */}
+      <div style={{flex:1, minWidth:0, display:'flex', justifyContent:'space-between', alignItems:'baseline', gap:'1rem', flexWrap:'wrap'}}>
+        <span style={{fontWeight:600, fontSize:'0.9rem'}}>{r.description}</span>
+        <span style={{fontSize:'0.76rem', color:'var(--text-muted)', display:'flex', gap:'0.9rem', flexWrap:'wrap', justifyContent:'flex-end'}}>
+          {/* Two distinct times: when the event happened vs when it was typed in. */}
+          <span title="The bill's date & time — the moment this actually happened. Follows the bill if its date is edited." style={{whiteSpace:'nowrap'}}>🗓 {formatDateTime(r.event_at)}</span>
+          <span>by <strong>{performer}</strong></span>
+          {r.document_ref && <span style={{whiteSpace:'nowrap'}}>Ref: {r.document_ref}</span>}
+          {r.challan_no && <span style={{whiteSpace:'nowrap'}}>Challan: {r.challan_no}</span>}
+          {/* Second time: when the entry was last touched. Says "entered" until the bill
+              is edited, then "changed" with the moment of that edit. */}
+          {(() => {
+            const entered = r.entered_at, changed = r.changed_at;
+            const wasEdited = entered && changed && (new Date(changed) - new Date(entered) > 60000);
+            const shown = wasEdited ? changed : entered;
+            if (!shown) return null;
+            return (
+              <span title={wasEdited
+                ? 'When this entry was last changed (the bill was edited)'
+                : 'When this was entered into CylinderPro'}
+                style={{whiteSpace:'nowrap', opacity:0.8}}>
+                {wasEdited ? '✏️ changed ' : '⌨ entered '}{formatDateTime(shown)}
+              </span>
+            );
+          })()}
+        </span>
+      </div>
+    </div>
+  );
+}
+
 export function CylinderHistoryModal({ cylinder, onClose }) {
   const [data, setData] = useState(null);
   const [loading, setLoading] = useState(true);
   const a11yRef = useModalA11y(onClose);
+
+  // GEN-C full history. The step-up token is valid 10 minutes and REUSABLE, so a single approval
+  // covers an entire "Load next 20" session — the operator is not re-prompted on every page.
+  const [token, setToken] = useState('');
+  const [askStepUp, setAskStepUp] = useState(false);
+  const [expired, setExpired] = useState(false);
+  const [full, setFull] = useState(null);          // { rows, total, hasMore } once unlocked
+  const [loadingMore, setLoadingMore] = useState(false);
 
   useEffect(() => {
     let alive = true;
@@ -2374,8 +2420,49 @@ export function CylinderHistoryModal({ cylinder, onClose }) {
     return () => { alive = false; };
   }, [cylinder._id]);
 
-  const rows = data?.history || [];
-  const performerOf = (r) => r.performed_by || LOCATION_LABELS[r.performed_at_location] || '—';
+  const total = data?.total_count ?? 0;
+  const rows = full ? full.rows : (data?.history || []);
+
+  // One page of the full history. `tok` is passed explicitly because on the first call — straight
+  // out of the step-up modal — setToken has not landed in state yet.
+  const loadPage = async (skip, tok) => {
+    setLoadingMore(true);
+    try {
+      const res = await apiFetch(
+        `${API_URL}/cylinders/${cylinder._id}/history/full?skip=${skip}&limit=20`,
+        { headers: { 'x-step-up-token': tok } }
+      );
+      if (res.status === 403) {
+        // The 10-minute window closed mid-browse. Say so and offer to re-verify — never fail
+        // silently, and never quietly drop the operator back to the 15-row view.
+        setToken('');
+        setExpired(true);
+        setAskStepUp(true);
+        return;
+      }
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not load history')); return; }
+      const page = await res.json();
+      setFull(prev => ({
+        rows: skip === 0 ? page.rows : [...((prev && prev.rows) || []), ...page.rows],
+        total: page.total,
+        hasMore: page.hasMore
+      }));
+    } catch {
+      showToast('Could not load history');
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const onVerified = (auth) => {
+    const tok = auth.step_up_token;
+    setToken(tok);
+    setAskStepUp(false);
+    setExpired(false);
+    // Resume where the operator was: after an expiry mid-browse, re-fetch from the top of the
+    // page they had not yet loaded rather than restarting the whole list.
+    loadPage(full ? full.rows.length : 0, tok);
+  };
 
   return (
     <div className="modal-overlay" onClick={onClose}>
@@ -2385,9 +2472,18 @@ export function CylinderHistoryModal({ cylinder, onClose }) {
           <button className="modal-close" onClick={onClose}>✕</button>
         </div>
         <div className="modal-body">
-          <div style={{fontSize:'0.82rem', color:'var(--text-muted)', marginBottom:'0.75rem'}}>
-            {cylinder.gas_type} · {cylinder.capacity}
-            {!loading && ` — most recent ${rows.length} event${rows.length === 1 ? '' : 's'} (max 15)`}
+          <div style={{fontSize:'0.82rem', color:'var(--text-muted)', marginBottom:'0.75rem', display:'flex', justifyContent:'space-between', alignItems:'center', gap:'1rem', flexWrap:'wrap'}}>
+            <span>
+              {cylinder.gas_type} · {cylinder.capacity}
+              {!loading && ` — showing ${rows.length} of ${total} event${total === 1 ? '' : 's'}`}
+              {full && <span style={{marginLeft:'0.5rem', color:'var(--success, #2e7d32)'}}>🔓 full history</span>}
+            </span>
+            {/* The COUNT above is not gated — only the content past the newest 15 is. */}
+            {!loading && !full && total > rows.length && (
+              <button className="btn btn-sm btn-secondary" onClick={() => { setExpired(false); setAskStepUp(true); }}>
+                🔒 View All History
+              </button>
+            )}
           </div>
           {loading ? (
             <Spinner label="Loading history…" />
@@ -2395,42 +2491,37 @@ export function CylinderHistoryModal({ cylinder, onClose }) {
             <EmptyState icon="🕘" message="No history yet" hint="Events will appear here as this cylinder is transferred, filled, given, or received." />
           ) : (
             <div style={{display:'flex', flexDirection:'column', gap:'0.4rem'}}>
-              {rows.map(r => (
-                <div key={r.id} style={{display:'flex', gap:'0.65rem', alignItems:'baseline', padding:'0.5rem 0.7rem', border:'1px solid var(--border)', borderRadius:'8px'}}>
-                  <div style={{fontSize:'1.05rem', lineHeight:1.1}}>{HISTORY_ICONS[r.event_type] || '•'}</div>
-                  {/* One line per event: description on the left, meta on the right, no wrapping. */}
-                  <div style={{flex:1, minWidth:0, display:'flex', justifyContent:'space-between', alignItems:'baseline', gap:'1rem', flexWrap:'wrap'}}>
-                    <span style={{fontWeight:600, fontSize:'0.9rem'}}>{r.description}</span>
-                    <span style={{fontSize:'0.76rem', color:'var(--text-muted)', display:'flex', gap:'0.9rem', flexWrap:'wrap', justifyContent:'flex-end'}}>
-                      {/* Two distinct times: when the event happened vs when it was typed in. */}
-                      <span title="The bill's date & time — the moment this actually happened. Follows the bill if its date is edited." style={{whiteSpace:'nowrap'}}>🗓 {formatDateTime(r.event_at)}</span>
-                      <span>by <strong>{performerOf(r)}</strong></span>
-                      {r.document_ref && <span style={{whiteSpace:'nowrap'}}>Ref: {r.document_ref}</span>}
-                      {r.challan_no && <span style={{whiteSpace:'nowrap'}}>Challan: {r.challan_no}</span>}
-                      {/* Second time: when the entry was last touched. Says "entered" until the bill
-                          is edited, then "changed" with the moment of that edit. */}
-                      {(() => {
-                        const entered = r.entered_at, changed = r.changed_at;
-                        const wasEdited = entered && changed && (new Date(changed) - new Date(entered) > 60000);
-                        const shown = wasEdited ? changed : entered;
-                        if (!shown) return null;
-                        return (
-                          <span title={wasEdited
-                            ? 'When this entry was last changed (the bill was edited)'
-                            : 'When this was entered into CylinderPro'}
-                            style={{whiteSpace:'nowrap', opacity:0.8}}>
-                            {wasEdited ? '✏️ changed ' : '⌨ entered '}{formatDateTime(shown)}
-                          </span>
-                        );
-                      })()}
-                    </span>
-                  </div>
+              {rows.map(r => <HistoryRow key={r.id} r={r} />)}
+              {full && full.hasMore && (
+                <button
+                  className="btn btn-secondary"
+                  style={{marginTop:'0.5rem', alignSelf:'center'}}
+                  disabled={loadingMore}
+                  onClick={() => loadPage(full.rows.length, token)}
+                >
+                  {loadingMore ? 'Loading…' : `Load Next 20 (${full.total - full.rows.length} left)`}
+                </button>
+              )}
+              {full && !full.hasMore && full.rows.length > 15 && (
+                <div style={{textAlign:'center', fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.4rem'}}>
+                  End of history — all {full.total} events shown.
                 </div>
-              ))}
+              )}
             </div>
           )}
         </div>
       </div>
+      {askStepUp && (
+        <StepUpVerificationModal
+          title={expired ? 'Approval expired' : 'View full history'}
+          message={expired
+            ? 'Your approval was valid for 10 minutes and has now expired. Verify again to keep reading this history.'
+            : `This cylinder has ${total} events. The most recent 15 are shown without approval; seeing the rest needs a trusted person to approve.`}
+          context={`View full history for cylinder ${cylinder.rotational_number}`}
+          onVerified={onVerified}
+          onClose={() => setAskStepUp(false)}
+        />
+      )}
     </div>
   );
 }
