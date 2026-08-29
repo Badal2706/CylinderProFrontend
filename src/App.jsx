@@ -2,6 +2,9 @@ import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
 import { TransactionEntry, StepUpVerificationModal, displayContact } from './components.jsx';
 import { CustomerDetail, Payments, CylinderInventory, CylinderAgingReport, TransactionHistory, Reports, PaymentForm, FillingListPage } from './pages.jsx';
+// F-11 defaults live in their own module; re-exported so pages.jsx keeps one import source.
+export { GAS_PURITY_DEFAULTS, purityDefaultsFor } from './purityDefaults.js';
+import * as LB from './localBackup.js';
 
 export const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001/api';
 
@@ -70,7 +73,125 @@ export function fillingLocationCode() {
   const f = LOCATION_PROFILES.find(p => p.is_filling_location);
   return f ? f.location : null;
 }
+// The workshop — the one site where a cylinder can be put under maintenance. Designated
+// independently of the filling site; an account may repair where it fills, or at a separate yard
+// that does no filling at all (R143).
+export function maintenanceLocationCode() {
+  const m = LOCATION_PROFILES.find(p => p.is_maintenance_location);
+  return m ? m.location : null;
+}
 
+// ── F-13: the local auto-backup folder, as one hook ──
+// Owns the whole client-side story: the stored folder handle, its permission, the fetch, the
+// write, and the 'has it run today' timestamp. Exported so the Settings screen and the
+// Dashboard tile share ONE implementation — duplicating the permission handling and the
+// error taxonomy would eventually leave one copy quietly reporting success on a failed write.
+//
+// The backup fetch is NOT approval-gated (30 Aug 2026, owner's instruction): a daily backup
+// that demands a trusted-person code every time does not get taken. The server records every
+// backup in the audit log instead (R146).
+export function useLocalBackup() {
+  const supported = LB.isSupported();
+  const [folder, setFolder] = useState(null);   // { handle, name } | null
+  const [perm, setPerm] = useState('unset');    // unset | granted | prompt | denied | gone
+  const [last, setLast] = useState(null);       // Date | null
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState('');
+
+  useEffect(() => {
+    if (!supported) return;
+    let dead = false;
+    (async () => {
+      setLast(LB.getLastRun());
+      const f = await LB.loadFolder();
+      if (dead) return;
+      if (!f) { setFolder(null); setPerm('unset'); return; }
+      const state = await LB.checkPermission(f.handle);
+      if (dead) return;
+      if (state === 'gone') {
+        // The handle no longer resolves. Forget it rather than leaving a button that can only
+        // fail, and say so plainly — the folder has to be chosen again.
+        await LB.clearFolder();
+        setFolder(null); setPerm('unset');
+        setError('We couldn’t reach your backup folder — set it up again.');
+        return;
+      }
+      setFolder(f); setPerm(state);
+    })();
+    return () => { dead = true; };
+  }, [supported]);
+
+  const choose = async () => {
+    setError('');
+    try {
+      const handle = await LB.pickFolder();
+      await LB.saveFolder(handle);
+      setFolder({ handle, name: handle.name });
+      setPerm(await LB.checkPermission(handle));
+      showToast(`Backups will be written to "${handle.name}".`, 'success');
+    } catch (e) {
+      if (e && e.name === 'AbortError') return;      // closed the picker — not a failure
+      setError('That folder could not be used. Try another one.');
+    }
+  };
+
+  // Must stay inside the click handler: a permission prompt needs the user gesture, and an
+  // await before it would spend that gesture.
+  const reconnect = async () => {
+    if (!folder) return;
+    setError('');
+    const state = await LB.requestPermission(folder.handle);
+    if (state === 'granted') { setPerm('granted'); showToast('Backup folder reconnected.', 'success'); return; }
+    if (state === 'gone') {
+      await LB.clearFolder(); setFolder(null); setPerm('unset');
+      setError('We couldn’t reach your backup folder — set it up again.');
+      return;
+    }
+    setPerm(state);
+    setError('Permission to write to that folder was not granted.');
+  };
+
+  const update = async () => {
+    if (!folder || busy) return false;
+    setError(''); setBusy(true);
+    try {
+      // Re-check permission at the moment of use: it can be withdrawn between page load and
+      // this click, and a stale 'granted' would surface as an opaque write error instead.
+      const state = await LB.checkPermission(folder.handle);
+      if (state === 'gone') {
+        await LB.clearFolder(); setFolder(null); setPerm('unset');
+        setError('We couldn’t reach your backup folder — set it up again.');
+        setBusy(false); return false;
+      }
+      if (state !== 'granted') {
+        setPerm(state);
+        setError('This folder needs permission again before a backup can be written.');
+        setBusy(false); return false;
+      }
+
+      const res = await apiFetch(`${API_URL}/profile/backup`);
+      if (!res.ok) {
+        setError(await apiErrorMessage(res, 'The backup could not be built on the server.'));
+        setBusy(false); return false;
+      }
+      const blob = await res.blob();
+      await LB.writeBackup(folder.handle, blob);
+
+      // Only now — after close() committed the file. A failed write must never leave a
+      // timestamp that makes the next page load look like everything is fine.
+      setLast(LB.setLastRunNow());
+      showToast(`Backup written to "${folder.name}".`, 'success');
+      setBusy(false); return true;
+    } catch (e) {
+      if (e && e.kind === 'permission') setPerm('prompt');
+      if (e && e.kind === 'gone') { await LB.clearFolder(); setFolder(null); setPerm('unset'); }
+      setError((e && e.message) || 'The backup could not be written to that folder.');
+      setBusy(false); return false;
+    }
+  };
+
+  return { supported, folder, perm, last, busy, error, choose, reconnect, update };
+}
 // Mutating the arrays does not re-render anything on its own — React has no idea they changed.
 // Components that RENDER a location list call useLocations() so this event forces them to redraw.
 export function useLocations() {
@@ -1592,7 +1713,7 @@ export function AuthPage({ onAuthSuccess, notice }) {
   const EMAIL_TAKEN = 'Email is already registered';
 
   const [mode, setMode] = useState('signin');
-  const [formData, setFormData] = useState({ name: '', email: '', password: '', developer_token: '' });
+  const [formData, setFormData] = useState({ name: '', email: '', password: '', licence_number: '' });
   const [remember, setRemember] = useState(false);
   const [error, setError] = useState('');
   const [loading, setLoading] = useState(false);
@@ -1609,7 +1730,7 @@ export function AuthPage({ onAuthSuccess, notice }) {
     setLoading(true);
     try {
       const body = mode === 'signup'
-        ? { name: formData.name, email: formData.email, password: formData.password, developer_token: formData.developer_token }
+        ? { name: formData.name, email: formData.email, password: formData.password, licence_number: formData.licence_number }
         : { email: formData.email, password: formData.password, remember };
 
       const res = await fetch(`${API_URL}/auth/${mode}`, {
@@ -1748,15 +1869,18 @@ export function AuthPage({ onAuthSuccess, notice }) {
             {mode === 'signup' && (
               <>
                 <div className="form-group">
-                  <label>Developer Token</label>
+                  <label>Licence Number</label>
                   <input
                     type="text"
                     className="form-control"
-                    value={formData.developer_token}
-                    onChange={(e) => setFormData({...formData, developer_token: e.target.value})}
-                    placeholder="Enter developer access token"
+                    value={formData.licence_number}
+                    onChange={(e) => setFormData({...formData, licence_number: e.target.value})}
+                    placeholder="e.g. CP-XXXX-XXXX-XXXX"
                     required
                   />
+                  <small style={{color:'var(--text-muted)', fontSize:'0.78rem'}}>
+                    Issued to your email address for this one account. It cannot be used twice.
+                  </small>
                 </div>
                 <div className="form-group">
                   <label>Full Name</label>
@@ -1817,7 +1941,7 @@ export function AuthPage({ onAuthSuccess, notice }) {
                       setMode('signin');
                       setError('');
                       setOtpStep(false);
-                      setFormData(f => ({ ...f, password: '', name: '', developer_token: '' }));
+                      setFormData(f => ({ ...f, password: '', name: '', licence_number: '' }));
                     }}
                   >
                     Log in instead →
@@ -2712,6 +2836,14 @@ export function SessionsSection({ onLoggedOut }) {
 
 // Dashboard Component
 export function Dashboard({ onNavigate }) {
+  // F-13: the same hook the Settings screen uses, so the two can never disagree about whether a
+  // backup ran today or whether the folder is still reachable.
+  //
+  // It MUST stay up here with the other hooks. This component returns early while `loading` is
+  // true, so a hook called below that return runs on some renders and not others — React counts
+  // hooks per render and throws "Rendered more hooks than during the previous render" the moment
+  // loading flips, which took the whole Dashboard down behind its error boundary.
+  const backup = useLocalBackup();
   const [stats, setStats] = useState(null);
   const [overLimitCustomers, setOverLimitCustomers] = useState([]);
   const [cylinderStock, setCylinderStock] = useState(null);
@@ -2745,6 +2877,9 @@ export function Dashboard({ onNavigate }) {
   // Phase 25: every card becomes a click-through. Content, colour, icon and layout are
   // unchanged — the only additions are cursor/role/keyboard affordances, so the cards look
   // exactly as before. No trend indicators, no sparklines.
+  const backupReady = backup.supported && backup.folder && backup.perm === 'granted';
+  const backupDoneToday = LB.ranToday(backup.last);
+
   const cardProps = (label, go) => ({
     className: undefined, // set by caller
     role: 'button',
@@ -2803,7 +2938,8 @@ export function Dashboard({ onNavigate }) {
             <div className="value">₹{(stats?.total_security_deposit || 0).toFixed(0)}</div>
           </div>
         </div>
-        <div {...cardProps('View cylinders in stock', () => onNavigate('cylinders', { stateFilters: ['IN_STOCK'] }))} className="stat-card green bento-wide">
+        {/* Halved from bento-wide to make room for the backup tile beside it. */}
+        <div {...cardProps('View cylinders in stock', () => onNavigate('cylinders', { stateFilters: ['IN_STOCK'] }))} className="stat-card green">
           <div className="stat-icon">🏭</div>
           <div className="stat-body">
             <h3>Cylinders in Stock</h3>
@@ -2813,6 +2949,54 @@ export function Dashboard({ onNavigate }) {
             </div>
           </div>
         </div>
+
+        {/* F-13: one-click backup, straight from the dashboard.
+            Ready — writes into the configured folder with no dialog and no approval.
+            Not set up (or a browser that cannot) — sends them to Profile, where the folder is
+            chosen and where the browser note lives. Never a button here that silently does
+            nothing. */}
+        {backupReady ? (
+          <div
+            role="button" tabIndex={0}
+            title={`Write a backup into "${backup.folder.name}" now`}
+            style={{ cursor: backup.busy ? 'wait' : 'pointer' }}
+            onClick={() => { if (!backup.busy) backup.update(); }}
+            onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && !backup.busy) { e.preventDefault(); backup.update(); } }}
+            className={`stat-card ${backupDoneToday ? 'green' : 'purple'}`}>
+            <div className="stat-icon">{backup.busy ? '⏳' : (backupDoneToday ? '🛟' : '⚠️')}</div>
+            <div className="stat-body">
+              <h3>Backup</h3>
+              <div className="value" style={{fontSize:'1.15rem'}}>
+                {backup.busy ? 'Writing…' : (backupDoneToday ? 'Done today' : 'Back up now')}
+              </div>
+              <div style={{fontSize:'0.72rem', color:'var(--text-muted)', marginTop:'0.25rem'}}>
+                {backup.error
+                  ? backup.error
+                  : `Last backup: ${LB.lastRunLabel(backup.last)} · ${backup.folder.name}`}
+              </div>
+            </div>
+          </div>
+        ) : (
+          <div {...cardProps('Set up the local backup folder in Profile', () => {
+              // Tell Profile which block to jump to — Data & Privacy is a long way down.
+              try { sessionStorage.setItem('cp_scroll_local_backup', '1'); } catch {}
+              onNavigate('profile');
+            })}
+            className="stat-card blue">
+            <div className="stat-icon">🛟</div>
+            <div className="stat-body">
+              <h3>Backup</h3>
+              <div className="value" style={{fontSize:'1.15rem'}}>Set up</div>
+              <div style={{fontSize:'0.72rem', color:'var(--text-muted)', marginTop:'0.25rem'}}>
+                {!backup.supported
+                  ? 'Needs Chrome or Edge — open Profile for details'
+                  : backup.folder
+                    ? 'Folder needs reconnecting — open Profile'
+                    : 'Choose a folder in Profile, then back up from here'}
+              </div>
+            </div>
+          </div>
+        )}
 
         <DashboardCharts stock={cylinderStock} onNavigate={onNavigate} />
       </div>
@@ -3804,6 +3988,8 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   const [account, setAccount] = useState(null);
   const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'',
     certification_line:'', business_email:'', products_line:'', contact_lines:[], logo_scale:100, logo:'',
+    // F-11 certificate identity (kept here so a Business Info save never drops them).
+    certificate_prefix:'', footer_contact_line:'',
     // GEN-C numbering. fy_choice_locked / fy_lock_date are read-only, computed by the server.
     fy_reset_numbering:false, fy_choice_locked:false, fy_lock_date:null });
   const [loading, setLoading] = useState(true);
@@ -3996,11 +4182,16 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             method: 'PUT',
             headers: { 'x-step-up-token': auth.step_up_token },
             body: JSON.stringify({ profiles: locData.profiles.map(p => ({
-              location: p.location, manager_name: p.manager_name, contact_number: p.contact_number, challan_prefix: p.challan_prefix
+              location: p.location, label: p.label, manager_name: p.manager_name,
+              contact_number: p.contact_number, challan_prefix: p.challan_prefix
             })) })
           });
-          if (res.ok) showToast('All location profiles saved.', 'success');
-          else showToast(await apiErrorMessage(res));
+          if (!res.ok) { showToast(await apiErrorMessage(res)); return; }
+          // A rename changes what every dropdown, report header and challan shows, so both the
+          // global registry and this card have to be re-read rather than left on stale labels.
+          await refreshLocations();
+          await reloadLocationProfiles();
+          showToast('All location profiles saved.', 'success');
         } catch { showToast('Could not save location profiles.'); }
       }
     });
@@ -4047,6 +4238,43 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // ── Phase GEN-B2: move the filling flag ──
   // Not a cosmetic edit: DSR, Stock Summary, the maintenance gate and the filling log all pivot on
   // it, so this is confirmed AND step-up gated.
+  // ── Phase GEN-B2 addendum: move the WORKSHOP flag ──
+  // Independent of the filling flag (R143): a business may repair where it fills, or at a separate
+  // yard that does no filling at all. Only cylinders standing at this site can be put under
+  // maintenance, which is what lets the flag stay out of the Stock Summary entirely — nothing
+  // moves when a cylinder is flagged.
+  const currentMaintenance = (locData.profiles || []).find(p => p.is_maintenance_location) || null;
+
+  const makeMaintenanceLocation = (p) => {
+    const from = currentMaintenance ? locationText(currentMaintenance.location) : 'nowhere';
+    const ok = window.confirm(
+      `Make ${locationText(p.location)} the maintenance location?\n\n` +
+      (currentMaintenance
+        ? `${locationText(currentMaintenance.location)} will stop being the maintenance location.\n\n`
+        : 'No location currently services cylinders.\n\n') +
+      'Only cylinders standing at this site can be put under maintenance. Cylinders already ' +
+      'flagged stay flagged and stay where they are — nothing moves, and no report changes.'
+    );
+    if (!ok) return;
+    setStepUpAsk({
+      title: 'Approve changing the maintenance location',
+      context: `make "${locationText(p.location)}" the maintenance location (currently ${from}) — only cylinders there can be put under maintenance`,
+      action: async (auth) => {
+        try {
+          const res = await apiFetch(`${API_URL}/profile/locations/${p.location}`, {
+            method: 'PUT',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({ is_maintenance_location: true })
+          });
+          if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not change the maintenance location')); return; }
+          await refreshLocations();
+          await reloadLocationProfiles();
+          showToast(`${locationText(p.location)} is now the maintenance location.`, 'success');
+        } catch { showToast('Could not change the maintenance location'); }
+      }
+    });
+  };
+
   const makeFillingLocation = (p) => {
     const from = currentFilling ? locationText(currentFilling.location) : 'nowhere';
     const ok = window.confirm(
@@ -4056,7 +4284,6 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         : 'No location currently fills.\n\n') +
       'This changes how the system behaves from now on:\n' +
       '  • DSR and Stock Summary classify transfers around the filling location\n' +
-      '  • Cylinders can only be put under maintenance there\n' +
       '  • Gas type / capacity can only be edited there\n' +
       '  • Filling log entries are recorded against it\n\n' +
       'Existing bills, cylinders and history are NOT changed — but reports covering past dates ' +
@@ -4065,7 +4292,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     if (!ok) return;
     setStepUpAsk({
       title: `Approve changing the filling location`,
-      context: `make "${locationText(p.location)}" the filling location (currently ${from}) — this changes DSR, Stock Summary, the maintenance gate and the filling log`,
+      context: `make "${locationText(p.location)}" the filling location (currently ${from}) — this changes DSR, Stock Summary and the filling log`,
       action: async (auth) => {
         try {
           const res = await apiFetch(`${API_URL}/profile/locations/${p.location}`, {
@@ -4130,16 +4357,21 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // to READ; this is every document, in a form that RESTORES. Same file extension, entirely
   // different purpose — hence the different label, icon and description.
   const [backingUp, setBackingUp] = useState(false);
+
+  // F-13: the same hook the Dashboard tile uses, so the two can never disagree about whether a
+  // backup ran today or whether the folder is still reachable.
+  const {
+    supported: lbSupported, folder: lbFolder, perm: lbPerm, last: lbLast,
+    busy: lbBusy, error: lbError, choose: lbChoose, reconnect: lbReconnect, update: lbUpdate
+  } = useLocalBackup();
+  // No longer approval-gated (30 Aug 2026, owner's instruction): a daily backup that demands a
+  // trusted-person code every time does not get taken. The server records every backup in the
+  // audit log instead, so it stays answerable without standing in the way (R146).
   const downloadBackup = () => {
-    setStepUpAsk({
-      title: 'Approve downloading a full backup',
-      context: 'download a complete backup of every customer, cylinder, bill, payment and history record',
-      action: async (auth) => {
+    (async () => {
         setBackingUp(true);
         try {
-          const res = await apiFetch(`${API_URL}/profile/backup`, {
-            headers: { 'x-step-up-token': auth.step_up_token }
-          });
+          const res = await apiFetch(`${API_URL}/profile/backup`);
           if (!res.ok) { showToast(await apiErrorMessage(res, 'Backup failed.')); setBackingUp(false); return; }
 
           // The server names the file (it knows the business name and the timestamp); fall back
@@ -4156,8 +4388,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           showToast('Backup downloaded. Keep it somewhere safe and off this machine.', 'success');
         } catch { showToast('Backup failed.'); }
         setBackingUp(false);
-      }
-    });
+    })();
   };
 
   // ── Phase GEN-C: restore from a backup ──
@@ -4247,6 +4478,27 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     } catch {}
   };
 
+  // Deep-link from the Dashboard's Backup tile. The flag is set there and consumed here, once:
+  // landing at the top of a long settings page and hunting for the section is the thing the tile
+  // is meant to save. Runs after `loading` clears, because the section does not exist before then.
+  useEffect(() => {
+    if (loading) return;
+    let want = false;
+    try { want = sessionStorage.getItem('cp_scroll_local_backup') === '1'; } catch {}
+    if (!want) return;
+    try { sessionStorage.removeItem('cp_scroll_local_backup'); } catch {}
+    const t = setTimeout(() => {
+      const el = document.getElementById('local-backup');
+      if (!el) return;
+      el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      // A brief highlight, so it is obvious WHICH block the tile meant.
+      el.style.transition = 'background 0.4s';
+      el.style.background = '#fef3c7';
+      setTimeout(() => { el.style.background = ''; }, 2200);
+    }, 150);
+    return () => clearTimeout(t);
+  }, [loading]);
+
   if (loading) return <Spinner label="Loading profile…" />;
 
   return (
@@ -4306,6 +4558,30 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             <input className="form-control" value={business.products_line}
               placeholder="e.g. Mfg.: Industrial &amp; Medical gases"
               onChange={(e) => setBusiness({...business, products_line: e.target.value})} />
+          </div>
+          {/* F-11: identity used only by Purity Test Certificates. Both blank by default — a
+              guessed prefix would print one client's initials on another client's certificate. */}
+          <div className="form-row">
+            <div className="form-group">
+              <label>Certificate Prefix</label>
+              <input className="form-control" value={business.certificate_prefix || ''}
+                placeholder="e.g. GI"
+                onChange={(e) => setBusiness({...business, certificate_prefix: e.target.value})} />
+              <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                Starts every certificate number: <code>PREFIX/TC/2026-27/1</code>. Leave blank and
+                the segment is dropped entirely rather than printing a leading slash.
+              </small>
+            </div>
+            <div className="form-group">
+              <label>Certificate Signature Line</label>
+              <input className="form-control" value={business.footer_contact_line || ''}
+                placeholder="e.g. M 90000 00000"
+                onChange={(e) => setBusiness({...business, footer_contact_line: e.target.value})} />
+              <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                Printed under the business name where a certificate is signed off. Separate from the
+                letterhead contact box above — a certificate signs off with one line, not three.
+              </small>
+            </div>
           </div>
           <div className="form-group">
             <label>Printed Contact Lines</label>
@@ -4476,31 +4752,73 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           </form>
         )}
         <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(240px, 1fr))', gap:'1rem'}}>
-          {locData.profiles.map(p => (
+          {/* Filling site first. DISPLAY ONLY — the API order drives the global LOCATIONS array,
+              and the letterhead's Printed Contact Lines are indexed against that array
+              positionally, so reordering it there would re-attach each site's printed phone
+              number to a different site. */}
+          {[...locData.profiles]
+            .sort((a, b) => (b.is_filling_location ? 1 : 0) - (a.is_filling_location ? 1 : 0))
+            .map(p => (
             <div key={p.location} style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
-              <div style={{fontWeight:700, marginBottom:'0.6rem'}}>
-                📍 {locationText(p.location)}
-                {locData.active_location === p.location && (
-                  <span className="badge badge-success" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}>Active</span>
-                )}
-                {p.is_filling_location && (
-                  <span className="badge badge-info" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}
-                    title="Cylinders are filled here. DSR, Stock Summary, maintenance and the filling log all anchor on this site.">
-                    Filling location
-                  </span>
-                )}
+              {/* Title row: name and badges left, the two designation actions pinned right. They
+                  wrap onto their own line on a narrow card rather than squashing the name. */}
+              <div style={{display:'flex', alignItems:'flex-start', justifyContent:'space-between',
+                           gap:'0.5rem', flexWrap:'wrap', marginBottom:'0.6rem'}}>
+                <div style={{fontWeight:700, minWidth:0, flex:'1 1 auto'}}>
+                  📍 {p.label || locationText(p.location)}
+                  {locData.active_location === p.location && (
+                    <span className="badge badge-success" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}>Active</span>
+                  )}
+                  {p.is_filling_location && (
+                    <span className="badge badge-info" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}
+                      title="Cylinders are filled here. DSR, Stock Summary, the gas-type/size edit gate and the filling log all anchor on this site.">
+                      Filling location
+                    </span>
+                  )}
+                  {p.is_maintenance_location && (
+                    <span className="badge badge-warning" style={{marginLeft:'0.5rem', fontSize:'0.62rem'}}
+                      title="Faulty cylinders are serviced here. Only cylinders standing at this site can be put under maintenance.">
+                      Maintenance location
+                    </span>
+                  )}
+                </div>
+                {/* Both designations live here, stacked and right-aligned. They are independent:
+                    a business may fill and repair at the same site, or keep a separate workshop. */}
+                <div style={{display:'flex', flexDirection:'column', alignItems:'flex-end',
+                             gap:'0.2rem', flex:'0 0 auto', marginLeft:'auto'}}>
+                  {!p.is_filling_location && (
+                    <button type="button" className="link-btn"
+                      style={{fontSize:'0.78rem', whiteSpace:'nowrap'}}
+                      onClick={() => makeFillingLocation(p)}>
+                      Set as filling location
+                    </button>
+                  )}
+                  {!p.is_maintenance_location && (
+                    <button type="button" className="link-btn"
+                      style={{fontSize:'0.78rem', whiteSpace:'nowrap'}}
+                      onClick={() => makeMaintenanceLocation(p)}>
+                      Set as maintenance location
+                    </button>
+                  )}
+                </div>
               </div>
               <div style={{fontSize:'0.7rem', color:'var(--text-muted)', marginTop:'-0.4rem', marginBottom:'0.6rem'}}>
                 {p.location}
               </div>
-              {!p.is_filling_location && (
-                <div style={{marginBottom:'0.6rem'}}>
-                  <button type="button" className="link-btn" style={{fontSize:'0.78rem'}}
-                    onClick={() => makeFillingLocation(p)}>
-                    Set as filling location
-                  </button>
-                </div>
-              )}
+              <div className="form-group">
+                <label>Location Name</label>
+                <input className="form-control" value={p.label || ''}
+                  disabled={p.renameable === false}
+                  onChange={(e) => setLocField(p.location, 'label', e.target.value)} />
+                <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                  {p.renameable === false
+                    ? `Fixed — this site already has ${[
+                        p.usage && p.usage.bills ? `${p.usage.bills} transaction${p.usage.bills === 1 ? '' : 's'}` : null,
+                        p.usage && p.usage.cylinders ? `${p.usage.cylinders} cylinder${p.usage.cylinders === 1 ? '' : 's'}` : null
+                      ].filter(Boolean).join(' and ')}. The name is printed on challans and written into cylinder history, so it cannot change once the site is in use.`
+                    : 'Editable until this site is used. Once it has a transaction or a cylinder, the name is fixed. The code above never changes.'}
+                </small>
+              </div>
               <div className="form-group">
                 <label>Manager Name</label>
                 <input className="form-control" value={p.manager_name}
@@ -4657,7 +4975,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             <div style={{fontWeight:600, fontSize:'0.9rem', marginBottom:'0.25rem'}}>🛟 Backup for disaster recovery</div>
             <p style={{fontSize:'0.8rem', color:'var(--text-muted)', margin:'0 0 0.75rem'}}>
               Every record exactly as stored, in a form that can rebuild this account on a new
-              server. Not readable in Excel. Needs approval, and should be kept somewhere off this
+              server. Not readable in Excel, and should be kept somewhere off this
               machine. Your login and Trusted People are <strong>not</strong> included — those are
               set up fresh after a restore.
             </p>
@@ -4667,6 +4985,118 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             {backingUp && <div style={{marginTop:'0.5rem'}}><Spinner label="Streaming every record…" /></div>}
           </div>
 
+        </div>
+
+        {/* F-13: local auto-backup folder. The SECTION always renders, in every browser, so the
+            capability is discoverable rather than mysteriously absent — Brave, Firefox and
+            Safari do not expose showDirectoryPicker, and a feature that silently vanishes reads
+            as a bug rather than as a browser limit. Where it cannot work, `lbSupported` swaps the
+            controls for a plain note and NO usable button, so there is still nothing here that
+            can be clicked and fail. Companion to Download Backup, never a replacement: this
+            writes to one folder on this machine, which is convenient but is still the same
+            machine. Keeping a copy elsewhere still matters. */}
+        <div id="local-backup" style={{marginTop:'1.25rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>
+          <h3 style={{fontSize:'1rem', marginBottom:'0.25rem'}}>Backup to a Folder on This Computer</h3>
+          <p style={{fontSize:'0.82rem', color:'var(--text-muted)', margin:'0 0 0.9rem'}}>
+            Choose a folder once — a pen drive, or a folder that syncs to Google Drive or
+            OneDrive — and afterwards one click writes the backup straight into it with no save
+            dialog. It always overwrites the same file, <code>{LB.BACKUP_FILENAME}</code>, so you
+            keep the newest backup rather than a pile of dated copies.
+          </p>
+
+          {!lbSupported ? (
+            /* Brave, Firefox, Safari. Say plainly what is missing and what to do instead, and
+               show the button DISABLED rather than hidden: the reader can see what the feature
+               is without there being anything here that can be clicked and then fail. */
+            <div style={{border:'1px dashed var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+              <div style={{fontWeight:600, fontSize:'0.88rem', marginBottom:'0.3rem'}}>
+                Not available in this browser
+              </div>
+              <p style={{fontSize:'0.8rem', color:'var(--text-muted)', margin:'0 0 0.75rem'}}>
+                Writing straight into a folder needs the File System Access API, which only
+                <strong> Google Chrome</strong> and <strong>Microsoft Edge</strong> offer. Brave,
+                Firefox and Safari do not, so there is no way for this page to save into a folder
+                you choose. Open CylinderPro in Chrome or Edge to use it — the setup belongs to
+                that browser, it does not carry across. In the meantime,
+                <strong> Download Backup</strong> above does exactly the same job, just through
+                your browser&rsquo;s normal download instead.
+              </p>
+              <button className="btn btn-secondary" disabled
+                title="Available in Google Chrome and Microsoft Edge">
+                Set Local Backup Folder…
+              </button>
+            </div>
+          ) : (
+          <>
+
+          {/* Every failure state is shown here, and is visibly different from success. */}
+          {lbError && (
+            <div className="alert alert-danger" style={{marginBottom:'0.75rem', fontSize:'0.85rem'}}>
+              {lbError}
+            </div>
+          )}
+
+          {/* STATE 1 — never set up. Distinct from "set up but not run today": the ask is to
+              choose a folder, not to press a button that does not exist yet. */}
+          {!lbFolder && (
+            <div style={{border:'1px dashed var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+              <div style={{fontWeight:600, fontSize:'0.88rem', marginBottom:'0.3rem'}}>
+                Set up local backup
+              </div>
+              <p style={{fontSize:'0.8rem', color:'var(--text-muted)', margin:'0 0 0.75rem'}}>
+                No folder chosen yet. Pick one and this becomes a single click from then on.
+              </p>
+              <button className="btn btn-secondary" onClick={lbChoose}>Set Local Backup Folder…</button>
+            </div>
+          )}
+
+          {lbFolder && (
+            <div style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem'}}>
+              <div style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start',
+                           gap:'0.5rem', flexWrap:'wrap', marginBottom:'0.5rem'}}>
+                <div style={{minWidth:0}}>
+                  <div style={{fontSize:'0.88rem'}}>
+                    Backing up to: <strong>{lbFolder.name}</strong>
+                  </div>
+                  <div style={{fontSize:'0.78rem', color:'var(--text-muted)'}}>
+                    Last local backup: {LB.lastRunLabel(lbLast)}
+                  </div>
+                </div>
+                <button type="button" className="link-btn" style={{fontSize:'0.78rem', whiteSpace:'nowrap'}}
+                  onClick={lbChoose}>Change folder</button>
+              </div>
+
+              {/* STATE 2 — the browser has dropped write permission (it does this between
+                  sessions). requestPermission must run from the click itself, so this is its own
+                  button rather than something attempted automatically on render. */}
+              {lbPerm !== 'granted' ? (
+                <>
+                  <p style={{fontSize:'0.8rem', color:'var(--text-muted)', margin:'0 0 0.6rem'}}>
+                    Your browser needs permission to write to this folder again.
+                  </p>
+                  <button className="btn btn-secondary" onClick={lbReconnect}>Reconnect Backup Folder</button>
+                </>
+              ) : (
+                <>
+                  {/* STATE 3 — set up and permitted, but today's backup has not run. */}
+                  {!LB.ranToday(lbLast) && (
+                    <div style={{background:'#fff7ed', border:'1px solid #f59e0b',
+                                 borderRadius:'6px', padding:'0.6rem 0.75rem', marginBottom:'0.7rem',
+                                 fontSize:'0.83rem', color:'#92400e'}}>
+                      Today&rsquo;s local backup hasn&rsquo;t run yet.
+                    </div>
+                  )}
+                  <button className="btn btn-primary" onClick={lbUpdate} disabled={lbBusy}>
+                    {lbBusy ? 'Writing backup…' : 'Update Backup'}
+                  </button>
+                  {lbBusy && <div style={{marginTop:'0.5rem'}}><Spinner label="Building and writing the backup…" /></div>}
+                </>
+              )}
+            </div>
+          )}
+
+          </>
+          )}
         </div>
         {/* Restore (Phase GEN-C) */}
         <div style={{marginTop:'1.5rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>

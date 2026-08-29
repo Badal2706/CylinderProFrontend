@@ -437,6 +437,138 @@ export async function printHoldingStatement({ customer_name, customer_address, c
   writePrintDoc(w, html);
 }
 
+// ─── F-11: Purity Test Certificate print view ───
+//
+// Same shell as the challan and the holding statement — printDocStyles() for the page, and
+// printHeaderBox() for the letterhead, which is read fresh from BusinessProfile on every print so
+// no business identity is hardcoded here (R74). Only the BODY is specific to this document.
+//
+// Everything printed comes from the CERTIFICATE ITSELF, never from a live lookup. The customer
+// name and address are the ones snapshotted when it was issued, so re-printing a two-year-old
+// certificate reproduces exactly what was handed over — even if that customer has since moved.
+// The one deliberate exception is the letterhead and signature block, which are the issuing
+// business's own current identity rather than a property of the document.
+//
+// Certificate-specific rules live in their own <style> block rather than in printDocStyles(),
+// which three other documents share: the classes below are needed by nothing else, and adding
+// them to the shared sheet would put the challan one typo away from changing shape.
+function printCertStyles() {
+  return `
+    .cert-meta { margin: 10px 0 12px; font-size: 13px; }
+    .cert-to { margin-bottom: 10px; font-size: 13px; line-height: 1.6; }
+    .cert-to .to-name { font-weight: 700; }
+    /* The address prints as typed — a two-line address stays two lines. */
+    .cert-to .to-addr { white-space: pre-wrap; }
+    .cert-sub { margin: 10px 0; font-size: 13px; }
+    .cert-salute { margin: 10px 0 6px; font-size: 13px; }
+    .cert-decl { font-size: 12.5px; line-height: 1.75; text-align: justify; margin-bottom: 12px;
+                 white-space: pre-wrap; }
+    /* Detail block: a label column of fixed width so every colon lines up, whatever the labels. */
+    table.cert-detail { border-collapse: collapse; margin-bottom: 12px; font-size: 12.5px; }
+    table.cert-detail td { padding: 3px 0; vertical-align: top; }
+    table.cert-detail td.k { width: 210px; }
+    table.cert-detail td.sep { width: 14px; }
+    table.cert-detail td.v { font-weight: 700; }
+    .cert-imp-title { font-weight: 700; font-size: 13px; margin: 4px 0 5px; }
+    /* The signature block is pushed to the foot of the page by .signs' margin-top:auto, the same
+       way the challan's is, so a short certificate still signs off at the bottom. */
+    .cert-sign { margin-top: auto; padding-top: 40px; display: flex; justify-content: flex-end; }
+    .cert-sign .box { text-align: center; font-size: 12.5px; line-height: 1.6; }
+    .cert-sign .box .for { text-align: left; }
+    .cert-sign .box .biz { font-weight: 700; }
+    .cert-sign .box .sig { margin-top: 46px; font-weight: 700; }`;
+}
+
+export async function printPurityCertificate(cert) {
+  const w = openPrintTarget('guru_certificate');    // FIRST statement — before any await
+  if (!w) return;
+  const { business } = await fetchPrintIdentity();
+  const esc = printEsc;
+  const c = cert || {};
+  const has = (v) => !!(v && String(v).trim());
+
+  // A blank field prints NOTHING — never an orphan label with an empty value. Same rule as the
+  // letterhead (GEN-A), applied to the detail block: an optional delivery date or challan
+  // reference that was left blank simply has no row.
+  const row = (label, value) => has(value)
+    ? `<tr><td class="k">${esc(label)}</td><td class="sep">:</td><td class="v">${esc(value)}</td></tr>`
+    : '';
+  const dateRow = (label, value) => value ? row(label, formatDate(value)) : '';
+
+  const detail = [
+    row('Gas', c.gas_type),
+    row('Purity', c.purity_percent),
+    row('Cylinder Owner', c.cylinder_owner),
+    row('Cylinder Water Capacity (Ltrs.)', c.cylinder_water_capacity_ltrs),
+    row('Quantity', c.qty),
+    row('Cylinder No.', c.cylinder_serial_no),
+    dateRow('Date of Filling', c.filling_date),
+    dateRow('Date of Delivery', c.delivery_date),
+    row('Challan Ref.', c.challan_ref)
+  ].join('');
+
+  const impurities = Array.isArray(c.impurities) ? c.impurities : [];
+  const impurityTable = impurities.length ? `
+    <div class="cert-imp-title">Analysis Report</div>
+    <table class="ctab">
+      <thead><tr>
+        <th class="c" style="width:8%">Sr. No.</th><th>Impurity</th><th class="c" style="width:28%">Content (PPM)</th>
+      </tr></thead>
+      <tbody>${impurities.map((r, i) => `
+        <tr>
+          <td class="c">${i + 1}</td>
+          <td>${esc(r.name || '')}</td>
+          <td class="c">${esc(r.ppm_text || '')}</td>
+        </tr>`).join('')}</tbody>
+    </table>` : '';
+
+  // "For, / <business name> / <contact line>" then the signature line. The business name comes
+  // from the letterhead settings, exactly as the challan's signature block does.
+  const signature = `
+    <div class="cert-sign">
+      <div class="box">
+        <div class="for">For,</div>
+        <div class="biz">${esc(business.business_name || '')}</div>
+        ${has(business.footer_contact_line) ? `<div>${esc(business.footer_contact_line)}</div>` : ''}
+        <div class="sig">Authorised Signatory</div>
+      </div>
+    </div>`;
+
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(c.certificate_number || 'Purity Test Certificate')}</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
+  <style>${printDocStyles()}</style>
+  <style>${printCertStyles()}</style></head><body>
+  ${printHeaderBox('Purity Test Certificate', business)}
+
+  <div class="cert-meta">
+    <div class="pair">
+      <span class="pair-l">Certificate No.: <b>${esc(c.certificate_number || '')}</b></span>
+      <span class="pair-r">Date: <b>${c.date ? formatDate(c.date) : ''}</b></span>
+    </div>
+  </div>
+
+  <div class="cert-to">
+    <div>To,</div>
+    <div class="to-name">M/s. ${esc(c.customer_name || '')}</div>
+    ${has(c.customer_address) ? `<div class="to-addr">${esc(c.customer_address)}</div>` : ''}
+  </div>
+
+  ${has(c.sub_line) ? `<div class="cert-sub"><b>Sub:</b> ${esc(c.sub_line)}</div>` : ''}
+
+  <div class="cert-salute">Dear Sir,</div>
+
+  ${has(c.declaration_text) ? `<div class="cert-decl">${esc(c.declaration_text)}</div>` : ''}
+
+  ${detail ? `<table class="cert-detail">${detail}</table>` : ''}
+  ${impurityTable}
+  ${signature}
+  ${printFitAndPrintScript()}
+  </body></html>`;
+
+  writePrintDoc(w, html);
+}
+
 // ─── Step-up verification modal (Phase 17 — consumed by Phase 18's gated actions) ───
 // Two ways to approve a sensitive action:
 //   Email code : pick a specific trusted person → 6-digit code goes to THEIR email.
@@ -583,6 +715,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   // Pre-software confirmation (Phase 34 item 4): set to { cylinders, message, onConfirm } when a
   // backdated entry contradicts only the migration placeholder; cleared on confirm/cancel.
   const [preSoftware, setPreSoftware] = useState(null);
+  const [crossSite, setCrossSite] = useState(null);   // returned to a different site than issued from
   // Combine the date + time inputs into an absolute UTC instant. The inputs are the user's LOCAL
   // wall-clock; `new Date('YYYY-MM-DDTHH:MM')` parses them in the browser's timezone, and
   // .toISOString() converts to UTC so the server (which may run in a different timezone, e.g. UTC on
@@ -1337,30 +1470,42 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         fetchCustomers(); // refresh personalCylindersAtPlant / holdings for follow-up transactions
       };
       const postBill = (extra) => apiFetch(`${API_URL}/bills`, {
-        method: 'POST', body: JSON.stringify(extra ? { ...billData, ...extra } : billData)
+        method: 'POST', body: JSON.stringify({ ...billData, ...(extra || {}) })
       });
 
-      const response = await postBill();
-      if (response.ok) {
+      // One bill can trip more than one confirmation, so each answer is carried forward into the
+      // next attempt rather than replacing it — otherwise confirming the second would un-confirm
+      // the first and the save would loop.
+      const submitWith = async (extra) => {
+        const response = await postBill(extra);
+        if (!response.ok) {
+          showToast(await apiErrorMessage(response, 'Error creating bill'));
+          return;
+        }
         const result = await response.json();
-        // Phase 34: backdated entry that contradicts only the migration placeholder — confirm first.
+
+        // Taken back at a different site than it was issued from.
+        if (result.requires_cross_site_confirmation) {
+          setCrossSite({
+            cylinders: result.cylinders || [],
+            message: result.message,
+            onConfirm: () => { setCrossSite(null); submitWith({ ...extra, confirm_cross_site: true }); }
+          });
+          return;
+        }
+        // Phase 34: backdated entry that contradicts only the migration placeholder.
         if (result.requires_pre_software_confirmation) {
           setPreSoftware({
             cylinders: result.cylinders || [],
             message: result.message,
-            onConfirm: async () => {
-              setPreSoftware(null);
-              const r2 = await postBill({ confirm_pre_software: true });
-              if (r2.ok) finishCreate(await r2.json());
-              else showToast(await apiErrorMessage(r2, 'Error creating bill'));
-            }
+            onConfirm: () => { setPreSoftware(null); submitWith({ ...extra, confirm_pre_software: true }); }
           });
           return;
         }
         finishCreate(result);
-      } else {
-        showToast(await apiErrorMessage(response, 'Error creating bill'));
-      }
+      };
+
+      await submitWith({});
     } catch (error) {
       console.error('Error:', error);
     }
@@ -1730,6 +1875,35 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
 
   // Phase 34: pre-software confirmation — a backdated entry that contradicts only the migration
   // placeholder. Confirming saves it as genuine pre-software history; it never moves live stock.
+  const crossSiteModal = crossSite ? (
+    <div className="modal-overlay" onClick={() => setCrossSite(null)}>
+      <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{maxWidth:'560px'}}>
+        <div className="modal-header">
+          <span>🚚 Cylinder is coming back to a different site</span>
+          <button className="modal-close" onClick={() => setCrossSite(null)}>✕</button>
+        </div>
+        <div className="modal-body">
+          <p style={{marginTop:0}}>{crossSite.message}</p>
+          <ul style={{margin:'0.5rem 0 1rem', paddingLeft:'1.2rem'}}>
+            {crossSite.cylinders.map(c => (
+              <li key={c.serial} style={{marginBottom:'0.3rem'}}>
+                <strong>Cylinder {c.serial}</strong> — issued from <em>{c.given_at_label}</em>, being taken back at <em>{c.received_at_label}</em>.
+              </li>
+            ))}
+          </ul>
+          <div className="alert alert-warning" style={{fontSize:'0.85rem'}}>
+            This is allowed. On save the cylinder joins this site's stock, and the move from the
+            issuing site is written to its history so the change is on record.
+          </div>
+          <div className="modal-actions">
+            <button className="btn btn-secondary" onClick={() => setCrossSite(null)}>Cancel</button>
+            <button className="btn btn-primary" onClick={crossSite.onConfirm}>Confirm &amp; Save</button>
+          </div>
+        </div>
+      </div>
+    </div>
+  ) : null;
+
   const preSoftwareModal = preSoftware ? (
     <div className="modal-overlay" onClick={() => setPreSoftware(null)}>
       <div className="modal-card" onClick={(e) => e.stopPropagation()} style={{maxWidth:'560px'}}>
@@ -1766,6 +1940,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         </div>
         {stepUpModal}
         {preSoftwareModal}
+        {crossSiteModal}
 
         {/* Bill summary */}
         <div style={{padding:'1rem', background:'#f8f9fa', borderRadius:'8px', marginBottom:'1rem'}}>
@@ -1860,6 +2035,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     <div className="card">
       {stepUpModal}
       {preSoftwareModal}
+        {crossSiteModal}
       <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
         <h2 style={{margin:0, border:'none', padding:0}}>New Transaction / Bill</h2>
         {!editingBillId && (

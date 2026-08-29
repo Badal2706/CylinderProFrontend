@@ -6,9 +6,10 @@ import {
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
   LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, stockStateText, cylinderStateText,
-  Pagination, useDebounce, useBatchList, BatchListFooter, useLocations
+  Pagination, useDebounce, useBatchList, BatchListFooter, useLocations,
+  purityDefaultsFor, fillingLocationCode, maintenanceLocationCode
 } from './App.jsx';
-import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
+import { printSavedBill, printHoldingStatement, printPurityCertificate, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
 
 // Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time (the user's LOCAL wall-clock) into an
 // absolute UTC instant, so a server in a different timezone stores the exact moment and re-edits
@@ -18,6 +19,16 @@ import { printSavedBill, printHoldingStatement, RentalSummaryModal, StepUpVerifi
 // Invalid Date for the seconds-less form), and the old fallback then sent a naive local string
 // that the server stored verbatim as UTC — a silent +5:30 shift for IST users that pushed bills
 // into the future and corrupted cylinder ordering. Component form works in every browser.
+// The distinct sites a bill took cylinders back FROM, when that is not the bill's own site.
+// Recorded per line as issued_from_location at save time (see models/Bill.js). Empty for every
+// ordinary bill, and for bills saved before that field existed — in which case nothing extra is
+// shown, exactly as before.
+const crossSiteOrigins = (bill) => [...new Set(
+  (bill?.line_items || [])
+    .filter(li => li.direction === 'RECEIVED' && li.issued_from_location)
+    .map(li => li.issued_from_location)
+)];
+
 const combineDT = (date, time) => {
   if (!date) return date;
   const t = /^\d{2}:\d{2}/.test(time || '') ? time : '00:00';
@@ -108,6 +119,13 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
   const [loading, setLoading] = useState(true);
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
+  // F-11: purity test certificates. `viewCert` and `deleteCert` are the ONLY two things that can
+  // happen to one after it is issued — there is no editCert, by design.
+  const [certificates, setCertificates] = useState([]);
+  const [showCertForm, setShowCertForm] = useState(false);
+  const [viewCert, setViewCert] = useState(null);
+  const [deleteCert, setDeleteCert] = useState(null);
+  const [deletingCert, setDeletingCert] = useState(false);
 
   useEffect(() => {
     if (customerId) {
@@ -128,14 +146,15 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
 
   const fetchCustomerDetail = async () => {
     try {
-      const [customerRes, givenRes, receivedRes, paymentsRes, personalHistRes, agingRes, billsRes] = await Promise.all([
+      const [customerRes, givenRes, receivedRes, paymentsRes, personalHistRes, agingRes, billsRes, certsRes] = await Promise.all([
         apiFetch(`${API_URL}/customers/${customerId}`),
         apiFetch(`${API_URL}/customers/${customerId}/transactions/given?page=${givenPage}&limit=50`),
         apiFetch(`${API_URL}/customers/${customerId}/transactions/received?page=${receivedPage}&limit=50`),
         apiFetch(`${API_URL}/customers/${customerId}/payments?page=${paymentsPage}&limit=50`),
         apiFetch(`${API_URL}/customers/${customerId}/personal-cylinder-history`),
         apiFetch(`${API_URL}/customers/${customerId}/aging`),
-        apiFetch(`${API_URL}/bills?customer_id=${customerId}&limit=200`)
+        apiFetch(`${API_URL}/bills?customer_id=${customerId}&limit=200`),
+        apiFetch(`${API_URL}/purity-certificates?customer_id=${customerId}`)
       ]);
 
       if (!customerRes.ok) {
@@ -169,6 +188,8 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       setPersonalHistory(Array.isArray(personalHistData) ? personalHistData : []);
       setAgingRows(Array.isArray(agingData) ? agingData : []);
       setCustomerBills(Array.isArray(billsData) ? billsData : []);
+      const certsData = certsRes.ok ? await certsRes.json() : [];
+      setCertificates(Array.isArray(certsData) ? certsData : []);
       setLoading(false);
     } catch (error) {
       console.error('Error fetching customer detail:', error);
@@ -214,7 +235,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     const paymentRows = payments.length ? payments.map(p => ({
       'Receipt No': p.receipt_number || '', 'Challan No': p.challan_no || '', 'Date': d2(p.date),
       'Amount Received': rs(p.amount_received), 'Discount': rs(p.discount),
-      'Net Amount': rs((p.amount_received || 0) - (p.discount || 0)),
+      'Net Amount': rs(p.amount_received || 0),
       'Mode': paymentModeLabel(p.payment_mode),
       'Cheque No': p.payment_mode === 'CHEQUE' ? (p.cheque_number || '') : '',
       'UPI Txn ID': (p.payment_mode === 'UPI' || p.payment_mode === 'ONLINE') ? (p.upi_transaction_id || '') : '',
@@ -276,7 +297,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     );
     const pymtSec = section('Payment History',
       ['Receipt No','Challan No','Date','Amount','Discount','Net','Mode','Cheque No. / UPI Txn ID','Remarks'],
-      payments.map(p => [p.receipt_number, p.challan_no||'', d2(p.date), rs(p.amount_received), rs(p.discount), rs((p.amount_received||0)-(p.discount||0)), paymentModeLabel(p.payment_mode), paymentRef(p), p.remarks||''])
+      payments.map(p => [p.receipt_number, p.challan_no||'', d2(p.date), rs(p.amount_received), rs(p.discount), rs(p.amount_received||0), paymentModeLabel(p.payment_mode), paymentRef(p), p.remarks||''])
     );
 
     const docTitle = getExportFileName('customer-ledger', { customerName: customer.company_name });
@@ -423,6 +444,34 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     { header: 'Cheque No. / UPI Txn ID', cell: (p) => paymentRef(p) },
     { header: 'Remarks', cell: (p) => p.remarks || '-' }
   ];
+  // F-11. Deliberately no edit column: the row opens a read-only view, from which the only
+  // actions are Print and Delete.
+  const [certsVisible, certsMore, certsOpen, setCertsOpen] = useViewAll(certificates, 5);
+  const certColumns = [
+    { header: 'Certificate No.', cell: (c) => <strong>{c.certificate_number}</strong> },
+    { header: 'Date', cell: (c) => formatDate(c.date) },
+    { header: 'Gas Type', cell: (c) => c.gas_type || '-' },
+    { header: 'Purity (%)', cell: (c) => c.purity_percent || '-' },
+    { header: 'Cylinder No.', cell: (c) => c.cylinder_serial_no || '-' },
+    { header: 'Qty', cell: (c) => c.qty || '-' }
+  ];
+
+  const removeCertificate = async (cert) => {
+    setDeletingCert(true);
+    try {
+      const res = await apiFetch(`${API_URL}/purity-certificates/${cert._id}`, { method: 'DELETE' });
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not delete the certificate.')); return; }
+      showToast(`Certificate ${cert.certificate_number} deleted.`, 'success');
+      setDeleteCert(null);
+      setViewCert(null);
+      setCertificates(prev => prev.filter(c => c._id !== cert._id));
+    } catch {
+      showToast('Could not delete the certificate. Please try again.');
+    } finally {
+      setDeletingCert(false);
+    }
+  };
+
   const dateKey = (k) => (it) => formatDate(it[k]);
 
   if (loading) {
@@ -655,6 +704,62 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
           </div>
         </div>
       )}
+
+      {/* F-11: Purity Test Certificates. View / Print / Delete only — a certificate is frozen
+          the moment it is saved, so this section has no edit affordance anywhere. */}
+      <div className="card" id="purity-certificates">
+        <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
+          <h2 style={{margin:0, border:'none', padding:0}}>Purity Test Certificates ({certificates.length})</h2>
+          <button className="btn btn-primary" onClick={() => setShowCertForm(true)}>+ New Certificate</button>
+        </div>
+
+        {certificates.length === 0 ? (
+          <EmptyState icon="📄" message="No certificates issued yet"
+            hint="Issue one with “+ New Certificate” above." />
+        ) : (
+          <div className="table-container" style={{marginTop:'0.75rem'}}>
+            <table>
+              <thead>
+                <tr>
+                  <th>Certificate No.</th><th>Date</th><th>Gas Type</th>
+                  <th>Purity (%)</th><th>Cylinder No.</th><th>Qty</th><th></th>
+                </tr>
+              </thead>
+              <tbody>
+                {certsVisible.map((c) => (
+                  <tr key={c._id}>
+                    <td><strong>{c.certificate_number}</strong></td>
+                    <td>{formatDate(c.date)}</td>
+                    <td>{c.gas_type || '-'}</td>
+                    <td>{c.purity_percent || '-'}</td>
+                    <td>{c.cylinder_serial_no || '-'}</td>
+                    <td>{c.qty || '-'}</td>
+                    <td style={{whiteSpace:'nowrap'}}>
+                      <button type="button" className="link-btn" onClick={() => setViewCert(c)}>View</button>
+                      {' · '}
+                      <button type="button" className="link-btn" onClick={() => printPurityCertificate(c)}>Print</button>
+                      {' · '}
+                      <button type="button" className="link-btn" style={{color:'var(--danger, #dc2626)'}}
+                        onClick={() => setDeleteCert(c)}>Delete</button>
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+            {certsMore && <ViewAllButton count={certificates.length} onClick={() => setCertsOpen(true)} />}
+          </div>
+        )}
+
+        {showCertForm && (
+          <Modal title={`New Purity Test Certificate — ${customer.company_name}`} size="wide"
+            onClose={() => setShowCertForm(false)}>
+            <PurityCertificateForm
+              customer={customer}
+              onSuccess={() => { setShowCertForm(false); fetchCustomerDetail(); }}
+              onCancel={() => setShowCertForm(false)} />
+          </Modal>
+        )}
+      </div>
 
       {/* Currently Holding Cylinders */}
       <div className="card" id="currently-holding">
@@ -1020,6 +1125,314 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
           searchKeys={['receipt_number', 'challan_no', (p) => p.amount_received, dateKey('date')]}
           searchPlaceholder="Search by receipt no., challan no., amount, or date…" onClose={() => setPaymentsOpen(false)} />
       )}
+      {certsOpen && (
+        <ListModal title="Purity Test Certificates" items={certificates} columns={certColumns}
+          searchKeys={['certificate_number', 'gas_type', 'cylinder_serial_no', dateKey('date')]}
+          searchPlaceholder="Search by certificate no., gas type, cylinder no., or date…"
+          onRowClick={(c) => { setCertsOpen(false); setViewCert(c); }}
+          onClose={() => setCertsOpen(false)} />
+      )}
+      {viewCert && (
+        <Modal title={`Purity Test Certificate — ${viewCert.certificate_number}`} size="wide"
+          onClose={() => setViewCert(null)}>
+          <PurityCertificateView certificate={viewCert} onDelete={(c) => setDeleteCert(c)} />
+        </Modal>
+      )}
+      {deleteCert && (
+        <ConfirmModal
+          title="Delete this certificate?"
+          message={`Certificate ${deleteCert.certificate_number} will be permanently removed. Nothing else is affected — no cylinder, bill or customer record changes. This cannot be undone.`}
+          confirmLabel="Delete Certificate"
+          loading={deletingCert}
+          onConfirm={() => removeCertificate(deleteCert)}
+          onCancel={() => setDeleteCert(null)} />
+      )}
+    </div>
+  );
+}
+
+// ─── F-11: Purity Test Certificate ───
+//
+// Issued per customer, printed, and then frozen. Two components live here: the form that issues
+// one, and the read-only view of one already issued. There is deliberately no third — no edit
+// form exists anywhere in this file, because a certificate cannot be edited once saved. The
+// correction path is delete and reissue, the same as everywhere else in this app.
+
+// Label for one detail field, shared by the form and the view so the two read alike.
+const CERT_FIELD_LABELS = {
+  gas_type: 'Gas Type',
+  purity_percent: 'Purity (%)',
+  cylinder_owner: 'Cylinder Owner',
+  cylinder_water_capacity_ltrs: 'Cylinder Water Capacity (Ltrs.)',
+  qty: 'Quantity',
+  cylinder_serial_no: 'Cylinder No.',
+  filling_date: 'Date of Filling',
+  delivery_date: 'Date of Delivery',
+  challan_ref: 'Challan Ref.'
+};
+
+export function PurityCertificateForm({ customer, onSuccess, onCancel }) {
+  // The customer's name and address are SEEDED from the customer record and then belong to the
+  // form: the operator may correct them before issuing, and whatever they approve is what gets
+  // frozen onto the certificate. Nothing here is read back from the customer afterwards.
+  const [form, setForm] = useState({
+    date: istDateInput(),
+    gas_type: '',
+    purity_percent: '',
+    sub_line: '',
+    declaration_text: '',
+    customer_name: customer.company_name || '',
+    customer_address: customer.address || '',
+    cylinder_owner: '',
+    cylinder_water_capacity_ltrs: '',
+    qty: '',
+    filling_date: istDateInput(),
+    delivery_date: '',
+    cylinder_serial_no: '',
+    challan_ref: ''
+  });
+  const [impurities, setImpurities] = useState([]);
+  const [saving, setSaving] = useState(false);
+
+  // Cylinder Owner defaults to the issuing business's own name, from Business Profile — most
+  // cylinders on a certificate are the plant's. Still fully editable for a customer-owned one.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const name = await getBusinessName();
+      if (!cancelled) setForm(f => (f.cylinder_owner ? f : { ...f, cylinder_owner: name }));
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  const set = (k) => (e) => setForm(f => ({ ...f, [k]: e.target.value }));
+
+  // Picking a gas type pre-fills the purity figure, the Sub line, the declaration and the whole
+  // impurity table from the static defaults. Every one of those is a starting point — the
+  // operator can edit any field and add or remove impurity rows before issuing.
+  const onGasChange = (e) => {
+    const gas = e.target.value;
+    const d = purityDefaultsFor(gas);
+    setForm(f => ({
+      ...f,
+      gas_type: gas,
+      purity_percent: d.purity_percent,
+      sub_line: d.sub_line,
+      declaration_text: d.declaration_text
+    }));
+    setImpurities(d.impurities);
+  };
+
+  const setImp = (i, key, value) => setImpurities(rows =>
+    rows.map((r, idx) => idx === i ? { ...r, [key]: value } : r));
+  const addImp = () => setImpurities(rows => [...rows, { name: '', ppm_text: '' }]);
+  const removeImp = (i) => setImpurities(rows => rows.filter((_, idx) => idx !== i));
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!form.gas_type.trim()) { showToast('Please choose a gas type.'); return; }
+    setSaving(true);
+    try {
+      const res = await apiFetch(`${API_URL}/purity-certificates`, {
+        method: 'POST',
+        body: JSON.stringify({ ...form, customer_id: customer._id, impurities })
+      });
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not issue the certificate.')); return; }
+      const result = await res.json();
+      showToast(`Certificate ${result.certificate_number} issued.`, 'success');
+      onSuccess(result);
+    } catch {
+      showToast('Could not issue the certificate. Please try again.');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <form onSubmit={submit}>
+      <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:0}}>
+        Edit anything below before saving. <strong>Once saved a certificate cannot be changed</strong> —
+        it can only be viewed, printed or deleted. The certificate number is assigned automatically.
+      </p>
+
+      <div className="form-row">
+        <div className="form-group">
+          <label>Certificate Date</label>
+          <input type="date" className="form-control" value={form.date} onChange={set('date')} required />
+        </div>
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.gas_type}</label>
+          <select className="form-control" value={form.gas_type} onChange={onGasChange} required>
+            <option value="">Select gas type…</option>
+            {GAS_TYPE_LIST.map(g => <option key={g} value={g}>{g}</option>)}
+          </select>
+        </div>
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.purity_percent}</label>
+          <input className="form-control" value={form.purity_percent} onChange={set('purity_percent')}
+            placeholder="e.g. 99.5" />
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>Customer Name (printed on the certificate)</label>
+        <input className="form-control" value={form.customer_name} onChange={set('customer_name')} />
+      </div>
+      <div className="form-group">
+        <label>Customer Address (printed on the certificate)</label>
+        <textarea className="form-control" rows="2" value={form.customer_address} onChange={set('customer_address')} />
+      </div>
+
+      <div className="form-group">
+        <label>Sub</label>
+        <input className="form-control" value={form.sub_line} onChange={set('sub_line')}
+          placeholder="e.g. Test Certificate for Oxygen Gas" />
+      </div>
+      <div className="form-group">
+        <label>Declaration</label>
+        <textarea className="form-control" rows="4" value={form.declaration_text} onChange={set('declaration_text')} />
+      </div>
+
+      <div className="form-row">
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.cylinder_owner}</label>
+          <input className="form-control" value={form.cylinder_owner} onChange={set('cylinder_owner')} />
+        </div>
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.cylinder_water_capacity_ltrs}</label>
+          <input className="form-control" value={form.cylinder_water_capacity_ltrs}
+            onChange={set('cylinder_water_capacity_ltrs')} placeholder="e.g. 46.7" />
+        </div>
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.qty}</label>
+          <input className="form-control" value={form.qty} onChange={set('qty')} placeholder="e.g. 10" />
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>{CERT_FIELD_LABELS.cylinder_serial_no}</label>
+        <input className="form-control" value={form.cylinder_serial_no} onChange={set('cylinder_serial_no')}
+          placeholder="e.g. 1024, 1025, 1031" />
+      </div>
+
+      <div className="form-row">
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.filling_date}</label>
+          <input type="date" className="form-control" value={form.filling_date} onChange={set('filling_date')} />
+        </div>
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.delivery_date} <span style={{color:'var(--text-muted)', fontWeight:400}}>(optional)</span></label>
+          <input type="date" className="form-control" value={form.delivery_date} onChange={set('delivery_date')} />
+        </div>
+        <div className="form-group">
+          <label>{CERT_FIELD_LABELS.challan_ref} <span style={{color:'var(--text-muted)', fontWeight:400}}>(optional)</span></label>
+          <input className="form-control" value={form.challan_ref} onChange={set('challan_ref')} />
+        </div>
+      </div>
+
+      <div className="form-group">
+        <label>Impurities</label>
+        <div className="table-container">
+          <table>
+            <thead>
+              <tr><th style={{width:'55%'}}>Impurity</th><th style={{width:'30%'}}>Content (PPM)</th><th style={{width:'15%'}}></th></tr>
+            </thead>
+            <tbody>
+              {impurities.length === 0 && (
+                <tr><td colSpan="3" style={{color:'var(--text-muted)', fontSize:'0.82rem'}}>
+                  Choose a gas type to load its usual impurities, or add rows by hand.
+                </td></tr>
+              )}
+              {impurities.map((r, i) => (
+                <tr key={i}>
+                  <td><input className="form-control" value={r.name}
+                    onChange={(e) => setImp(i, 'name', e.target.value)} /></td>
+                  <td><input className="form-control" value={r.ppm_text}
+                    onChange={(e) => setImp(i, 'ppm_text', e.target.value)} /></td>
+                  <td><button type="button" className="link-btn" onClick={() => removeImp(i)}>Remove</button></td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+        <button type="button" className="btn btn-secondary" style={{marginTop:'0.5rem'}} onClick={addImp}>
+          + Add Impurity Row
+        </button>
+      </div>
+
+      <div className="btn-group">
+        <button type="submit" className="btn btn-primary" disabled={saving}>
+          {saving ? 'Saving…' : 'Save Certificate'}
+        </button>
+        <button type="button" className="btn btn-secondary" onClick={onCancel} disabled={saving}>Cancel</button>
+      </div>
+    </form>
+  );
+}
+
+// A certificate already issued. Read-only by construction — there is no input on this screen and
+// no route behind it that would accept an edit. Print renders from these same saved values, so
+// what is shown here and what comes out of the printer are the same document.
+export function PurityCertificateView({ certificate, onDelete }) {
+  const c = certificate || {};
+  const show = (v) => (v && String(v).trim()) ? String(v) : '—';
+  const row = (label, value) => (
+    <tr key={label}>
+      <td style={{color:'var(--text-muted)', width:'240px', verticalAlign:'top'}}>{label}</td>
+      <td style={{fontWeight:600, whiteSpace:'pre-wrap'}}>{value}</td>
+    </tr>
+  );
+
+  return (
+    <div>
+      <div style={{marginBottom:'0.75rem', fontSize:'0.82rem', color:'var(--text-muted)'}}>
+        Issued certificates cannot be edited. To correct one, delete it and issue a new certificate.
+      </div>
+
+      <div className="table-container">
+        <table>
+          <tbody>
+            {row('Certificate No.', show(c.certificate_number))}
+            {row('Certificate Date', c.date ? formatDate(c.date) : '—')}
+            {row('Customer', show(c.customer_name))}
+            {row('Address', show(c.customer_address))}
+            {row('Sub', show(c.sub_line))}
+            {row('Declaration', show(c.declaration_text))}
+            {row(CERT_FIELD_LABELS.gas_type, show(c.gas_type))}
+            {row(CERT_FIELD_LABELS.purity_percent, show(c.purity_percent))}
+            {row(CERT_FIELD_LABELS.cylinder_owner, show(c.cylinder_owner))}
+            {row(CERT_FIELD_LABELS.cylinder_water_capacity_ltrs, show(c.cylinder_water_capacity_ltrs))}
+            {row(CERT_FIELD_LABELS.qty, show(c.qty))}
+            {row(CERT_FIELD_LABELS.cylinder_serial_no, show(c.cylinder_serial_no))}
+            {row(CERT_FIELD_LABELS.filling_date, c.filling_date ? formatDate(c.filling_date) : '—')}
+            {row(CERT_FIELD_LABELS.delivery_date, c.delivery_date ? formatDate(c.delivery_date) : '—')}
+            {row(CERT_FIELD_LABELS.challan_ref, show(c.challan_ref))}
+          </tbody>
+        </table>
+      </div>
+
+      <h4 style={{margin:'1rem 0 0.4rem'}}>Analysis Report</h4>
+      {(c.impurities || []).length === 0 ? (
+        <p style={{color:'var(--text-muted)', fontSize:'0.82rem'}}>No impurities were listed.</p>
+      ) : (
+        <div className="table-container">
+          <table>
+            <thead><tr><th>Sr.</th><th>Impurity</th><th>Content (PPM)</th></tr></thead>
+            <tbody>
+              {(c.impurities || []).map((r, i) => (
+                <tr key={i}><td>{i + 1}</td><td>{r.name}</td><td>{r.ppm_text}</td></tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      <div className="btn-group" style={{marginTop:'1rem'}}>
+        <button type="button" className="btn btn-primary" onClick={() => printPurityCertificate(c)}>
+          Print / PDF
+        </button>
+        <button type="button" className="btn btn-danger" onClick={() => onDelete(c)}>Delete Certificate</button>
+      </div>
     </div>
   );
 }
@@ -1072,7 +1485,7 @@ export function PaymentForm({ customerId, billId, challanNo, onSuccess, onCancel
       <PaymentFields formData={formData} setFormData={setFormData} errors={errors} />
       {formData.amount_received > 0 && (
         <div style={{padding: '0.75rem 1rem', backgroundColor: '#e7f3ff', borderRadius: '4px', margin: '0.25rem 0 0'}}>
-          <p style={{margin: 0}}><strong>Net Amount: ₹{((parseFloat(formData.amount_received) || 0) - (parseFloat(formData.discount) || 0)).toFixed(2)}</strong></p>
+          <p style={{margin: 0}}><strong>Net Amount: ₹{(parseFloat(formData.amount_received) || 0).toFixed(2)}</strong></p>
         </div>
       )}
       <div className="modal-actions">
@@ -1883,31 +2296,27 @@ export function ReportTable({ reportType, data }) {
 
 // Payments Component
 export function Payments({ onNavigate }) {
-  const [payments, setPayments] = useState([]);
-  const [payPagination, setPayPagination] = useState(null);
   const [customers, setCustomers] = useState([]);
   const [showForm, setShowForm] = useState(false);
-  const [loading, setLoading] = useState(true);
   const [searchTerm, setSearchTerm] = useState('');
-  const [payPage, setPayPage] = useState(1);
+  const debouncedSearch = useDebounce(searchTerm, 300);
 
-  useEffect(() => {
-    fetchPayments();
-    fetchCustomers();
-  }, [payPage]);
-
-  const fetchPayments = async () => {
-    try {
-      const response = await apiFetch(`${API_URL}/payments?page=${payPage}&limit=50`);
-      const data = await response.json();
-      setPayments(data.data || data);
-      setPayPagination(data.pagination || null);
-      setLoading(false);
-    } catch (error) {
-      console.error('Error fetching payments:', error);
-      setLoading(false);
-    }
+  // Same batch-load pattern as Cylinder Inventory and Transaction History: an initial batch, the
+  // true server-side total, and "View All" to pull the rest in the background.
+  //
+  // Search now goes to the SERVER on every (debounced) keystroke. The old page=&limit + useViewAll
+  // pair filtered only the 50 rows that happened to be loaded, so a receipt on any other page
+  // could not be found at all — the search box silently lied about the rest of the ledger.
+  const buildUrl = (page, limit) => {
+    let url = `${API_URL}/payments?page=${page}&limit=${limit}`;
+    if (debouncedSearch) url += `&search=${encodeURIComponent(debouncedSearch)}`;
+    return url;
   };
+  const {
+    rows: payments, total, loading, loadingAll, loadedAll, loadAll, reload: fetchPayments
+  } = useBatchList(buildUrl, [debouncedSearch]);
+
+  useEffect(() => { fetchCustomers(); }, []);
 
   const fetchCustomers = async () => {
     try {
@@ -1918,26 +2327,6 @@ export function Payments({ onNavigate }) {
       console.error('Error fetching customers:', error);
     }
   };
-
-  const filteredPayments = payments.filter(p =>
-    p.company_name.toLowerCase().includes(searchTerm.toLowerCase()) ||
-    p.receipt_number.toLowerCase().includes(searchTerm.toLowerCase())
-  );
-  const [payVisible, payMore, payOpen, setPayOpen] = useViewAll(filteredPayments, 10);
-
-  const payColumns = [
-    { header: 'Receipt No.', cell: (p) => <strong>{p.receipt_number}</strong> },
-    { header: 'Challan No.', cell: (p) => p.challan_no || '-' },
-    { header: 'Date', cell: (p) => formatDate(p.date) },
-    { header: 'Customer', cell: (p) => p.company_name },
-    { header: 'Bill No.', cell: (p) => p.bill_number || '-' },
-    { header: 'Amount', cell: (p) => `₹${(p.amount_received || 0).toFixed(2)}` },
-    { header: 'Discount', cell: (p) => `₹${(p.discount || 0).toFixed(2)}` },
-    { header: 'Net', cell: (p) => `₹${((p.amount_received || 0) - (p.discount || 0)).toFixed(2)}` },
-    { header: 'Mode', cell: (p) => paymentModeLabel(p.payment_mode) },
-    { header: 'Cheque No. / UPI Txn ID', cell: (p) => paymentRef(p) },
-    { header: 'Remarks', cell: (p) => p.remarks || '-' }
-  ];
 
   if (loading) {
     return <Spinner label="Loading payments…" />;
@@ -1962,7 +2351,7 @@ export function Payments({ onNavigate }) {
                 'Bill No.': p.bill_number || '',
                 'Amount Received': p.amount_received || 0,
                 'Discount': p.discount || 0,
-                'Net Amount': (p.amount_received || 0) - (p.discount || 0),
+                'Net Amount': p.amount_received || 0,
                 'Payment Mode': paymentModeLabel(p.payment_mode),
                 'Cheque No.': p.payment_mode === 'CHEQUE' ? (p.cheque_number || '') : '',
                 'UPI Txn ID': (p.payment_mode === 'UPI' || p.payment_mode === 'ONLINE') ? (p.upi_transaction_id || '') : '',
@@ -2000,7 +2389,7 @@ export function Payments({ onNavigate }) {
         </div>
 
         <div className="table-container" style={{marginTop: '1rem'}}>
-          {filteredPayments.length === 0 ? (
+          {payments.length === 0 ? (
             <EmptyState icon="💰" message="No payments found" hint={searchTerm ? 'Try a different search.' : 'Record your first payment above.'} />
           ) : (
             <table>
@@ -2020,7 +2409,7 @@ export function Payments({ onNavigate }) {
                 </tr>
               </thead>
               <tbody>
-                {payVisible.map(payment => (
+                {payments.map(payment => (
                   <tr key={payment._id}>
                     <td><strong>{payment.receipt_number}</strong></td>
                     <td>{payment.challan_no || '-'}</td>
@@ -2029,7 +2418,7 @@ export function Payments({ onNavigate }) {
                     <td>{payment.bill_number || '-'}</td>
                     <td>₹{(payment.amount_received || 0).toFixed(2)}</td>
                     <td>₹{(payment.discount || 0).toFixed(2)}</td>
-                    <td><strong>₹{((payment.amount_received || 0) - (payment.discount || 0)).toFixed(2)}</strong></td>
+                    <td><strong>₹{(payment.amount_received || 0).toFixed(2)}</strong></td>
                     <td>{paymentModeLabel(payment.payment_mode)}</td>
                     <td>{paymentRef(payment)}</td>
                     <td>{payment.remarks || '-'}</td>
@@ -2038,23 +2427,20 @@ export function Payments({ onNavigate }) {
               </tbody>
             </table>
           )}
-          {payMore && <ViewAllButton count={filteredPayments.length} onClick={() => setPayOpen(true)} />}
-          <Pagination pagination={payPagination} onPageChange={(p) => setPayPage(p)} />
+          <BatchListFooter shown={payments.length} total={total} loadedAll={loadedAll}
+            loadingAll={loadingAll} onLoadAll={loadAll} noun="payments" />
         </div>
-
-        {payOpen && (
-          <ListModal title="Payment History" items={filteredPayments} columns={payColumns}
-            searchKeys={['receipt_number', 'challan_no', 'company_name', (p) => p.amount_received, (p) => formatDate(p.date)]}
-            searchPlaceholder="Search by receipt no., challan no., customer, amount, or date…"
-            onClose={() => setPayOpen(false)} />
-        )}
 
         <div style={{marginTop: '1rem', padding: '1rem', backgroundColor: '#f8f9fa', borderRadius: '4px'}}>
           <h4>Summary</h4>
-          <p><strong>Total Payments:</strong> {payPagination ? payPagination.total : filteredPayments.length}</p>
-          <p><strong>Total Amount Received:</strong> ₹{filteredPayments.reduce((sum, p) => sum + (p.amount_received || 0), 0).toFixed(2)}</p>
-          <p><strong>Total Discount Given:</strong> ₹{filteredPayments.reduce((sum, p) => sum + (p.discount || 0), 0).toFixed(2)}</p>
-          <p><strong>Net Amount:</strong> ₹{filteredPayments.reduce((sum, p) => sum + (p.amount_received || 0) - (p.discount || 0), 0).toFixed(2)}</p>
+          <p><strong>Total Payments:</strong> {total}</p>
+          <p style={{fontSize: '0.8rem', color: 'var(--text-muted)', margin: '0 0 0.4rem'}}>
+            {loadedAll ? 'Totals below cover all payments.'
+                       : `Totals below cover the ${payments.length} loaded so far — use View All for the full figures.`}
+          </p>
+          <p><strong>Total Amount Received:</strong> ₹{payments.reduce((sum, p) => sum + (p.amount_received || 0), 0).toFixed(2)}</p>
+          <p><strong>Total Discount Given:</strong> ₹{payments.reduce((sum, p) => sum + (p.discount || 0), 0).toFixed(2)}</p>
+          <p><strong>Net Amount:</strong> ₹{payments.reduce((sum, p) => sum + (p.amount_received || 0), 0).toFixed(2)}</p>
         </div>
       </div>
     </div>
@@ -2179,7 +2565,7 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
 
       {formData.amount_received > 0 && (
         <div style={{padding: '0.75rem 1rem', backgroundColor: '#e7f3ff', borderRadius: '4px', margin: '0.25rem 0 0'}}>
-          <p style={{margin: 0}}><strong>Net Amount: ₹{((parseFloat(formData.amount_received) || 0) - (parseFloat(formData.discount) || 0)).toFixed(2)}</strong></p>
+          <p style={{margin: 0}}><strong>Net Amount: ₹{(parseFloat(formData.amount_received) || 0).toFixed(2)}</strong></p>
         </div>
       )}
 
@@ -2202,7 +2588,7 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
     physical_number: cylinder?.physical_number || '',
     gas_type: cylinder?.gas_type || '',
     capacity: cylinder?.capacity || '',
-    location: cylinder?.location || 'AT_PLANT_CHANDISAR',
+    location: cylinder?.location || LOCATIONS[0] || '',
     stock_state: cylinder?.stock_state || 'IN_STOCK',
     under_maintenance: cylinder?.under_maintenance || false
   });
@@ -2211,9 +2597,11 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
   const CAPACITIES = formData.gas_type ? (GAS_CAPACITIES[formData.gas_type] || []) : [];
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
-  // Gas type / capacity edits use the same gate as the maintenance toggle (Phase 9):
-  // only while the cylinder is IN_STOCK at Chandisar Plant. Backend re-enforces.
-  const typeLocked = isEdit && !(cylinder.location === 'AT_PLANT_CHANDISAR' && cylinder.stock_state === 'IN_STOCK');
+  // Gas type / capacity edits stay gated to IN_STOCK at the FILLING site (Phase 9) — re-designating
+  // a cylinder is a plant job. Read from the live registry: the old literal 'AT_PLANT_CHANDISAR' is
+  // a pre-GEN-B1 code that no account has any more, so this gate was permanently ON for everyone.
+  // Backend re-enforces.
+  const typeLocked = isEdit && !(cylinder.location === fillingLocationCode() && cylinder.stock_state === 'IN_STOCK');
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -2325,17 +2713,33 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
                   onChange={(e) => {
                     const v = e.target.value;
                     if (v === 'UNDER_MAINTENANCE') {
-                      setFormData({...formData, stock_state: 'IN_STOCK', under_maintenance: true, location: 'AT_PLANT_CHANDISAR'});
+                      // Leave `location` alone. It used to be forced to the literal
+                      // 'AT_PLANT_CHANDISAR', which no longer exists in any account's registry —
+                      // so every save from this dropdown was rejected with
+                      // `Unknown location "AT_PLANT_CHANDISAR"`. Servicing happens at the workshop,
+                      // and the option below is only offered when the cylinder is already standing
+                      // there, so flagging never has to move it.
+                      setFormData({...formData, stock_state: 'IN_STOCK', under_maintenance: true});
                     } else {
                       setFormData({...formData, stock_state: v, under_maintenance: false});
                     }
                   }}>
                   <option value="IN_STOCK">In Stock</option>
                   <option value="AT_CUSTOMER">At Customer</option>
-                  <option value="UNDER_MAINTENANCE">Under Maintenance</option>
+                  {/* Offered only when the cylinder already stands at the workshop. The server
+                      enforces the same rule, so a stale page cannot get round it. */}
+                  <option value="UNDER_MAINTENANCE"
+                    disabled={formData.location !== maintenanceLocationCode()}>
+                    Under Maintenance
+                  </option>
                 </select>
                 <small style={{color:'var(--text-muted)', fontSize:'0.78rem'}}>
                   Normally derived from bills — set manually only for onboarding corrections.
+                  {formData.location !== maintenanceLocationCode() && (
+                    <> Cylinders are serviced at{' '}
+                      <strong>{locationText(maintenanceLocationCode())}</strong>; transfer it there
+                      before putting it under maintenance.</>
+                  )}
                 </small>
               </div>
             </div>
@@ -2594,21 +2998,22 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
   };
 
   // ── Filter-group toggles ──
-  // Location: "All" clears the set; picking sites toggles them. While Under Maintenance is
-  // selected, location is forced to Chandisar-only (maintenance exists only there).
+  // Location: "All" clears the set; picking sites toggles them. Under Maintenance pins the
+  // location filter to the workshop, because that is the only site a flagged cylinder can stand at.
   const toggleLocation = (loc) => {
-    if (maintenanceView && loc !== 'AT_PLANT_CHANDISAR') return;
+    if (maintenanceView && loc !== maintenanceLocationCode()) return;
     setLocFilters(prev => prev.includes(loc) ? prev.filter(l => l !== loc) : [...prev, loc]);
   };
   const toggleState = (st) => {
     setStateFilters(prev => {
       const next = prev.includes(st) ? prev.filter(x => x !== st) : [...prev, st];
-      if (next.includes('UNDER_MAINTENANCE')) setLocFilters(['AT_PLANT_CHANDISAR']);
+      const shop = maintenanceLocationCode();
+      if (next.includes('UNDER_MAINTENANCE') && shop) setLocFilters([shop]);
       return next;
     });
   };
 
-  // ── Maintenance toggle (backend re-enforces the Chandisar + IN_STOCK gate) ──
+  // ── Maintenance toggle (backend re-enforces the workshop + IN_STOCK gate) ──
   const confirmMaintenance = async () => {
     if (!maintTarget) return;
     setMaintSaving(true);
@@ -2663,12 +3068,16 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
   const maintenanceButton = (c) => {
     if (c.under_maintenance) {
       return (
-        <button className="btn btn-secondary" title="Return to stock (back to In Stock at Chandisar)"
+        <button className="btn btn-secondary" title={`Return to stock at ${locationText(c.location)}`}
           style={{padding:'0.25rem 0.55rem'}}
           onClick={(e) => { e.stopPropagation(); setMaintTarget({ cyl: c, on: false }); }}>↩️</button>
       );
     }
-    if (c.stock_state === 'IN_STOCK' && c.location === 'AT_PLANT_CHANDISAR') {
+    // Servicing happens at the designated maintenance site only, so the toggle appears only on
+    // rows standing there. Read from the live registry: the old gate compared against the literal
+    // 'AT_PLANT_CHANDISAR', which matches no location in a GEN-B1 registry, so this button was
+    // hidden on EVERY row at every site and no cylinder could be flagged at all.
+    if (c.stock_state === 'IN_STOCK' && c.location === maintenanceLocationCode()) {
       return (
         <button className="btn btn-secondary" title="Move to maintenance"
           style={{padding:'0.25rem 0.55rem'}}
@@ -2787,15 +3196,15 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
             <span style={{fontSize:'0.78rem', color:'var(--text-muted)', marginRight:'0.35rem'}}>Location:</span>
             <button className={`btn ${locFilters.length === 0 ? 'btn-primary' : 'btn-secondary'}`}
               disabled={maintenanceView}
-              title={maintenanceView ? 'Locked to Chandisar while Under Maintenance is selected' : undefined}
+              title={maintenanceView ? 'Pinned to the maintenance location' : undefined}
               onClick={() => setLocFilters([])}>All</button>
             {LOCATIONS.map(l => {
-              const disabled = maintenanceView && l !== 'AT_PLANT_CHANDISAR';
+              const disabled = maintenanceView && l !== maintenanceLocationCode();
               return (
                 <button key={l}
                   className={`btn ${locFilters.includes(l) ? 'btn-primary' : 'btn-secondary'}`}
                   disabled={disabled}
-                  title={disabled ? 'Maintenance only exists at Chandisar Plant' : undefined}
+                  title={disabled ? 'Cylinders are only serviced at the maintenance location' : undefined}
                   style={disabled ? {opacity:0.5, cursor:'not-allowed'} : {}}
                   onClick={() => toggleLocation(l)}>{LOCATION_LABELS[l]}</button>
               );
@@ -3358,6 +3767,14 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
               <div>{bill.transaction_category === 'INTERNAL_TRANSFER'
                 ? `${locationText(bill.from_location)} → ${locationText(bill.to_location)}`
                 : locationText(bill.location)}</div>
+              {/* A cross-site return moves the cylinder between branches without a transfer
+                  document, so the bill used to show one location and nothing else — the reader had
+                  to open the cylinder's own history to learn it had come from somewhere else. */}
+              {crossSiteOrigins(bill).length > 0 && (
+                <div style={{fontSize:'0.74rem', color:'var(--warning, #b45309)', marginTop:'0.15rem'}}>
+                  ↩ taken back here from {crossSiteOrigins(bill).map(locationText).join(', ')}
+                </div>
+              )}
             </div>
             <div><div style={{fontSize:'0.72rem', color:'var(--text-muted)'}}>Challan No.</div><div>{bill.challan_no || '-'}</div></div>
             {bill.vehicle_number ? (
@@ -3381,6 +3798,11 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
                     <td>{directionLabel(li.direction)}</td><td>{li.gas_type_name}</td><td>{li.size_label}</td>
                     <td>{li.serial_number}
                       {p > 0 && <span style={{color:'var(--text-2)'}}>{li.serial_number ? ', ' : ''}(Personal Cyl. ×{p})</span>}
+                      {li.issued_from_location && (
+                        <div style={{fontSize:'0.72rem', color:'var(--warning, #b45309)'}}>
+                          issued from {locationText(li.issued_from_location)}
+                        </div>
+                      )}
                     </td>
                     <td>{p > 0 ? `${inv} + ${p} personal` : inv}</td>
                     <td>₹{(li.rate || 0).toFixed(2)}</td><td>₹{(li.amount || 0).toFixed(2)}</td>
@@ -3405,7 +3827,7 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
                       <td>{formatDate(p.date)}</td>
                       <td>₹{(p.amount_received || 0).toFixed(2)}</td>
                       <td>₹{(p.discount || 0).toFixed(2)}</td>
-                      <td>₹{((p.amount_received || 0) - (p.discount || 0)).toFixed(2)}</td>
+                      <td>₹{(p.amount_received || 0).toFixed(2)}</td>
                       <td>{paymentModeLabel(p.payment_mode)}</td>
                       <td>{paymentRef(p)}</td>
                     </tr>
