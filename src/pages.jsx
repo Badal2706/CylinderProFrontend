@@ -9,7 +9,7 @@ import {
   Pagination, useDebounce, useBatchList, BatchListFooter, useLocations,
   purityDefaultsFor, fillingLocationCode, maintenanceLocationCode
 } from './App.jsx';
-import { printSavedBill, printHoldingStatement, printPurityCertificate, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
+import { printSavedBill, printHoldingStatement, printPurityCertificate, printNotesBlock, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
 
 // Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time (the user's LOCAL wall-clock) into an
 // absolute UTC instant, so a server in a different timezone stores the exact moment and re-edits
@@ -66,13 +66,36 @@ export function paymentRef(p) {
   return '-';
 }
 
-// Business name for print/PDF headers — from the saved Business Profile, default "GURU Industries".
+// Business name for print/PDF headers — from the saved Business Profile; '' when it is not set.
+// The whole business profile. getBusinessName below is kept for the callers that only need the
+// name; anything that prints the notes block needs the record, because the wording AND the
+// per-document flags both live on it.
+export async function getBusinessProfile() {
+  try {
+    const r = await apiFetch(`${API_URL}/profile/business`);
+    if (r.ok) return (await r.json()) || {};
+  } catch {}
+  return {};
+}
+
+// The business's own name, or '' when they have not filled one in. It used to fall back to the
+// first client's name, which meant a second client's reports printed a heading naming somebody
+// else's company. Callers must handle '' — every one of them omits the heading line rather than
+// printing a placeholder, because a blank space is honest and a wrong company name is not.
 export async function getBusinessName() {
   try {
     const r = await apiFetch(`${API_URL}/profile/business`);
-    if (r.ok) { const b = await r.json(); return b.business_name || 'GURU Industries'; }
+    if (r.ok) { const b = await r.json(); return String((b && b.business_name) || '').trim(); }
   } catch {}
-  return 'GURU Industries';
+  return '';
+}
+
+// "GURU Industries — Daily Sales Report" style print headings. An account that has not entered a
+// business name gets just the report title: the separator is part of the name, so it goes with it
+// rather than leaving a document that opens with a stray dash.
+export function printTitlePrefix(name) {
+  const s = String(name || '').trim();
+  return s ? `${esc(s)} — ` : '';
 }
 
 // Small amber badge for cross-customer returns. Clickable → opens the counterparty customer.
@@ -312,7 +335,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       tr:nth-child(even) td{background:#f8fafc}
       @page{margin:12mm}
     </style></head><body>
-    <h2>${esc(bizName)} — Customer Report: ${esc(customer.company_name)}</h2>
+    <h2>${printTitlePrefix(bizName)}Customer Report: ${esc(customer.company_name)}</h2>
     <p style="color:#64748b;font-size:10px;margin-bottom:12px">Generated: ${formatDateTime(new Date())}</p>
     ${infoTable}${givenSec}${recvSec}${pymtSec}
     <script>window.onload=function(){window.print();window.onafterprint=function(){window.close()}}<\/script>
@@ -1618,7 +1641,10 @@ export function getReportRows(reportType, data) {
 // Open a clean popup window with just the table, then trigger browser print → Save as PDF
 export async function printReportPopup(title, rows, fileName) {
   if (!rows || rows.length === 0) { showToast('No data to print', 'info'); return; }
-  const bizName = await getBusinessName();
+  // The full profile, not just the name: the printed notes block reads its wording and its
+  // per-document flags from the same record.
+  const business = await getBusinessProfile();
+  const bizName = String(business.business_name || '').trim();
   const headers = Object.keys(rows[0]);
   const th = headers.map(h => `<th>${esc(h)}</th>`).join('');
   const tb = rows.map(r =>
@@ -1637,11 +1663,18 @@ export async function printReportPopup(title, rows, fileName) {
     th{background:#1e293b;color:#fff;padding:7px 10px;text-align:left;font-size:10px;font-weight:600}
     td{padding:6px 10px;border-bottom:1px solid #e2e8f0;font-size:10px}
     tr:nth-child(even) td{background:#f8fafc}
+    /* Same look as the challan's notes block; this popup has its own minimal stylesheet
+       rather than printDocStyles, so the three rules it needs are repeated here. */
+    .foot{margin-top:14px}
+    .note-h{font-weight:700;font-size:12.5px;font-family:'Noto Sans Gujarati','Shruti','Arial Unicode MS',sans-serif}
+    .note{font-size:12px;line-height:1.7;font-family:'Noto Sans Gujarati','Shruti','Arial Unicode MS',sans-serif}
+    .eng{margin-top:7px;font-size:12px;font-weight:600}
     @page{margin:15mm}
   </style></head><body>
-  <h2>${esc(bizName)} — ${esc(title)}</h2>
+  <h2>${printTitlePrefix(bizName)}${esc(title)}</h2>
   <div class="sub">Generated: ${formatDateTime(new Date())}</div>
   <table><thead><tr>${th}</tr></thead><tbody>${tb}</tbody></table>
+  ${printNotesBlock(business, 'reports')}
   <script>window.onload=function(){window.print();window.onafterprint=function(){window.close()}}<\/script>
   </body></html>`;
 
@@ -1873,7 +1906,7 @@ export function DSRReport() {
       .remarks .box{border:1px solid #94a3b8;border-radius:4px;height:110px;margin-top:6px}
       @page{margin:15mm}
     </style></head><body>
-    <h2>${esc(bizName)} — Daily Sales Report (DSR)</h2>
+    <h2>${printTitlePrefix(bizName)}Daily Sales Report (DSR)</h2>
     <div class="sub">Generated: ${formatDateTime(new Date())}</div>
     <div class="meta"><strong>Location:</strong> ${esc(data.location_label)} &nbsp;·&nbsp; <strong>Date:</strong> ${formatDate(data.date)} &nbsp;·&nbsp; <strong>Reporting Person:</strong> ${esc(data.reporting_person || '—')}</div>
     <table><thead>${th}</thead><tbody>${tb}</tbody><tfoot>${tf}</tfoot></table>
@@ -2048,7 +2081,7 @@ export function StockSummaryReport() {
       .tot td{font-weight:700;border-top:2px solid #1e293b}
       @page{margin:15mm}
     </style></head><body>
-    <h2>${esc(bizName)} — Stock Summary · ${esc(data.location_label)} · ${formatDate(data.date)}</h2>
+    <h2>${printTitlePrefix(bizName)}Stock Summary · ${esc(data.location_label)} · ${formatDate(data.date)}</h2>
     <div class="sub">Generated: ${formatDateTime(new Date())}</div>
     ${mkTable('Filled Cylinder Stock', [
       { header: 'Opening', get: (r) => r.filled.opening },
@@ -2128,7 +2161,7 @@ export function StockSummaryReport() {
             </div>
           )}
           <p style={{color:'var(--text-muted)', fontSize:'0.78rem', marginTop:'0.75rem'}}>
-            All figures derive automatically from bills and transfers ({data.filled_add_label === 'Filled Today' ? 'Chandisar’s "Filled Today" comes from the daily Filling List; ' : ''}the Empty table’s
+            All figures derive automatically from bills and transfers ({data.filled_add_label === 'Filled Today' ? `${locationText(fillingLocationCode())}’s "Filled Today" comes from the daily Filling List; ` : ''}the Empty table’s
             Issue row will later also reflect cylinders sent to filling vendors). A cylinder counts as "empty" while its latest
             movement is a customer return — this model will be refined after you use it in practice.
           </p>
@@ -2662,7 +2695,7 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
                 <label>Gas Type *</label>
                 <select className="form-control" value={formData.gas_type}
                   disabled={typeLocked}
-                  title={typeLocked ? 'Gas type can only be changed while In Stock at Chandisar Plant' : undefined}
+                  title={typeLocked ? `Gas type can only be changed while In Stock at ${locationText(fillingLocationCode())}` : undefined}
                   onChange={(e) => {
                     const gas = e.target.value;
                     // Reset capacity if it isn't valid for the newly chosen gas type.
@@ -2687,7 +2720,7 @@ export function CylinderModal({ cylinder, onClose, onSaved }) {
                 <select className="form-control" value={formData.capacity}
                   onChange={(e) => setFormData({...formData, capacity: e.target.value})}
                   disabled={!formData.gas_type || typeLocked}
-                  title={typeLocked ? 'Capacity can only be changed while In Stock at Chandisar Plant' : undefined}
+                  title={typeLocked ? `Capacity can only be changed while In Stock at ${locationText(fillingLocationCode())}` : undefined}
                   required>
                   <option value="">{formData.gas_type ? '-- Select Capacity --' : '-- Select gas type first --'}</option>
                   {CAPACITIES.map(c => (
@@ -3319,7 +3352,7 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
           title={maintTarget.on ? 'Move to maintenance?' : 'Return to stock?'}
           message={maintTarget.on
             ? `Move cylinder ${maintTarget.cyl.rotational_number} to Under Maintenance?`
-            : `Return cylinder ${maintTarget.cyl.rotational_number} to In Stock at Chandisar Plant?`}
+            : `Return cylinder ${maintTarget.cyl.rotational_number} to In Stock at ${locationText(maintTarget.cyl.location)}?`}
           confirmLabel={maintTarget.on ? 'Move to Maintenance' : 'Return to Stock'}
           loading={maintSaving}
           onConfirm={confirmMaintenance}
@@ -4781,12 +4814,16 @@ export function CylinderAgingReport({ onViewCustomer }) {
   );
 }
 
-// ─── Chandisar Filling List (Phase 11, redesigned Phase 13) ───
+// ─── Filling List (Phase 11, redesigned Phase 13) ───
 // Staff stage cylinder entries locally through the day and commit them with an explicit Save;
-// Edit reopens a saved day in the same staged view for further changes. Feeds ONLY the
-// Chandisar stock summary ("Filled Today" + the Empty-Issue component) — it never alters
+// Edit reopens a saved day in the same staged view for further changes. Feeds ONLY the FILLING
+// SITE'S stock summary ("Filled Today" + the Empty-Issue component) — it never alters
 // Cylinder.location/stock_state and never creates or touches a Bill.
+//
+// Which site that is comes from the account's own registry (the site flagged is_filling_location),
+// not from a plant name written into the headings.
 export function FillingListPage() {
+  useLocations();   // re-render the headings when the registry lands or the filling site moves
   const localToday = () => {
     const x = new Date();
     return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
@@ -4900,12 +4937,12 @@ export function FillingListPage() {
     <div>
       <div className="card">
         <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.75rem'}}>
-          <h2 style={{margin:0, border:'none', padding:0}}>⛽ Filling List — Chandisar Plant</h2>
+          <h2 style={{margin:0, border:'none', padding:0}}>⛽ Filling List — {locationText(fillingLocationCode())}</h2>
           <input type="date" className="form-control" style={{width:'auto'}} value={date} onChange={(e) => setDate(e.target.value)} />
         </div>
         <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'0.5rem'}}>
           Stage cylinders as they are filled, then press <strong>Save</strong> to commit the day's list.
-          This log only feeds the Chandisar Stock Summary — it never changes a cylinder's location/state and never creates a bill.
+          This log only feeds the {locationText(fillingLocationCode())} Stock Summary — it never changes a cylinder's location/state and never creates a bill.
         </p>
 
         {mode === 'edit' && (

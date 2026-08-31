@@ -51,19 +51,41 @@ export function directionText(d) {
 }
 
 // ── Business sites (multi-location cylinder tracking) ──
-// Phase GEN-B2: these are no longer constants. They start as the seed set so the very first render
-// (before the fetch lands) is never empty, then refreshLocations() replaces their CONTENTS with
-// whatever the account actually has.
+// Phase GEN-B2: these are no longer constants. refreshLocations() replaces their CONTENTS with
+// whatever the account actually has, as soon as the fetch lands.
+//
+// They used to START as one client's three sites, hardcoded, "so the first render is never
+// empty". That was the wrong cure: for that one account it was invisible, and for every other
+// account the app opened showing three plants they do not own until the fetch corrected it.
+//
+// The seed is now the LAST REGISTRY THIS BROWSER SAW, cached in localStorage by refreshLocations.
+// Same benefit — dropdowns are populated on the very first paint, and populated with this
+// account's real sites — and a browser that has never logged in simply starts empty for the
+// few hundred milliseconds before the fetch answers.
 //
 // CRITICAL: never reassign these bindings. Twenty-odd modules did `import { LOCATIONS }` and hold
 // a reference to THIS array object; `LOCATIONS = [...]` would leave every one of them pointing at
 // the old one. Mutate in place — splice and Object.keys/delete — so every importer sees the change.
-export const LOCATIONS = ['AT_PLANT_CHANDISAR', 'AT_PALANPUR_OFFICE', 'AT_CHHAPI_OFFICE'];
-export const LOCATION_LABELS = {
-  AT_PLANT_CHANDISAR: 'Chandisar Plant',
-  AT_PALANPUR_OFFICE: 'Palanpur Office',
-  AT_CHHAPI_OFFICE: 'Chhapi Office'
-};
+const LOCATION_CACHE_KEY = 'cylinderpro_locations_cache';
+function readCachedLocations() {
+  try {
+    const raw = localStorage.getItem(LOCATION_CACHE_KEY);
+    const v = raw ? JSON.parse(raw) : null;
+    if (v && Array.isArray(v.codes) && v.labels) return v;
+  } catch { /* unparseable or unavailable — start empty */ }
+  return { codes: [], labels: {} };
+}
+// Dropped on logout. The cache exists to make the FIRST paint of the next session correct; if the
+// next session is a different account, showing them the previous account's sites for half a second
+// is exactly the fault this replaced. Only the registry cache goes — the per-browser Active
+// Location preference (Phase 32) deliberately survives a logout, and is validated against
+// LOCATIONS before it is used anyway.
+export function clearLocationCache() {
+  try { localStorage.removeItem(LOCATION_CACHE_KEY); } catch { /* nothing to clear */ }
+}
+const __locSeed = readCachedLocations();
+export const LOCATIONS = [...__locSeed.codes];
+export const LOCATION_LABELS = { ...__locSeed.labels };
 export function locationText(loc) { return LOCATION_LABELS[loc] || loc || '—'; }
 
 // The full records behind the two exports above — label, filling flag, manager, etc. Read by the
@@ -219,6 +241,13 @@ export async function refreshLocations() {
     Object.keys(LOCATION_LABELS).forEach(k => { delete LOCATION_LABELS[k]; });
     profiles.forEach(p => { LOCATION_LABELS[p.location] = p.label || p.location; });
 
+    // Remember them so the NEXT first paint in this browser starts with this account's own sites
+    // instead of an empty dropdown. Cache only — the fetch above is always the authority.
+    try {
+      localStorage.setItem(LOCATION_CACHE_KEY,
+        JSON.stringify({ codes: [...LOCATIONS], labels: { ...LOCATION_LABELS } }));
+    } catch { /* private mode / quota — the app works without the cache */ }
+
     window.dispatchEvent(new CustomEvent('locations-updated'));
     return true;
   } catch {
@@ -229,8 +258,8 @@ export async function refreshLocations() {
 // ─── Active Location — per-browser preference (Phase 32) ───
 // The default site for new transactions and location-aware report tabs is now stored PER
 // BROWSER in localStorage, not shared on the account. Switching it in one browser never changes
-// what any other browser/device defaults to. First visit (no stored value) falls back to
-// Chandisar Plant. Everything else on the settings page (Manager Name / Contact / Challan
+// what any other browser/device defaults to. First visit (no stored value) falls back to the
+// account's own first site. Everything else on the settings page (Manager Name / Contact / Challan
 // Prefix per site) remains shared/global on the account.
 const ACTIVE_LOCATION_KEY = 'cylinderpro_active_location';
 export function getActiveLocation() {
@@ -238,7 +267,10 @@ export function getActiveLocation() {
     const v = localStorage.getItem(ACTIVE_LOCATION_KEY);
     if (v && LOCATIONS.includes(v)) return v;
   } catch { /* localStorage unavailable */ }
-  return 'AT_PLANT_CHANDISAR'; // sensible first-visit default
+  // First visit: this account's own first site. It used to name one client's plant, which for
+  // anybody else was a code their account does not contain — every location-aware screen then
+  // filtered on a site that does not exist and showed nothing.
+  return LOCATIONS[0] || '';
 }
 export function setActiveLocation(loc) {
   try { if (LOCATIONS.includes(loc)) localStorage.setItem(ACTIVE_LOCATION_KEY, loc); } catch { /* ignore */ }
@@ -1076,6 +1108,8 @@ export async function apiFetch(url, options = {}) {
   if (res.status === 401) {
     localStorage.removeItem('authToken');
     localStorage.removeItem('currentUser');
+    clearLocationCache();
+    clearBusinessNameCache();
     window.dispatchEvent(new CustomEvent('auth-logout', {
       detail: { message: 'Your session has expired. Please log in again.' }
     }));
@@ -1111,6 +1145,47 @@ export async function readListResponse(res, fallback = 'Could not load this list
   return { ok: true, rows, pagination: (body && body.pagination) || null, error: null };
 }
 
+// ─── The business's own name, cached for the places that cannot wait for a fetch ───
+// Export file names are built synchronously, deep inside click handlers, by getExportFileName().
+// There is nowhere in that path to await /profile/business — which is why a literal brand name
+// was compiled in, and why every client's export downloaded named after the first client.
+//
+// So the name is fetched ONCE per session (alongside the location registry, on login) and cached
+// here and in localStorage, exactly like LOCATIONS above. Callers get a synchronous answer, and it
+// is this account's answer.
+const BRAND_CACHE_KEY = 'cylinderpro_brand';
+let BUSINESS_NAME = (() => {
+  try { return localStorage.getItem(BRAND_CACHE_KEY) || ''; } catch { return ''; }
+})();
+export function businessName() { return BUSINESS_NAME; }
+
+/** Refreshed on login. Also drives the browser tab title. */
+export async function refreshBusinessName() {
+  try {
+    const res = await apiFetch(`${API_URL}/profile/business`);
+    if (!res.ok) return false;
+    const b = await res.json();
+    BUSINESS_NAME = String((b && b.business_name) || '').trim();
+    try {
+      if (BUSINESS_NAME) localStorage.setItem(BRAND_CACHE_KEY, BUSINESS_NAME);
+      else localStorage.removeItem(BRAND_CACHE_KEY);
+    } catch { /* private mode — the in-memory copy still works for this session */ }
+    applyDocumentTitle();
+    return true;
+  } catch { return false; }
+}
+
+/** The tab title: the business's name when it has one, the product name when it does not. */
+export function applyDocumentTitle() {
+  try { document.title = BUSINESS_NAME ? `${BUSINESS_NAME} — CylinderPro` : 'CylinderPro'; } catch {}
+}
+
+export function clearBusinessNameCache() {
+  BUSINESS_NAME = '';
+  try { localStorage.removeItem(BRAND_CACHE_KEY); } catch {}
+  applyDocumentTitle();
+}
+
 // ─── Shared context-aware file-name helpers (print PDFs + Excel/ZIP exports) ───
 // Format any date as DD-MM-YYYY for use in file names.
 export function fileDateStr(d) {
@@ -1136,7 +1211,11 @@ export function getExportFileName(context, extras = {}) {
   const cust = sanitizeNamePart(extras.customerName);
   const bill = sanitizeNamePart(extras.billNo);
   const rcpt = sanitizeNamePart(extras.receiptNo);
-  const BRAND = 'GURUIndustries';
+  // The account's own name, or the product name for an account that has not filled one in yet —
+  // never a compiled-in one, which would put another business's name on this one's downloads.
+  // Spaces are squeezed out rather than turned into underscores so the existing account's exports
+  // keep the exact file names they have always had ("GURU Industries" -> GURUIndustries).
+  const BRAND = sanitizeNamePart(String(businessName()).replace(/\s+/g, '')) || 'CylinderPro';
   switch (context) {
     case 'bill':               return `${cust}_${bill}_${day}`;
     case 'receipt':            return `Receipt_${cust}_${rcpt}_${day}`;
@@ -1244,7 +1323,9 @@ export const IMPORT_SCHEMAS = {
       physical_number: 'PHY-001',
       gas_type: 'Oxygen',
       capacity: '7 m3',
-      location: 'AT_PLANT_CHANDISAR',
+      // Filled in from the account's own registry when the template is generated, so the example
+      // row shows a site the person downloading it actually has.
+      location: '',
       stock_state: 'IN_STOCK'
     }
   }
@@ -1337,6 +1418,28 @@ export function validateCustomerRow(raw, ctx) {
   };
   return { data, errors };
 }
+// Resolve a spreadsheet's "location" cell against THIS ACCOUNT'S registry. Mirrors the backend's
+// matchLocation exactly — exact code, then exact label, then a loose contains-match on either the
+// label or the distinctive words of the code — so the preview a user sees before importing agrees
+// with what the server will actually do.
+//
+// This replaced three hardcoded substring tests for one client's site names, which meant a
+// different account's spreadsheet saying "Rajkot Depot" resolved to a plant they do not own.
+function matchImportLocation(v) {
+  const normKey = (x) => String(x == null ? '' : x).trim().toUpperCase().replace(/[\s-]+/g, '_');
+  const s = normKey(v);
+  if (!s) return null;
+  if (LOCATIONS.includes(s)) return s;
+  for (const code of LOCATIONS) if (normKey(LOCATION_LABELS[code]) === s) return code;
+  for (const code of LOCATIONS) {
+    const lab = normKey(LOCATION_LABELS[code]);
+    if (lab && (s.includes(lab) || lab.includes(s))) return code;
+    const words = code.replace(/^AT_/, '').split('_').filter(w => w.length > 2);
+    if (words.some(w => s.includes(w))) return code;
+  }
+  return null;
+}
+
 export function validateCylinderRow(raw, ctx) {
   const g = (k) => String(raw[k] == null ? '' : raw[k]).trim();
   const errors = [];
@@ -1378,14 +1481,11 @@ export function validateCylinderRow(raw, ctx) {
   }
 
   const locRaw = g('location');
-  let location = locRaw.toUpperCase().replace(/[\s-]+/g, '_');
-  if (location === '') location = 'AT_PLANT_CHANDISAR';
-  else if (!LOCATIONS.includes(location)) {
-    // Accept friendly spellings (matches backend normalizeLocation).
-    if (location.includes('CHANDISAR') || location.includes('PLANT')) location = 'AT_PLANT_CHANDISAR';
-    else if (location.includes('PALANPUR')) location = 'AT_PALANPUR_OFFICE';
-    else if (location.includes('CHHAPI')) location = 'AT_CHHAPI_OFFICE';
-    else push('location', 'INVALID_LOCATION', locRaw, `location '${locRaw}' is not valid — use ${LOCATIONS.join(', ')}.`);
+  let location = matchImportLocation(locRaw);
+  if (!locRaw.trim()) location = LOCATIONS[0] || '';
+  else if (!location) {
+    push('location', 'INVALID_LOCATION', locRaw,
+      `location '${locRaw}' is not valid — use ${LOCATIONS.join(', ') || 'one of your configured locations'}.`);
   }
 
   const ssRaw = g('stock_state');
@@ -1397,7 +1497,7 @@ export function validateCylinderRow(raw, ctx) {
   const data = {
     rotational_number, physical_number,
     gas_type: gas || gasRaw, capacity: capacity || capRaw,
-    location: LOCATIONS.includes(location) ? location : 'AT_PLANT_CHANDISAR',
+    location: LOCATIONS.includes(location) ? location : (LOCATIONS[0] || ''),
     stock_state: stock_state === 'AT_CUSTOMER' ? 'AT_CUSTOMER' : 'IN_STOCK'
   };
   return { data, errors };
@@ -1410,7 +1510,12 @@ export function downloadImportTemplate(which) {
   const schema = IMPORT_SCHEMAS[which];
   const cols = schema.columns;
   const headers = cols.map(importHeaderLabel);
-  const exampleRow = cols.map(c => schema.example[c.key] == null ? '' : schema.example[c.key]);
+  const exampleRow = cols.map(c => {
+    // The location example is the downloader's own first site — the template used to ship one
+    // client's plant code, which every other account would have had to know to delete.
+    if (c.key === 'location') return LOCATIONS[0] || '';
+    return schema.example[c.key] == null ? '' : schema.example[c.key];
+  });
 
   const wsMain = XLSX.utils.aoa_to_sheet([headers, exampleRow]);
 
@@ -2204,8 +2309,14 @@ export function App() {
   useEffect(() => { loadGasCatalog(); }, []);
 
   // Phase GEN-B2: pull the account's real locations as soon as there is a session. Until this
-  // lands the seed set is used, so nothing renders empty.
-  useEffect(() => { if (authToken) refreshLocations(); }, [authToken]);
+  // lands the cached registry from this browser's last session is used, so dropdowns are not empty.
+  // The business name comes down at the same moment, for the tab title and for export file names —
+  // both of which are built synchronously and cannot await a fetch of their own.
+  useEffect(() => {
+    if (!authToken) { applyDocumentTitle(); return; }
+    refreshLocations();
+    refreshBusinessName();
+  }, [authToken]);
 
   const handleAuthSuccess = (data) => {
     localStorage.setItem('authToken', data.token);
@@ -2218,6 +2329,8 @@ export function App() {
   const handleLogout = () => {
     localStorage.removeItem('authToken');
     localStorage.removeItem('currentUser');
+    clearLocationCache();
+    clearBusinessNameCache();
     setAuthToken(null);
     setCurrentUser(null);
   };
@@ -2289,7 +2402,9 @@ export function App() {
     'cylinders':       'Cylinder Inventory',
     'aging-report':    'Cylinder Aging Report',
     'transactions':    'Transaction History',
-    'filling-list':    'Filling List — Chandisar',
+    // Named after whichever site the account has designated as its filling location, not after
+    // one client's plant.
+    'filling-list':    `Filling List — ${locationText(fillingLocationCode())}`,
     'reports':         'Reports',
     'profile':         'Profile',
   };
@@ -4033,7 +4148,20 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         setAccount(a);
         setAcct({ name: a.name || '', phone: a.phone || '', email: a.email || '', current_password: '' });
       }
-      if (bRes.ok) setBusiness(await bRes.json());
+      if (bRes.ok) {
+        const b = await bRes.json();
+        setBusiness(b);
+        const n = b.print_notes || {};
+        setPrintNotes({
+          heading: n.heading || '', body: n.body || '', footer: n.footer || '',
+          show_on: {
+            challan: !!(n.show_on && n.show_on.challan),
+            holding_statement: !!(n.show_on && n.show_on.holding_statement),
+            purity_certificate: !!(n.show_on && n.show_on.purity_certificate),
+            reports: !!(n.show_on && n.show_on.reports)
+          }
+        });
+      }
       // Take the shared profiles from the server but keep Active Location per-browser (Phase 32).
       if (lRes.ok) { const ld = await lRes.json(); setLocData({ ...ld, active_location: getActiveLocation() }); }
     } catch (e) {
@@ -4091,6 +4219,11 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     });
   };
 
+  // Printed notes / terms. Held apart from `business` so the notes card saves on its own:
+  // it is edited far more often than the letterhead, and posting the whole profile to change
+  // one line would drag the logo along with it every time.
+  const [printNotes, setPrintNotes] = useState({ heading:'', body:'', footer:'', show_on:{ challan:true, holding_statement:false, purity_certificate:false, reports:false } });
+
   // Phase 25: pending authenticator rotation after an email change.
   const [totpRotation, setTotpRotation] = useState(null);
   // Phase 26: pending new-email verification, shown before anything is saved.
@@ -4108,9 +4241,39 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           const res = await apiFetch(`${API_URL}/profile/business`, {
             method:'PUT', headers: { 'x-step-up-token': auth.step_up_token }, body: JSON.stringify(business)
           });
-          if (res.ok) showToast('Business profile saved.', 'success');
+          if (res.ok) {
+            // The name feeds the tab title and every export file name from a synchronous cache;
+            // re-read it now so a rename takes effect without a re-login.
+            await refreshBusinessName();
+            showToast('Business profile saved.', 'success');
+          }
           else showToast(await apiErrorMessage(res));
         } catch {}
+      }
+    });
+  };
+
+  const savePrintNotes = (e) => {
+    e.preventDefault();
+    const where = Object.entries(printNotes.show_on).filter(([, on]) => on).map(([k]) => k);
+    setStepUpAsk({
+      title: 'Approve saving the printed notes',
+      context: where.length
+        ? `save the printed notes block and print it on: ${where.join(', ')}`
+        : 'save the printed notes block (currently printed on no document)',
+      action: async (auth) => {
+        try {
+          const res = await apiFetch(`${API_URL}/profile/business`, {
+            method: 'PUT',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({ print_notes: printNotes })
+          });
+          if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not save the notes.')); return; }
+          setBusiness(prev => ({ ...prev, print_notes: printNotes }));
+          showToast(where.length
+            ? 'Printed notes saved.'
+            : 'Printed notes saved — not printed on any document yet.', 'success');
+        } catch { showToast('Could not save the notes.'); }
       }
     });
   };
@@ -4623,6 +4786,113 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             </div>
           )}
           <button type="submit" className="btn btn-primary">Save Business Info</button>
+        </form>
+      </div>
+
+      {/* Printed notes / terms — the "નોંધ:" block at the foot of a challan. Its own card rather
+          than a field inside Business Information: it is long free text plus four switches, and it
+          is the thing a proprietor will come back to edit most often. */}
+      <div className="card">
+        <h2>Printed Notes &amp; Terms</h2>
+        <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
+          The notes printed at the foot of your documents. Type them in any language — they print
+          <strong> exactly as typed</strong>, one note per line. Leave everything blank and the
+          block is left off the page entirely.
+        </p>
+        <form onSubmit={savePrintNotes}>
+          <div className="form-group">
+            <label>Heading</label>
+            <input className="form-control" style={{maxWidth:'320px'}}
+              value={printNotes.heading}
+              placeholder="e.g. નોંધ:"
+              onChange={(e) => setPrintNotes({...printNotes, heading: e.target.value})} />
+            <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+              Printed in bold above the notes. Left off when blank.
+            </small>
+          </div>
+          <div className="form-group">
+            <label>Notes — one per line</label>
+            <textarea className="form-control" rows="6"
+              style={{resize:'vertical', fontFamily:"'Noto Sans Gujarati','Shruti',sans-serif", lineHeight:1.7}}
+              value={printNotes.body}
+              placeholder={'* First note\n* Second note'}
+              onChange={(e) => setPrintNotes({...printNotes, body: e.target.value})} />
+            <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+              Each line prints as its own note. Bullets or numbering are yours to type — nothing is
+              added or removed. Blank lines are skipped.
+            </small>
+          </div>
+          <div className="form-group">
+            <label>Closing lines (printed in bold)</label>
+            <textarea className="form-control" rows="3" style={{resize:'vertical'}}
+              value={printNotes.footer}
+              placeholder={'First check the Goods and then take delivery.\nSubject to <your city> Jurisdiction'}
+              onChange={(e) => setPrintNotes({...printNotes, footer: e.target.value})} />
+            <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+              Sits under the notes, emphasised — jurisdiction and inspection terms usually go here.
+            </small>
+          </div>
+
+          <div className="form-group">
+            <label>Print this block on</label>
+            <div style={{display:'grid', gridTemplateColumns:'repeat(auto-fit, minmax(230px, 1fr))', gap:'0.5rem'}}>
+              {[
+                { key:'challan',            label:'Delivery Challan',        hint:'The document handed over with cylinders.' },
+                { key:'holding_statement',  label:'Holding Statement',       hint:'What a customer currently holds.' },
+                { key:'purity_certificate', label:'Purity Test Certificate', hint:'A lab result — terms rarely belong here.' },
+                { key:'reports',            label:'Printed Reports',         hint:'DSR, aging, ledger and the rest.' }
+              ].map(opt => (
+                <label key={opt.key}
+                  style={{display:'flex', gap:'0.55rem', alignItems:'flex-start', padding:'0.6rem 0.7rem',
+                          border:'1px solid var(--border)', borderRadius:'8px', cursor:'pointer'}}>
+                  <input type="checkbox" style={{marginTop:'0.2rem'}}
+                    checked={!!printNotes.show_on[opt.key]}
+                    onChange={(e) => setPrintNotes({
+                      ...printNotes,
+                      show_on: { ...printNotes.show_on, [opt.key]: e.target.checked }
+                    })} />
+                  <span>
+                    <span style={{display:'block', fontWeight:600, fontSize:'0.86rem'}}>{opt.label}</span>
+                    <span style={{fontSize:'0.76rem', color:'var(--text-muted)'}}>{opt.hint}</span>
+                  </span>
+                </label>
+              ))}
+            </div>
+          </div>
+
+          {/* Exactly what will print, rendered from the same text the print path uses. */}
+          {(printNotes.heading.trim() || printNotes.body.trim() || printNotes.footer.trim()) && (
+            <div className="form-group">
+              <label>Preview</label>
+              <div style={{border:'1px solid var(--border)', borderRadius:'8px', padding:'0.9rem',
+                           background:'#fff', color:'#1e293b'}}>
+                {printNotes.heading.trim() && (
+                  <div style={{fontWeight:700, fontSize:'12.5px',
+                               fontFamily:"'Noto Sans Gujarati','Shruti',sans-serif"}}>
+                    {printNotes.heading.trim()}
+                  </div>
+                )}
+                <div style={{fontSize:'12px', lineHeight:1.7,
+                             fontFamily:"'Noto Sans Gujarati','Shruti',sans-serif"}}>
+                  {printNotes.body.split('\n').map(l => l.trim()).filter(Boolean)
+                    .map((l, i) => <div key={i}>{l}</div>)}
+                </div>
+                {printNotes.footer.trim() && (
+                  <div style={{marginTop:'7px', fontSize:'12px', fontWeight:600}}>
+                    {printNotes.footer.split('\n').map(l => l.trim()).filter(Boolean)
+                      .map((l, i) => <div key={i}>{l}</div>)}
+                  </div>
+                )}
+              </div>
+              <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                {Object.values(printNotes.show_on).some(Boolean)
+                  ? 'This is how it will print.'
+                  : 'No document is ticked above, so this block will not print anywhere yet.'}
+              </small>
+            </div>
+          )}
+
+          <button type="submit" className="btn btn-primary">Save Printed Notes</button>
         </form>
       </div>
 
@@ -5337,6 +5607,8 @@ export function DeleteAccountModal({ onClose, onDeleted }) {
         // Clear local session and bounce to login with a message.
         localStorage.removeItem('authToken');
         localStorage.removeItem('currentUser');
+        clearLocationCache();
+        clearBusinessNameCache();
         window.dispatchEvent(new CustomEvent('auth-logout', { detail: { message: 'Your account has been deleted.' } }));
       } else {
         showToast(await apiErrorMessage(res));

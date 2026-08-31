@@ -219,7 +219,7 @@ function printFitAndPrintScript() {
 // has to be fetched in between. openPrintTarget() MUST be the first synchronous statement of a
 // print handler — once an await has run, the window.open() is no longer a direct result of the
 // user's click and browsers block it as a popup.
-function openPrintTarget(name = 'guru_print') {
+function openPrintTarget(name = 'cylinderpro_print') {
   const w = window.open('', name, 'width=900,height=760,scrollbars=yes');
   if (!w) showToast('Please allow pop-ups to use Print / PDF.', 'info');
   return w;
@@ -234,6 +234,38 @@ function writePrintDoc(w, html) {
 // The letterhead is read FRESH on every print, never from mount-time state — editing Business
 // Info in another tab must never print a stale address. A failed fetch prints the document with
 // an empty letterhead rather than not printing at all.
+// ─── The printed notes / terms block ───
+// One renderer for all four printed documents, so the wording can never drift between them.
+//
+// `docKey` is which document is asking: 'challan' | 'holding_statement' | 'purity_certificate' |
+// 'reports'. The block appears only where the business has ticked it on in Settings, so turning it
+// on for a document is a deliberate act rather than something that happens by accident.
+//
+// Returns '' — not an empty <div> — when there is nothing to print or this document is not ticked.
+// A stray heading with no notes under it looks like a bug on a document handed to a customer.
+export function printNotesBlock(business, docKey) {
+  const n = (business && business.print_notes) || {};
+  const on = (n.show_on || {})[docKey];
+  if (!on) return '';
+
+  const heading = String(n.heading || '').trim();
+  const body = String(n.body || '');
+  const footer = String(n.footer || '');
+
+  // One note per line, blank lines dropped. The text is printed VERBATIM (escaped, never
+  // reformatted): a leading "*" or a numbering scheme is the proprietor's choice, not ours to
+  // impose or strip.
+  const lines = body.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const footLines = footer.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  if (!heading && !lines.length && !footLines.length) return '';
+
+  return `<div class="foot">
+    ${heading ? `<div class="note-h">${printEsc(heading)}</div>` : ''}
+    ${lines.length ? `<div class="note">${lines.map(printEsc).join('<br/>')}</div>` : ''}
+    ${footLines.length ? `<div class="eng">${footLines.map(printEsc).join('<br/>')}</div>` : ''}
+  </div>`;
+}
+
 async function fetchPrintIdentity() {
   try {
     const res = await apiFetch(`${API_URL}/profile/business`);
@@ -352,16 +384,7 @@ export async function printSavedBill(bill) {
   ${printCustomerBlock(bill, metaLeft, metaRight, { showVehicle: true })}
   ${mergedTable}
   ${transferSection}
-  <div class="foot">
-    <div class="note-h">નોંધ:</div>
-    <div class="note">
-      * સિલિન્ડર રીટર્ન આપતી વખતે સિલિન્ડર ખરાબ અથવા ડેમેજ હશે તો તેનો ચાર્જ અલગથી લેવામાં આવશે.<br/>
-      * ૧૦ દિવસ પછી સિલિન્ડરનું ભાડું આપવાનું રહેશે. (સિલિન્ડર દીઠ રૂ. ૧૦ પ્રતિ દિવસ)<br/>
-      * સિલિન્ડર જમા કરાવ્યાના ૨ થી ૫ દિવસ પછી ડિપોઝિટ રિટર્ન મળશે.<br/>
-      * કોઈપણ ગેસની વેલિડિટી ૩ મહિનાની હોય છે.
-    </div>
-    <div class="eng">First check the Goods and then take delivery.<br/>Subject to Palanpur Jurisdiction</div>
-  </div>
+  ${printNotesBlock(business, 'challan')}
   <div class="signs"><div>Customer Signature</div><div class="right">${esc(business.business_name || '')}<br/>Authorised Signature</div></div>
   ${printFitAndPrintScript()}
   </body></html>`;
@@ -430,6 +453,7 @@ export async function printHoldingStatement({ customer_name, customer_address, c
   ${printCustomerBlock(bill, '', `Date: <b>${formatDate(new Date())}</b>`)}
   ${table}
   ${breakdownTable ? `<h3 style="margin:16px 0 6px;font-size:12px">Breakdown by Type</h3>${breakdownTable}` : ''}
+  ${printNotesBlock(business, 'holding_statement')}
   <div class="signs"><div>Customer Signature</div><div class="right">${esc(business.business_name || '')}<br/>Authorised Signature</div></div>
   ${printFitAndPrintScript()}
   </body></html>`;
@@ -480,7 +504,7 @@ function printCertStyles() {
 }
 
 export async function printPurityCertificate(cert) {
-  const w = openPrintTarget('guru_certificate');    // FIRST statement — before any await
+  const w = openPrintTarget('cylinderpro_certificate');    // FIRST statement — before any await
   if (!w) return;
   const { business } = await fetchPrintIdentity();
   const esc = printEsc;
@@ -562,6 +586,7 @@ export async function printPurityCertificate(cert) {
 
   ${detail ? `<table class="cert-detail">${detail}</table>` : ''}
   ${impurityTable}
+  ${printNotesBlock(business, 'purity_certificate')}
   ${signature}
   ${printFitAndPrintScript()}
   </body></html>`;
@@ -704,11 +729,18 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   const [customers, setCustomers] = useState([]);
   // Defaults to SWAP (Phase 14): both Empty-from-Customer and Filled-to-Customer sections open.
   const [transactionType, setTransactionType] = useState('SWAP');
-  // Site the customer transaction happens at (required on every customer bill).
-  const [location, setLocation] = useState('AT_PLANT_CHANDISAR');
-  // Internal transfer: source and destination sites (must differ).
-  const [fromLocation, setFromLocation] = useState('AT_PLANT_CHANDISAR');
-  const [toLocation, setToLocation] = useState('AT_PALANPUR_OFFICE');
+  // Site the customer transaction happens at (required on every customer bill). Defaults to the
+  // site this browser is operating as, then to the account's first site — never to a compiled-in
+  // plant code, which for any other account is not in their registry at all and so left the
+  // <select> showing a value none of its <option>s carry.
+  const [location, setLocation] = useState(() => getActiveLocation() || LOCATIONS[0] || '');
+  // Internal transfer: source and destination sites (must differ) — so the destination starts on
+  // the first site that is NOT the source.
+  const [fromLocation, setFromLocation] = useState(() => getActiveLocation() || LOCATIONS[0] || '');
+  const [toLocation, setToLocation] = useState(() => {
+    const from = getActiveLocation() || LOCATIONS[0] || '';
+    return LOCATIONS.find(l => l !== from) || '';
+  });
   const [billDate, setBillDate] = useState(istDateInput());
   // Phase 34: time-of-day on the Bill Date, defaulting to now, always editable (incl. backdating).
   const [billTime, setBillTime] = useState(() => nowHHMM());
@@ -834,10 +866,12 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
       setLocProfiles(map);
       // Phase 32: the default site comes from THIS browser's Active Location (localStorage),
       // not the shared account. Still overridable per-transaction as before.
-      const active = getActiveLocation();
+      const active = getActiveLocation() || LOCATIONS[0] || '';
       setLocation(active);
       setFromLocation(active);
-      setToLocation(LOCATIONS.find(l => l !== active) || LOCATIONS[1]);
+      // '' rather than LOCATIONS[1] for a single-site account: there is no second site, and an
+      // undefined value in the <select> is what made "To" look blank-but-set.
+      setToLocation(LOCATIONS.find(l => l !== active) || '');
     } catch (e) {
       console.error('Error fetching location profiles:', e);
     }
