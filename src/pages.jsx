@@ -6,10 +6,10 @@ import {
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
   LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, stockStateText, cylinderStateText,
-  Pagination, useDebounce, useBatchList, BatchListFooter, useLocations,
+  useDebounce, useBatchList, BatchListFooter, useLocations, useLoadMore, LoadMoreFooter,
   purityDefaultsFor, fillingLocationCode, maintenanceLocationCode
 } from './App.jsx';
-import { printSavedBill, printHoldingStatement, printPurityCertificate, printNotesBlock, RentalSummaryModal, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
+import { printSavedBill, printHoldingStatement, printPurityCertificate, printNotesBlock, RentalSummaryModal, printRentalSummary, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
 
 // Phase 34: combine a 'YYYY-MM-DD' date + 'HH:MM' time (the user's LOCAL wall-clock) into an
 // absolute UTC instant, so a server in a different timezone stores the exact moment and re-edits
@@ -120,17 +120,15 @@ export function ReturnBadge({ text, customerId, onSelectCustomer }) {
 export const RETURN_ROW_STYLE = { background: '#fff7ed' };
 
 // Customer Detail Component
+// Safety ceiling on a single customer's history fetch. Not a page size — the tabs reveal these
+// rows ten at a time — but a bound so one screen can never pull an unbounded number of rows.
+const HISTORY_LIMIT = 500;
+
 export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo = null }) {
   const [customer, setCustomer] = useState(null);
   const [givenTransactions, setGivenTransactions] = useState([]);
-  const [givenPagination, setGivenPagination] = useState(null);
-  const [givenPage, setGivenPage] = useState(1);
   const [receivedTransactions, setReceivedTransactions] = useState([]);
-  const [receivedPagination, setReceivedPagination] = useState(null);
-  const [receivedPage, setReceivedPage] = useState(1);
   const [payments, setPayments] = useState([]);
-  const [paymentsPagination, setPaymentsPagination] = useState(null);
-  const [paymentsPage, setPaymentsPage] = useState(1);
   const [personalHistory, setPersonalHistory] = useState([]);
   const [detailBillId, setDetailBillId] = useState(null);
   const [editBillId, setEditBillId] = useState(null);
@@ -171,9 +169,9 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     try {
       const [customerRes, givenRes, receivedRes, paymentsRes, personalHistRes, agingRes, billsRes, certsRes] = await Promise.all([
         apiFetch(`${API_URL}/customers/${customerId}`),
-        apiFetch(`${API_URL}/customers/${customerId}/transactions/given?page=${givenPage}&limit=50`),
-        apiFetch(`${API_URL}/customers/${customerId}/transactions/received?page=${receivedPage}&limit=50`),
-        apiFetch(`${API_URL}/customers/${customerId}/payments?page=${paymentsPage}&limit=50`),
+        apiFetch(`${API_URL}/customers/${customerId}/transactions/given?page=1&limit=${HISTORY_LIMIT}`),
+        apiFetch(`${API_URL}/customers/${customerId}/transactions/received?page=1&limit=${HISTORY_LIMIT}`),
+        apiFetch(`${API_URL}/customers/${customerId}/payments?page=1&limit=${HISTORY_LIMIT}`),
         apiFetch(`${API_URL}/customers/${customerId}/personal-cylinder-history`),
         apiFetch(`${API_URL}/customers/${customerId}/aging`),
         apiFetch(`${API_URL}/bills?customer_id=${customerId}&limit=200`),
@@ -189,13 +187,10 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       const customerData = await customerRes.json();
       const givenRaw = givenRes.ok ? await givenRes.json() : [];
       const givenData = givenRaw.data || givenRaw;
-      if (givenRaw.pagination) setGivenPagination(givenRaw.pagination);
       const receivedRaw = receivedRes.ok ? await receivedRes.json() : [];
       const receivedData = receivedRaw.data || receivedRaw;
-      if (receivedRaw.pagination) setReceivedPagination(receivedRaw.pagination);
       const paymentsRaw = paymentsRes.ok ? await paymentsRes.json() : [];
       const paymentsData = paymentsRaw.data || paymentsRaw;
-      if (paymentsRaw.pagination) setPaymentsPagination(paymentsRaw.pagination);
       const personalHistData = personalHistRes.ok ? await personalHistRes.json() : [];
       const agingData = agingRes.ok ? await agingRes.json() : [];
       const billsRaw = billsRes.ok ? await billsRes.json() : [];
@@ -347,10 +342,10 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
   };
 
   // Paginated views — most recent first (backend already sorts -bill_date / -date).
-  const [givenVisible, givenMore, givenOpen, setGivenOpen] = useViewAll(givenTransactions, 10);
-  const [receivedVisible, receivedMore, receivedOpen, setReceivedOpen] = useViewAll(receivedTransactions, 10);
-  const [paymentsVisible, paymentsMore, paymentsOpen, setPaymentsOpen] = useViewAll(payments, 5);
-  const [pcHistVisible, pcHistMore, pcHistOpen, setPcHistOpen] = useViewAll(personalHistory, 5);
+  const givenMore_ = useLoadMore(givenTransactions, 10);
+  const receivedMore_ = useLoadMore(receivedTransactions, 10);
+  const paymentsMore_ = useLoadMore(payments, 10);
+  const pcHistMore_ = useLoadMore(personalHistory, 10);
 
   // Customer-scoped bill list (Phase 6) — same row shape as the global Transaction History.
   const billRows = customerBills.map(b => ({
@@ -376,7 +371,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
   // Cylinders this customer is currently holding (backend nets given vs. own returns, excluding
   // cross-customer returns). Most recent first.
   const heldCylinders = customer?.held_cylinders || [];
-  const [heldVisible, heldMore, heldOpen, setHeldOpen] = useViewAll(heldCylinders, 10);
+  const heldMore_ = useLoadMore(heldCylinders, 50);
   const daysHeld = (d) => d ? Math.floor((Date.now() - new Date(d).getTime()) / 86400000) : null;
   const heldColumns = [
     { header: 'Serial No.', cell: (c) => <strong>{c.serial_number}</strong> },
@@ -388,9 +383,37 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     { header: 'Challan No.', cell: (c) => c.challan_no || '-' }
   ];
 
+  // Past rental summaries for the picker on the Aging History heading. The list is deliberately
+  // lightweight (date, total, cylinder count); the full record is only fetched when one is
+  // actually reprinted, so opening a customer never pulls years of line items.
+  const [rentalHistory, setRentalHistory] = useState([]);
+  const [reprinting, setReprinting] = useState(false);
+
+  const loadRentalHistory = async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/customers/${customerId}/rental-charges`);
+      setRentalHistory(res.ok ? (await res.json()) || [] : []);
+    } catch { setRentalHistory([]); }
+  };
+  useEffect(() => { if (customerId) loadRentalHistory(); }, [customerId]);
+
+  // Reprint one. It fetches the SAVED record and hands it to the same printer the generate flow
+  // uses — nothing is recalculated, so a summary reprinted next year is the document that was
+  // issued, not today's arithmetic applied to old rows.
+  const reprintSummary = async (chargeId) => {
+    if (!chargeId || reprinting) return;
+    setReprinting(true);
+    try {
+      const res = await apiFetch(`${API_URL}/rental-charges/${chargeId}`);
+      if (!res.ok) { showToast(await apiErrorMessage(res, 'Could not load that summary.')); return; }
+      await printRentalSummary(await res.json());
+    } catch { showToast('Could not open that summary.'); }
+    finally { setReprinting(false); }
+  };
+
   // Cylinder Aging History pagination (Phase 31) — 10 rows + "View All", same pattern as
   // Currently Holding above. agingRows is the full dataset, so search in the modal sees everything.
-  const [agingVisible, agingMore, agingOpen, setAgingOpen] = useViewAll(agingRows, 10);
+  const agingMore_ = useLoadMore(agingRows, 10);
   const agingColumns = [
     { header: 'Rotational No.', cell: (r) => <strong>{r.serial_number}</strong> },
     { header: 'Gas Type', cell: (r) => r.gas_type },
@@ -705,7 +728,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {pcHistVisible.map((r, i) => (
+                {pcHistMore_.visible.map((r, i) => (
                   <tr key={`${r.bill_id}-${i}`}>
                     <td>{formatDate(r.date)}</td>
                     <td>
@@ -723,7 +746,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 ))}
               </tbody>
             </table>
-            {pcHistMore && <ViewAllButton count={personalHistory.length} onClick={() => setPcHistOpen(true)} />}
+            {<LoadMoreFooter hasMore={pcHistMore_.hasMore} remaining={pcHistMore_.remaining} step={10} total={pcHistMore_.total} onLoadMore={pcHistMore_.loadMore} showTotal />}
           </div>
         </div>
       )}
@@ -825,7 +848,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {heldVisible.map((c, i) => {
+                {heldMore_.visible.map((c, i) => {
                   const d = daysHeld(c.date_given);
                   return (
                     <tr key={c.serial_number + '-' + i}>
@@ -842,21 +865,48 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 })}
               </tbody>
             </table>
-            {heldMore && <ViewAllButton count={heldCylinders.length} onClick={() => setHeldOpen(true)} />}
+            {<LoadMoreFooter hasMore={heldMore_.hasMore} remaining={heldMore_.remaining} step={50} total={heldMore_.total} onLoadMore={heldMore_.showAll} all />}
           </div>
         )}
       </div>
 
-      {heldOpen && (
-        <ListModal title="Currently Holding Cylinders" items={heldCylinders} columns={heldColumns}
-          searchKeys={['serial_number', 'gas_type_name', 'size_label', 'bill_number', 'challan_no']}
-          searchPlaceholder="Search by serial no., gas type, size, bill, or challan…"
-          onClose={() => setHeldOpen(false)} />
-      )}
-
-      {/* Cylinder Aging History (Phase 4): days-held per currently-held cylinder + rental calculator */}
+      {/* Cylinder Aging History (Phase 4): days-held per currently-held cylinder + rental calculator.
+          The calculator and the past-summaries picker sit ON the heading line rather than in a row
+          of their own under the table — the row below the table pushed the card taller for two
+          controls that belong to the section, not to the last table row. */}
       <div className="card" id="aging-history">
-        <h2>Cylinder Aging History ({agingRows.length})</h2>
+        <div style={{display:'flex', justifyContent:'space-between', alignItems:'center',
+                     gap:'0.75rem', flexWrap:'wrap'}}>
+          <h2 style={{margin:0, border:'none', padding:0}}>Cylinder Aging History ({agingRows.length})</h2>
+          <div style={{display:'flex', gap:'0.5rem', alignItems:'center', flexWrap:'wrap'}}>
+            {/* Shown even with nothing in it, and disabled instead of hidden: a control that only
+                appears once you already have history is a control nobody discovers. */}
+            <select className="form-control"
+              style={{width:'auto', maxWidth:'15rem', fontSize:'0.82rem', padding:'0.3rem 0.5rem'}}
+              value=""
+              disabled={rentalHistory.length === 0 || reprinting}
+              title={rentalHistory.length === 0
+                ? 'Rental summaries you generate will be listed here to reprint'
+                : 'Reprint a previously generated summary'}
+              onChange={(e) => { if (e.target.value) reprintSummary(e.target.value); }}>
+              <option value="">
+                {reprinting ? 'Opening…'
+                  : rentalHistory.length === 0 ? 'Previous Summaries (none yet)'
+                  : `Previous Summaries (${rentalHistory.length})`}
+              </option>
+              {rentalHistory.map(h => (
+                <option key={h._id} value={h._id}>
+                  {formatDate(h.generated_date)} — ₹{(h.total_amount || 0).toFixed(2)}
+                  {h.line_count ? ` · ${h.line_count} cyl.` : ''}
+                </option>
+              ))}
+            </select>
+            {agingRows.length > 0 && (
+              <button className="btn btn-primary" style={{whiteSpace:'nowrap'}}
+                onClick={() => setShowRental(true)}>🧮 Calculate Rental Summary</button>
+            )}
+          </div>
+        </div>
         <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
           How long each cylinder has been with this customer, and the site it was issued from.
         </p>
@@ -872,7 +922,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {agingVisible.map((r) => (
+                {agingMore_.visible.map((r) => (
                   <tr key={r.serial_number}>
                     <td><strong>{r.serial_number}</strong></td>
                     <td>{r.gas_type}</td>
@@ -884,29 +934,17 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 ))}
               </tbody>
             </table>
-            {agingMore && <ViewAllButton count={agingRows.length} onClick={() => setAgingOpen(true)} />}
-          </div>
-        )}
-        {agingRows.length > 0 && (
-          <div style={{display:'flex', justifyContent:'flex-end', marginTop:'0.75rem'}}>
-            <button className="btn btn-primary" onClick={() => setShowRental(true)}>🧮 Calculate Rental Summary</button>
+            {<LoadMoreFooter hasMore={agingMore_.hasMore} remaining={agingMore_.remaining} step={10} total={agingMore_.total} onLoadMore={agingMore_.loadMore} />}
           </div>
         )}
       </div>
-
-      {agingOpen && (
-        <ListModal title="Cylinder Aging History" items={agingRows} columns={agingColumns}
-          searchKeys={['serial_number', 'gas_type', 'capacity']}
-          searchPlaceholder="Search by rotational no., gas type, or size…"
-          onClose={() => setAgingOpen(false)} />
-      )}
 
       {showRental && (
         <RentalSummaryModal
           customer={customer}
           customerId={customerId}
           onClose={() => setShowRental(false)}
-          onGenerated={() => { fetchCustomerDetail(); }}
+          onGenerated={() => { fetchCustomerDetail(); loadRentalHistory(); }}
         />
       )}
 
@@ -985,7 +1023,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {givenVisible.map(txn => {
+                {givenMore_.visible.map(txn => {
                   // A GIVEN cylinder returned via another customer (cross-customer return).
                   const returnedVia = !!txn.returned_via;
                   const badge = returnedVia
@@ -1009,8 +1047,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 })}
               </tbody>
             </table>
-            {givenMore && <ViewAllButton count={givenTransactions.length} onClick={() => setGivenOpen(true)} />}
-            <Pagination pagination={givenPagination} onPageChange={(p) => { setGivenPage(p); fetchCustomerDetail(); }} />
+            {<LoadMoreFooter hasMore={givenMore_.hasMore} remaining={givenMore_.remaining} step={10} total={givenMore_.total} onLoadMore={givenMore_.loadMore} />}
           </div>
         )}
       </div>
@@ -1036,7 +1073,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {receivedVisible.map(txn => {
+                {receivedMore_.visible.map(txn => {
                   // A cylinder this customer returned on behalf of its original holder.
                   const onBehalf = !!txn.returned_on_behalf_of;
                   return (
@@ -1058,8 +1095,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 })}
               </tbody>
             </table>
-            {receivedMore && <ViewAllButton count={receivedTransactions.length} onClick={() => setReceivedOpen(true)} />}
-            <Pagination pagination={receivedPagination} onPageChange={(p) => { setReceivedPage(p); fetchCustomerDetail(); }} />
+            {<LoadMoreFooter hasMore={receivedMore_.hasMore} remaining={receivedMore_.remaining} step={10} total={receivedMore_.total} onLoadMore={receivedMore_.loadMore} />}
           </div>
         )}
       </div>
@@ -1086,7 +1122,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {paymentsVisible.map(payment => (
+                {paymentsMore_.visible.map(payment => (
                   <tr key={payment.receipt_id}>
                     <td>{payment.receipt_number}</td>
                     <td>{payment.challan_no || '-'}</td>
@@ -1100,20 +1136,13 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 ))}
               </tbody>
             </table>
-            {paymentsMore && <ViewAllButton count={payments.length} onClick={() => setPaymentsOpen(true)} />}
-            <Pagination pagination={paymentsPagination} onPageChange={(p) => { setPaymentsPage(p); fetchCustomerDetail(); }} />
+            {<LoadMoreFooter hasMore={paymentsMore_.hasMore} remaining={paymentsMore_.remaining} step={10} total={paymentsMore_.total} onLoadMore={paymentsMore_.loadMore} />}
           </div>
         )}
       </div>
       )}
       </div>
 
-      {pcHistOpen && (
-        <ListModal title="Personal Cylinder History" items={personalHistory} columns={pcHistColumns}
-          searchKeys={['bill_number', 'challan_no', 'gas_type_name', 'size_label', dateKey('date')]}
-          searchPlaceholder="Search by bill no., challan no., gas type, size, or date…"
-          onClose={() => setPcHistOpen(false)} />
-      )}
       {billsOpen && (
         <ListModal title="Transaction History" items={billRows} columns={billColumns}
           searchKeys={['bill_number', 'challan_no', 'transaction_type', dateKey('date')]}
@@ -1132,21 +1161,6 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         <EditBillModal billId={editBillId} stepUpToken={editAuth?.step_up_token || ''}
           onClose={() => setEditBillId(null)}
           onSaved={() => { const id = editBillId; setEditBillId(null); fetchCustomerDetail(); setDetailBillId(id); }} />
-      )}
-      {givenOpen && (
-        <ListModal title="Cylinders Filled History" items={givenTransactions} columns={givenColumns}
-          searchKeys={['bill_number', 'serial_number', dateKey('date')]}
-          searchPlaceholder="Search by bill no., rotational no., or date…" onClose={() => setGivenOpen(false)} />
-      )}
-      {receivedOpen && (
-        <ListModal title="Cylinders Empty History" items={receivedTransactions} columns={receivedColumns}
-          searchKeys={['bill_number', 'serial_number', dateKey('date')]}
-          searchPlaceholder="Search by bill no., rotational no., or date…" onClose={() => setReceivedOpen(false)} />
-      )}
-      {paymentsOpen && (
-        <ListModal title="Payment History" items={payments} columns={paymentColumns}
-          searchKeys={['receipt_number', 'challan_no', (p) => p.amount_received, dateKey('date')]}
-          searchPlaceholder="Search by receipt no., challan no., amount, or date…" onClose={() => setPaymentsOpen(false)} />
       )}
       {certsOpen && (
         <ListModal title="Purity Test Certificates" items={certificates} columns={certColumns}
@@ -4839,6 +4853,9 @@ export function FillingListPage() {
   // Gas/size persist across additions; only the cylinder number clears.
   const [form, setForm] = useState({ gas_type: '', capacity: '', rotational_number: '' });
   const [cylinders, setCylinders] = useState([]);
+  // Cylinders on the saved list that are not standing at the filling site. Informational only —
+  // the list saved regardless (R33). Cleared when the day is reloaded or edited again.
+  const [saveWarnings, setSaveWarnings] = useState([]);
 
   const load = async () => {
     setLoading(true);
@@ -4848,6 +4865,7 @@ export function FillingListPage() {
       setSaved(list);
       setStaged([]);
       setDirty(false);
+      setSaveWarnings([]);        // they belong to the save that produced them, not to the day
       setMode(list.length ? 'view' : 'edit');
     } catch { setSaved([]); setStaged([]); setMode('edit'); }
     setLoading(false);
@@ -4900,11 +4918,15 @@ export function FillingListPage() {
         body: JSON.stringify({ date, entries: staged })
       });
       if (res.ok) {
-        const list = await res.json();
+        // The save now answers with { entries, warnings }; older shape was a bare array.
+        const body = await res.json();
+        const list = Array.isArray(body) ? body : (body.entries || []);
+        const warnings = Array.isArray(body) ? [] : (body.warnings || []);
         setSaved(list);
         setStaged([]);
         setDirty(false);
         setMode('view');
+        setSaveWarnings(warnings);
         showToast(`Filling list saved — ${list.length} entr${list.length === 1 ? 'y' : 'ies'} for ${formatDate(date)}.`, 'success');
       } else showToast(await apiErrorMessage(res, 'Could not save the filling list'));
     } catch { showToast('Could not save the filling list'); }
@@ -4944,6 +4966,26 @@ export function FillingListPage() {
           Stage cylinders as they are filled, then press <strong>Save</strong> to commit the day's list.
           This log only feeds the {locationText(fillingLocationCode())} Stock Summary — it never changes a cylinder's location/state and never creates a bill.
         </p>
+
+        {/* Cylinders on the saved list that the system does not have standing at the filling site.
+            The list is already saved — this is a prompt to check the yard or fix a transaction,
+            not a rejection (R33). */}
+        {saveWarnings.length > 0 && (
+          <div style={{border:'1px solid var(--warning)', background:'var(--warning-light)',
+                       borderRadius:'8px', padding:'0.7rem 0.9rem', marginBottom:'0.9rem'}}>
+            <div style={{display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:'0.5rem'}}>
+              <strong style={{fontSize:'0.86rem'}}>
+                ⚠️ Saved — but {saveWarnings.length} cylinder{saveWarnings.length === 1 ? '' : 's'} may
+                not be at {locationText(fillingLocationCode())}
+              </strong>
+              <button className="link-btn" style={{fontSize:'0.78rem'}}
+                onClick={() => setSaveWarnings([])}>Dismiss</button>
+            </div>
+            <ul style={{margin:'0.45rem 0 0', paddingLeft:'1.1rem', fontSize:'0.82rem'}}>
+              {saveWarnings.map(w => <li key={w.rotational_number}>{w.message}</li>)}
+            </ul>
+          </div>
+        )}
 
         {mode === 'edit' && (
           <div className="form-row cols-3" style={{alignItems:'end', marginTop:'0.75rem'}}>

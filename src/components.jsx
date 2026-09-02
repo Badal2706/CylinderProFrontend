@@ -115,6 +115,18 @@ function printDocStyles() {
 //   1. Every value prints EXACTLY as typed in Settings — no prefix, label or capitalisation is
 //      invented by the template. That is what lets one site carry two numbers on one line.
 //   2. A blank field renders NOTHING — never an orphan label like "GSTIN: " with no value.
+// The trading / "Mfg.:" line(s), always as an array. products_lines superseded the single
+// products_line string so lines can be added and removed freely in Settings; the old field is
+// still read for an account whose migration has not run yet, so the letterhead is correct either
+// way. Blank entries never print.
+function productsLines(business) {
+  const b = business || {};
+  const arr = Array.isArray(b.products_lines) && b.products_lines.length
+    ? b.products_lines
+    : (b.products_line ? [b.products_line] : []);
+  return arr.map((v) => String(v == null ? '' : v)).filter((v) => v.trim());
+}
+
 function printHeaderBox(title, business) {
   const b = business || {};
   const e = printEsc;
@@ -153,7 +165,7 @@ function printHeaderBox(title, business) {
     <div class="hdr-title">${e(title)}</div>
     <div class="${colsClass}">${logoBox}${companyBox}${contactBox}</div>
   </div>
-  ${ll(b.products_line, 'mfg')}`;
+  ${productsLines(b).map((v) => ll(v, 'mfg')).join('')}`;
 }
 
 // Shared customer info block: M/s + right-slot GSTIN, address, contact, and a right-aligned
@@ -478,6 +490,36 @@ export async function printHoldingStatement({ customer_name, customer_address, c
 // them to the shared sheet would put the challan one typo away from changing shape.
 function printCertStyles() {
   return `
+    /* ── The certificate's own letterhead (see printCertHeader) ── */
+    .cert-hdr { border-bottom: 1.5px solid #000; padding-bottom: 8px; margin-bottom: 10px; }
+    .cert-hdr .ch-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; }
+    .cert-hdr .ch-left { min-width: 0; }
+    /* Letterhead lines print VERBATIM here too. printDocStyles scopes its pre-wrap rule to the
+       challan's .hcol columns, so without this a two-line address typed in Settings would print
+       as one line on the certificate and two on the challan — the same field, disagreeing. */
+    .cert-hdr .ll { white-space: pre-wrap; }
+    .cert-hdr .ch-logo { display: block; max-width: 100%; margin-bottom: 4px; }
+    .cert-hdr .ch-co { font-size: 19px; font-weight: 700; line-height: 1.2; }
+    .cert-hdr .ch-addr { font-size: 11.5px; line-height: 1.45; margin-top: 2px; }
+    /* The tagline sits on the right, level with the address rather than the name, and is capped
+       so a long "Mfg./Trading" line wraps in its own column instead of crushing the address. */
+    .cert-hdr .ch-right { text-align: right; max-width: 46%; align-self: flex-end; }
+    .cert-hdr .ch-tag { font-size: 11.5px; font-style: italic; line-height: 1.45; }
+    /* The rule belongs to the letterhead block (border-bottom on .cert-hdr above), so the title
+       sits BELOW it rather than between the address and the rule. */
+    .cert-title {
+      text-align: center; font-size: 16px; font-weight: 700;
+      letter-spacing: 0.06em; text-transform: uppercase; margin: 10px 0 2px;
+    }
+
+    /* Contact block at the foot. Sits after the signature, which .cert-sign pushes down, so this
+       lands at the very bottom of the page. */
+    .cert-foot {
+      border-top: 1px solid #000; margin-top: 14px; padding-top: 6px;
+      display: flex; flex-wrap: wrap; justify-content: center; gap: 4px 18px;
+      font-size: 11px; text-align: center;
+    }
+
     .cert-meta { margin: 10px 0 12px; font-size: 13px; }
     .cert-to { margin-bottom: 10px; font-size: 13px; line-height: 1.6; }
     .cert-to .to-name { font-weight: 700; }
@@ -497,10 +539,63 @@ function printCertStyles() {
     /* The signature block is pushed to the foot of the page by .signs' margin-top:auto, the same
        way the challan's is, so a short certificate still signs off at the bottom. */
     .cert-sign { margin-top: auto; padding-top: 40px; display: flex; justify-content: flex-end; }
-    .cert-sign .box { text-align: center; font-size: 12.5px; line-height: 1.6; }
+    /* Same box, same place, same width — contents left-aligned within it now. */
+    .cert-sign .box { text-align: left; font-size: 12.5px; line-height: 1.6; min-width: 190px; }
     .cert-sign .box .for { text-align: left; }
-    .cert-sign .box .biz { font-weight: 700; }
-    .cert-sign .box .sig { margin-top: 46px; font-weight: 700; }`;
+    /* The blank line signed into. Was the old .sig top margin; it is the space itself now. */
+    .cert-sign .box .gap { height: 46px; }
+    .cert-sign .box .biz { font-weight: 700; }`;
+}
+
+// ─── The Quality Certificate's own letterhead ───
+// A certificate is not a challan. The challan's boxed, three-column header exists to pack a
+// delivery document's identity into as little vertical space as possible; a certificate is a
+// letter, and reads as one. So this document gets its own header: the logo top-left, the address
+// beneath it, the business's trading lines on the right, then a rule, and the document title
+// centred BELOW that rule.
+//
+// There is deliberately NO printed company-name text between the logo and the address — the logo
+// already carries the name, and printing both was the one thing that made this header look like a
+// form rather than a letterhead.
+//
+// Every value is read from the Business Profile — nothing here is written into the code (R74,
+// R147). The tagline reuses products_lines rather than adding a parallel field for the same idea.
+function printCertHeader(title, business) {
+  const b = business || {};
+  const e = printEsc;
+  const has = (v) => !!(v && String(v).trim());
+  const ll = (v, cls) => has(v) ? `<div class="${cls ? cls + ' ' : ''}ll">${e(v)}</div>` : '';
+
+  const scale = Number(b.logo_scale) > 0 ? Number(b.logo_scale) : 100;
+  const logo = has(b.logo)
+    ? `<img class="ch-logo" src="${e(b.logo)}" alt="" style="max-height:${Math.round(1.5 * scale)}px" onerror="this.style.display='none'"/>`
+    : '';
+
+  const left = logo + ll(b.business_address, 'ch-addr');
+  const right = productsLines(b).map((v) => ll(v, 'ch-tag')).join('');
+
+  // The rule closes the letterhead block; the title sits under it, outside .cert-hdr.
+  return `
+  <div class="cert-hdr">
+    <div class="ch-row">
+      <div class="ch-left">${left}</div>
+      <div class="ch-right">${right}</div>
+    </div>
+  </div>
+  <div class="cert-title">${e(title)}</div>`;
+}
+
+// Contact block at the foot of the page — the same `contact_lines` and `business_email` the
+// challan prints in its top-right column, moved to where a letter carries them.
+function printCertFooter(business) {
+  const b = business || {};
+  const e = printEsc;
+  const has = (v) => !!(v && String(v).trim());
+  const lines = (Array.isArray(b.contact_lines) ? b.contact_lines : [])
+    .filter(has).map((v) => `<span>${e(v)}</span>`);
+  if (has(b.business_email)) lines.push(`<span>E-mail: ${e(b.business_email)}</span>`);
+  // Nothing configured means no footer at all — never an empty rule across the foot of the page.
+  return lines.length ? `<div class="cert-foot">${lines.join('')}</div>` : '';
 }
 
 export async function printPurityCertificate(cert) {
@@ -519,16 +614,19 @@ export async function printPurityCertificate(cert) {
     : '';
   const dateRow = (label, value) => value ? row(label, formatDate(value)) : '';
 
+  // Cylinder No. sits LAST, after both dates — the operator reads the gas and quantity first and
+  // checks the serial against the cylinder in front of them last. Challan Ref. keeps its place
+  // ahead of it so the serial is still the final line whenever a reference is present at all.
   const detail = [
     row('Gas', c.gas_type),
     row('Purity', c.purity_percent),
     row('Cylinder Owner', c.cylinder_owner),
     row('Cylinder Water Capacity (Ltrs.)', c.cylinder_water_capacity_ltrs),
     row('Quantity', c.qty),
-    row('Cylinder No.', c.cylinder_serial_no),
     dateRow('Date of Filling', c.filling_date),
     dateRow('Date of Delivery', c.delivery_date),
-    row('Challan Ref.', c.challan_ref)
+    row('Challan Ref.', c.challan_ref),
+    row('Cylinder No.', c.cylinder_serial_no)
   ].join('');
 
   const impurities = Array.isArray(c.impurities) ? c.impurities : [];
@@ -546,24 +644,25 @@ export async function printPurityCertificate(cert) {
         </tr>`).join('')}</tbody>
     </table>` : '';
 
-  // "For, / <business name> / <contact line>" then the signature line. The business name comes
-  // from the letterhead settings, exactly as the challan's signature block does.
+  // "For," / a blank line to sign in / the business name. Nothing else: no contact line, no phone
+  // number. The blank IS the signing space, so the name sits under the signature the way a
+  // hand-signed letter reads. The box keeps its existing position and width; only its contents
+  // and their left alignment changed.
   const signature = `
     <div class="cert-sign">
       <div class="box">
         <div class="for">For,</div>
+        <div class="gap"></div>
         <div class="biz">${esc(business.business_name || '')}</div>
-        ${has(business.footer_contact_line) ? `<div>${esc(business.footer_contact_line)}</div>` : ''}
-        <div class="sig">Authorised Signatory</div>
       </div>
     </div>`;
 
-  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(c.certificate_number || 'Purity Test Certificate')}</title>
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(c.certificate_number || 'Quality Certificate')}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
   <style>${printDocStyles()}</style>
   <style>${printCertStyles()}</style></head><body>
-  ${printHeaderBox('Purity Test Certificate', business)}
+  ${printCertHeader('Quality Test Certificate', business)}
 
   <div class="cert-meta">
     <div class="pair">
@@ -588,6 +687,7 @@ export async function printPurityCertificate(cert) {
   ${impurityTable}
   ${printNotesBlock(business, 'purity_certificate')}
   ${signature}
+  ${printCertFooter(business)}
   ${printFitAndPrintScript()}
   </body></html>`;
 
@@ -2811,6 +2911,52 @@ export function CylinderItem({ item, index, gasTypes, cylinderSizes, availableCy
 // Two-step modal: (1) pick free days / rate / cylinders from the customer's current holdings,
 // (2) preview per-cylinder days_charged + amounts, then Generate & Save (persists a RentalCharge
 // and advances each cylinder's rental_charged_through so days are never billed twice) and Print.
+// The printable Rental Summary. Lifted out of RentalSummaryModal unchanged so the SAME code
+// renders a summary the moment it is generated and a summary reprinted from history months
+// later — a reprint that drifted from the original would be a forged document, not a feature.
+// It reads the SAVED record and recomputes nothing.
+export async function printRentalSummary(charge) {
+  const c = charge;
+  if (!c || !c.customer) return;
+  const w = openPrintTarget('rental_summary_print');   // FIRST — before any await
+  if (!w) return;
+  const { business } = await fetchPrintIdentity();
+  const esc = (s) => String(s == null ? '' : s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  const lines = (c.line_items || []).map((l, i) => `
+    <tr><td class="c">${i + 1}</td><td>${esc(l.serial_number)}</td><td>${esc(l.gas_type)}</td><td>${esc(l.capacity)}</td>
+    <td class="c">${formatDate(l.charged_from)} – ${formatDate(l.charged_through)}</td>
+    <td class="c">${l.days_held}</td><td class="c">${l.days_charged}</td>
+    <td class="r">${(l.amount || 0).toFixed(2)}</td></tr>`).join('');
+  const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(c.customer.company_name)} — Rental Summary</title>
+  <style>${printDocStyles()}</style></head><body>
+  ${printHeaderBox('Cylinder Rental Summary', business)}
+  <div class="meta">
+    <div>
+      <div><strong>M/s.: ${esc(c.customer.company_name)}</strong></div>
+      ${c.customer.address ? `<div>${esc(c.customer.address)}</div>` : ''}
+      ${displayContact(c.customer.phone_primary) ? `<div>Phone: ${esc(displayContact(c.customer.phone_primary))}</div>` : ''}
+      ${c.customer.gst_number ? `<div>GSTIN: ${esc(c.customer.gst_number)}</div>` : ''}
+    </div>
+    <div style="text-align:right">
+      <div>Date: <strong>${formatDate(c.generated_date)}</strong></div>
+      <div>Free days: <strong>${c.free_days}</strong></div>
+      <div>Rate/day: <strong>₹${(c.rate_per_day || 0).toFixed(2)}</strong></div>
+    </div>
+  </div>
+  <table class="ctab">
+    <thead><tr><th class="c" style="width:6%">Sr.</th><th>Cylinder No.</th><th>Gas</th><th>Size</th>
+    <th class="c">Period</th><th class="c">Days Held</th><th class="c">Days Charged</th><th class="r">Amount</th></tr></thead>
+    <tbody>${lines}</tbody>
+    <tfoot><tr class="tot"><td colspan="7" class="r">TOTAL...</td><td class="r">${(c.total_amount || 0).toFixed(2)}</td></tr></tfoot>
+  </table>
+  <div class="terms">Days charged = days held (since last charge) minus ${c.free_days} free day(s), at ₹${(c.rate_per_day || 0).toFixed(2)} per day per cylinder.</div>
+  ${printFitAndPrintScript()}
+  </body></html>`;
+  writePrintDoc(w, html);
+}
+
+
 export function RentalSummaryModal({ customer, customerId, onClose, onGenerated }) {
   const [step, setStep] = useState(1);
   const [loading, setLoading] = useState(true);
@@ -2861,46 +3007,7 @@ export function RentalSummaryModal({ customer, customerId, onClose, onGenerated 
 
   // Printable summary. Phase GEN-A: same printDocStyles() + printHeaderBox() shell as the challan
   // and the holding statement, so all three documents share one letterhead. Only the body differs.
-  const printSummary = async () => {
-    const c = savedCharge;
-    if (!c) return;
-    const w = openPrintTarget('rental_summary_print');   // FIRST — before any await
-    if (!w) return;
-    const { business } = await fetchPrintIdentity();
-    const esc = (s) => String(s == null ? '' : s)
-      .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-    const lines = (c.line_items || []).map((l, i) => `
-      <tr><td class="c">${i + 1}</td><td>${esc(l.serial_number)}</td><td>${esc(l.gas_type)}</td><td>${esc(l.capacity)}</td>
-      <td class="c">${formatDate(l.charged_from)} – ${formatDate(l.charged_through)}</td>
-      <td class="c">${l.days_held}</td><td class="c">${l.days_charged}</td>
-      <td class="r">${(l.amount || 0).toFixed(2)}</td></tr>`).join('');
-    const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(c.customer.company_name)} — Rental Summary</title>
-    <style>${printDocStyles()}</style></head><body>
-    ${printHeaderBox('Cylinder Rental Summary', business)}
-    <div class="meta">
-      <div>
-        <div><strong>M/s.: ${esc(c.customer.company_name)}</strong></div>
-        ${c.customer.address ? `<div>${esc(c.customer.address)}</div>` : ''}
-        ${displayContact(c.customer.phone_primary) ? `<div>Phone: ${esc(displayContact(c.customer.phone_primary))}</div>` : ''}
-        ${c.customer.gst_number ? `<div>GSTIN: ${esc(c.customer.gst_number)}</div>` : ''}
-      </div>
-      <div style="text-align:right">
-        <div>Date: <strong>${formatDate(c.generated_date)}</strong></div>
-        <div>Free days: <strong>${c.free_days}</strong></div>
-        <div>Rate/day: <strong>₹${(c.rate_per_day || 0).toFixed(2)}</strong></div>
-      </div>
-    </div>
-    <table class="ctab">
-      <thead><tr><th class="c" style="width:6%">Sr.</th><th>Cylinder No.</th><th>Gas</th><th>Size</th>
-      <th class="c">Period</th><th class="c">Days Held</th><th class="c">Days Charged</th><th class="r">Amount</th></tr></thead>
-      <tbody>${lines}</tbody>
-      <tfoot><tr class="tot"><td colspan="7" class="r">TOTAL...</td><td class="r">${(c.total_amount || 0).toFixed(2)}</td></tr></tfoot>
-    </table>
-    <div class="terms">Days charged = days held (since last charge) minus ${c.free_days} free day(s), at ₹${(c.rate_per_day || 0).toFixed(2)} per day per cylinder.</div>
-    ${printFitAndPrintScript()}
-    </body></html>`;
-    writePrintDoc(w, html);
-  };
+  const printSummary = () => printRentalSummary(savedCharge);
 
   return (
     <Modal title={`Rental Summary — ${customer?.company_name || ''}`} size="wide" onClose={onClose}>

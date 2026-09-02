@@ -510,6 +510,60 @@ export function ViewAllButton({ count, onClick }) {
   );
 }
 
+// ─── Pattern A: "show N, click for the next N" ───
+// The app has exactly two ways to show a long list, and this is the one for lists already held in
+// memory: reveal `step` rows, then `step` more on each click, until there are none left and the
+// button removes itself. The other is useBatchList — a background, server-paged load for the big
+// top-level lists.
+//
+// This replaced numbered pagination and the old "View All" modal. Numbered pages made someone
+// choose a page number to answer "what happened recently"; the modal was a second, differently
+// shaped copy of a list the user was already looking at.
+//
+// `rows` may arrive empty and fill in later, so the count resets whenever the identity of the
+// list changes — otherwise switching customer would leave the previous customer's "showing 40"
+// applied to the new one.
+export function useLoadMore(rows, step) {
+  const list = Array.isArray(rows) ? rows : [];
+  const [shown, setShown] = useState(step);
+  const key = list.length;
+  const lastKey = useRef(key);
+  useEffect(() => {
+    if (lastKey.current !== key) { lastKey.current = key; setShown(step); }
+  }, [key, step]);
+  return {
+    visible: list.slice(0, shown),
+    hasMore: list.length > shown,
+    remaining: Math.max(0, list.length - shown),
+    total: list.length,
+    loadMore: () => setShown(n => n + step),
+    // For lists already held in memory that reveal everything in one click rather than in steps.
+    showAll: () => setShown(list.length)
+  };
+}
+
+// The footer for a useLoadMore list. Renders nothing when everything already fits, so a short
+// list carries no chrome at all.
+export function LoadMoreFooter({ hasMore, remaining, step, total, onLoadMore, showTotal = false,
+                                 all = false }) {
+  if (!hasMore) {
+    return showTotal && total > 0
+      ? <div style={{textAlign:'center', fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.6rem'}}>
+          All {total.toLocaleString()} shown.
+        </div>
+      : null;
+  }
+  return (
+    <div style={{textAlign:'center', marginTop:'0.75rem'}}>
+      <button className="btn btn-secondary" style={{fontSize:'0.82rem'}} onClick={onLoadMore}>
+        {all
+          ? `View All (${total.toLocaleString()}) →`
+          : `Load Next ${Math.min(step, remaining)} (${remaining.toLocaleString()} left)`}
+      </button>
+    </div>
+  );
+}
+
 // ─── Server-side pagination controls ───
 export function Pagination({ pagination, onPageChange }) {
   if (!pagination || pagination.totalPages <= 1) return null;
@@ -2104,7 +2158,9 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
   // Open the Record Payment modal for a customer.
   const openPayment = (item) => setSelectedCustomer(item);
 
-  const [outVisible, outMore, outOpen, setOutOpen] = useViewAll(data, 5);
+  // Same shape as the Customers list: 50 first, the rest on one click. The rows are already
+  // in memory here, so no further fetch is needed to reveal them.
+  const outMore_ = useLoadMore(data, 50);
 
   // Column spec shared by the inline table and the "View All" modal.
   const outColumns = [
@@ -2183,7 +2239,7 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
                 </tr>
               </thead>
               <tbody>
-                {outVisible.map((item, index) => (
+                {outMore_.visible.map((item, index) => (
                   <tr
                     key={String(item.customer_id)}
                     style={selectedCustomer && selectedCustomer.customer_id === item.customer_id
@@ -2233,22 +2289,11 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
                 </tr>
               </tfoot>
             </table>
-            {outMore && <ViewAllButton count={data.length} onClick={() => setOutOpen(true)} />}
+            {<LoadMoreFooter hasMore={outMore_.hasMore} remaining={outMore_.remaining} step={50} total={outMore_.total} onLoadMore={outMore_.showAll} all />}
           </div>
         )}
       </div>
 
-      {/* View All — full outstanding list with search */}
-      {outOpen && (
-        <ListModal
-          title="Outstanding Receivables"
-          items={data}
-          columns={outColumns}
-          searchKeys={['company_name']}
-          searchPlaceholder="Search by customer name…"
-          onClose={() => setOutOpen(false)}
-        />
-      )}
 
       {/* Record Payment — centered modal */}
       {selectedCustomer && (
@@ -4102,7 +4147,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   useLocations();
   const [account, setAccount] = useState(null);
   const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'',
-    certification_line:'', business_email:'', products_line:'', contact_lines:[], logo_scale:100, logo:'',
+    certification_line:'', business_email:'', products_line:'', products_lines:[], contact_lines:[], logo_scale:100, logo:'',
     // F-11 certificate identity (kept here so a Business Info save never drops them).
     certificate_prefix:'', footer_contact_line:'',
     // GEN-C numbering. fy_choice_locked / fy_lock_date are read-only, computed by the server.
@@ -4716,11 +4761,40 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                 onChange={(e) => setBusiness({...business, business_email: e.target.value})} />
             </div>
           </div>
+          {/* An ordered list rather than one box: this line grew into several on the certificate
+              letterhead, and a business should be able to add or drop one without a developer.
+              Same shape as Printed Contact Lines above (R79) — one idea, one pattern. */}
           <div className="form-group">
-            <label>Products / Manufacturing Line</label>
-            <input className="form-control" value={business.products_line}
-              placeholder="e.g. Mfg.: Industrial &amp; Medical gases"
-              onChange={(e) => setBusiness({...business, products_line: e.target.value})} />
+            <label>Products / Manufacturing Lines</label>
+            <small style={{display:'block', color:'var(--text-muted)', fontSize:'0.75rem', marginBottom:'0.5rem'}}>
+              Printed under the letterhead and on the right of a certificate's header — one line
+              each, exactly as typed. Add as many as you need; blank ones are left off the page.
+            </small>
+            <div style={{display:'flex', flexDirection:'column', gap:'0.4rem'}}>
+              {(business.products_lines && business.products_lines.length
+                  ? business.products_lines : ['']).map((line, i) => (
+                <div key={i} style={{display:'flex', gap:'0.4rem', alignItems:'center'}}>
+                  <input className="form-control" value={line}
+                    placeholder={i === 0 ? 'e.g. Mfg.: Industrial & Medical gases' : 'Another line…'}
+                    onChange={(e) => {
+                      const next = [...(business.products_lines || [''])];
+                      next[i] = e.target.value;
+                      setBusiness({...business, products_lines: next});
+                    }} />
+                  <button type="button" className="btn btn-secondary"
+                    style={{padding:'0.3rem 0.6rem'}}
+                    title="Remove this line"
+                    onClick={() => {
+                      const next = (business.products_lines || ['']).filter((_, j) => j !== i);
+                      setBusiness({...business, products_lines: next});
+                    }}>🗑️</button>
+                </div>
+              ))}
+            </div>
+            <button type="button" className="link-btn" style={{fontSize:'0.82rem', marginTop:'0.45rem'}}
+              onClick={() => setBusiness({
+                ...business, products_lines: [...(business.products_lines || ['']), '']
+              })}>+ Add another line</button>
           </div>
           {/* F-11: identity used only by Purity Test Certificates. Both blank by default — a
               guessed prefix would print one client's initials on another client's certificate. */}
