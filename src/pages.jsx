@@ -124,6 +124,32 @@ export const RETURN_ROW_STYLE = { background: '#fff7ed' };
 // rows ten at a time — but a bound so one screen can never pull an unbounded number of rows.
 const HISTORY_LIMIT = 500;
 
+// Per-section loading and failure states for Customer Detail. Small on purpose: one section still
+// arriving should read as "this bit is on its way", not as the whole page loading.
+function SectionLoading({ label = 'Loading…' }) {
+  return (
+    <div style={{display:'flex', alignItems:'center', gap:'0.55rem', padding:'0.9rem 0.25rem',
+                 color:'var(--text-muted)', fontSize:'0.82rem'}}>
+      <span style={{width:'16px', height:'16px', border:'2px solid #e2e8f0', borderTopColor:'#2563eb',
+                    borderRadius:'50%', animation:'spin 0.8s linear infinite', display:'inline-block'}} />
+      {label}
+    </div>
+  );
+}
+
+function SectionError({ what, onRetry }) {
+  return (
+    <div className="alert alert-danger" style={{display:'flex', alignItems:'center', justifyContent:'space-between',
+                                               gap:'0.75rem', flexWrap:'wrap', fontSize:'0.83rem', margin:'0.75rem 0 0'}}>
+      <span>Could not load {what}. The rest of this page is unaffected.</span>
+      <button type="button" className="btn btn-secondary" style={{padding:'0.25rem 0.7rem'}} onClick={onRetry}>Retry</button>
+    </div>
+  );
+}
+
+// The seven sections loaded after the customer record, and the label each shows while it waits.
+const DETAIL_SECTIONS = ['given', 'received', 'payments', 'pcHist', 'aging', 'bills', 'certs'];
+
 export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo = null }) {
   const [customer, setCustomer] = useState(null);
   const [givenTransactions, setGivenTransactions] = useState([]);
@@ -148,8 +174,23 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
   const [deleteCert, setDeleteCert] = useState(null);
   const [deletingCert, setDeletingCert] = useState(false);
 
+  // 'loading' | 'ok' | 'error' per background section. Everything starts as loading; each flips on
+  // its own as its own call returns.
+  const allLoading = () => Object.fromEntries(DETAIL_SECTIONS.map(k => [k, 'loading']));
+  const [sec, setSec] = useState(allLoading);
+  const setSection = (key, state) => setSec(prev => ({ ...prev, [key]: state }));
+  // Bumped whenever a new customer is opened, so a slow answer about the PREVIOUS customer can
+  // never land in this one's tables.
+  const reqRef = useRef(0);
+
   useEffect(() => {
     if (customerId) {
+      reqRef.current++;
+      setLoading(true);
+      setCustomer(null);
+      setGivenTransactions([]); setReceivedTransactions([]); setPayments([]);
+      setPersonalHistory([]); setAgingRows([]); setCustomerBills([]); setCertificates([]);
+      setSec(allLoading());
       fetchCustomerDetail();
     }
   }, [customerId]);
@@ -165,56 +206,76 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     return () => clearTimeout(t);
   }, [loading, scrollTo]);
 
+  // ── Two phases ──
+  // 1. The customer record alone. The header, summaries, Financial Summary and Currently Holding
+  //    all come from it, so the page is usable the moment it lands.
+  // 2. The seven history sections, all started together and each written to its own state as it
+  //    arrives. None waits for another, and one failing leaves the other six (and the page) intact.
+  //
+  // Called again after a payment, an edit or a new certificate. On those refreshes the sections
+  // keep showing their current rows until the new ones arrive, rather than flashing back to a
+  // loading state for data that is only being brought up to date.
   const fetchCustomerDetail = async () => {
+    const token = reqRef.current;
     try {
-      const [customerRes, givenRes, receivedRes, paymentsRes, personalHistRes, agingRes, billsRes, certsRes] = await Promise.all([
-        apiFetch(`${API_URL}/customers/${customerId}`),
-        apiFetch(`${API_URL}/customers/${customerId}/transactions/given?page=1&limit=${HISTORY_LIMIT}`),
-        apiFetch(`${API_URL}/customers/${customerId}/transactions/received?page=1&limit=${HISTORY_LIMIT}`),
-        apiFetch(`${API_URL}/customers/${customerId}/payments?page=1&limit=${HISTORY_LIMIT}`),
-        apiFetch(`${API_URL}/customers/${customerId}/personal-cylinder-history`),
-        apiFetch(`${API_URL}/customers/${customerId}/aging`),
-        apiFetch(`${API_URL}/bills?customer_id=${customerId}&limit=200`),
-        apiFetch(`${API_URL}/purity-certificates?customer_id=${customerId}`)
-      ]);
-
+      const customerRes = await apiFetch(`${API_URL}/customers/${customerId}`);
+      if (token !== reqRef.current) return;
       if (!customerRes.ok) {
         showToast(await apiErrorMessage(customerRes, 'Could not load this customer.'));
         setLoading(false);
         return;
       }
-
       const customerData = await customerRes.json();
-      const givenRaw = givenRes.ok ? await givenRes.json() : [];
-      const givenData = givenRaw.data || givenRaw;
-      const receivedRaw = receivedRes.ok ? await receivedRes.json() : [];
-      const receivedData = receivedRaw.data || receivedRaw;
-      const paymentsRaw = paymentsRes.ok ? await paymentsRes.json() : [];
-      const paymentsData = paymentsRaw.data || paymentsRaw;
-      const personalHistData = personalHistRes.ok ? await personalHistRes.json() : [];
-      const agingData = agingRes.ok ? await agingRes.json() : [];
-      const billsRaw = billsRes.ok ? await billsRes.json() : [];
-      const billsData = billsRaw.data || billsRaw;
-      if (!givenRes.ok || !receivedRes.ok || !paymentsRes.ok) {
-        showToast('Some transaction history could not be loaded.');
-      }
-
+      if (token !== reqRef.current) return;
       setCustomer(customerData);
-      setGivenTransactions(Array.isArray(givenData) ? givenData : []);
-      setReceivedTransactions(Array.isArray(receivedData) ? receivedData : []);
-      setPayments(Array.isArray(paymentsData) ? paymentsData : []);
-      setPersonalHistory(Array.isArray(personalHistData) ? personalHistData : []);
-      setAgingRows(Array.isArray(agingData) ? agingData : []);
-      setCustomerBills(Array.isArray(billsData) ? billsData : []);
-      const certsData = certsRes.ok ? await certsRes.json() : [];
-      setCertificates(Array.isArray(certsData) ? certsData : []);
-      setLoading(false);
     } catch (error) {
       console.error('Error fetching customer detail:', error);
       showToast('Could not load customer details. Please try again.');
       setLoading(false);
+      return;
+    }
+    setLoading(false);
+    loadSections(token);
+  };
+
+  // asRows unwraps a response into the array the section stores. Paginated endpoints answer
+  // { data: [...] }, the others a bare array — the same unwrapping the single Promise.all did.
+  const asRows = (raw) => {
+    const d = raw && raw.data ? raw.data : raw;
+    return Array.isArray(d) ? d : [];
+  };
+  const SECTION_SOURCES = {
+    given:    { url: () => `${API_URL}/customers/${customerId}/transactions/given?page=1&limit=${HISTORY_LIMIT}`, set: (r) => setGivenTransactions(asRows(r)) },
+    received: { url: () => `${API_URL}/customers/${customerId}/transactions/received?page=1&limit=${HISTORY_LIMIT}`, set: (r) => setReceivedTransactions(asRows(r)) },
+    payments: { url: () => `${API_URL}/customers/${customerId}/payments?page=1&limit=${HISTORY_LIMIT}`, set: (r) => setPayments(asRows(r)) },
+    pcHist:   { url: () => `${API_URL}/customers/${customerId}/personal-cylinder-history`, set: (r) => setPersonalHistory(asRows(r)) },
+    aging:    { url: () => `${API_URL}/customers/${customerId}/aging`, set: (r) => setAgingRows(asRows(r)) },
+    bills:    { url: () => `${API_URL}/bills?customer_id=${customerId}&limit=200`, set: (r) => setCustomerBills(asRows(r)) },
+    certs:    { url: () => `${API_URL}/purity-certificates?customer_id=${customerId}`, set: (r) => setCertificates(asRows(r)) }
+  };
+
+  const loadSection = async (key, token = reqRef.current) => {
+    const src = SECTION_SOURCES[key];
+    try {
+      const res = await apiFetch(src.url());
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const raw = await res.json();
+      if (token !== reqRef.current) return;
+      src.set(raw);
+      setSection(key, 'ok');
+    } catch (e) {
+      if (token !== reqRef.current) return;
+      console.error(`Customer detail: ${key} failed to load`, e);
+      setSection(key, 'error');
     }
   };
+
+  // Fire-and-forget on purpose: each loadSection handles its own result, so there is nothing to
+  // await together — awaiting them as a group is exactly the all-at-once wait this replaced.
+  const loadSections = (token) => DETAIL_SECTIONS.forEach(key => { loadSection(key, token); });
+
+  // A retry shows the loading state again, since the section currently shows an error, not data.
+  const retrySection = (key) => { setSection(key, 'loading'); loadSection(key); };
 
   const exportCustomerExcel = () => {
     const d2 = (d) => formatDate(d);
@@ -534,8 +595,19 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         <button className="btn btn-secondary" onClick={onBack}>← Back to List</button>
         <div className="btn-group" style={{margin:0}}>
           <button className="btn btn-primary" onClick={() => setShowEdit(true)}>✏️ Edit</button>
-          <button className="btn btn-secondary" onClick={printCustomer}>Print / PDF</button>
-          <button className="btn btn-secondary" onClick={exportCustomerExcel}>Export Excel</button>
+          {/* Both documents include the filled / empty / payment history, so they wait for those
+              three sections rather than printing a report that is silently missing rows. */}
+          {(() => {
+            const ready = ['given', 'received', 'payments'].every(k => sec[k] === 'ok');
+            const why = ['given', 'received', 'payments'].some(k => sec[k] === 'error')
+              ? 'Some history failed to load — retry it below first' : 'Loading history…';
+            return (<>
+              <button className="btn btn-secondary" onClick={printCustomer} disabled={!ready}
+                title={ready ? '' : why}>Print / PDF</button>
+              <button className="btn btn-secondary" onClick={exportCustomerExcel} disabled={!ready}
+                title={ready ? '' : why}>Export Excel</button>
+            </>);
+          })()}
         </div>
       </div>
 
@@ -751,15 +823,26 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         </div>
       )}
 
+      {sec.pcHist === 'error' && (
+        <div className="card">
+          <h2>Personal Cylinder History</h2>
+          <SectionError what="personal cylinder history" onRetry={() => retrySection('pcHist')} />
+        </div>
+      )}
+
       {/* F-11: Purity Test Certificates. View / Print / Delete only — a certificate is frozen
           the moment it is saved, so this section has no edit affordance anywhere. */}
       <div className="card" id="purity-certificates">
         <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
-          <h2 style={{margin:0, border:'none', padding:0}}>Purity Test Certificates ({certificates.length})</h2>
+          <h2 style={{margin:0, border:'none', padding:0}}>Purity Test Certificates ({sec.certs === 'ok' ? certificates.length : '…'})</h2>
           <button className="btn btn-primary" onClick={() => setShowCertForm(true)}>+ New Certificate</button>
         </div>
 
-        {certificates.length === 0 ? (
+        {sec.certs === 'loading' ? (
+          <SectionLoading label="Loading certificates…" />
+        ) : sec.certs === 'error' ? (
+          <SectionError what="certificates" onRetry={() => retrySection('certs')} />
+        ) : certificates.length === 0 ? (
           <EmptyState icon="📄" message="No certificates issued yet"
             hint="Issue one with “+ New Certificate” above." />
         ) : (
@@ -877,7 +960,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       <div className="card" id="aging-history">
         <div style={{display:'flex', justifyContent:'space-between', alignItems:'center',
                      gap:'0.75rem', flexWrap:'wrap'}}>
-          <h2 style={{margin:0, border:'none', padding:0}}>Cylinder Aging History ({agingRows.length})</h2>
+          <h2 style={{margin:0, border:'none', padding:0}}>Cylinder Aging History ({sec.aging === 'ok' ? agingRows.length : '…'})</h2>
           <div style={{display:'flex', gap:'0.5rem', alignItems:'center', flexWrap:'wrap'}}>
             {/* Shown even with nothing in it, and disabled instead of hidden: a control that only
                 appears once you already have history is a control nobody discovers. */}
@@ -901,7 +984,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </option>
               ))}
             </select>
-            {agingRows.length > 0 && (
+            {sec.aging === 'ok' && agingRows.length > 0 && (
               <button className="btn btn-primary" style={{whiteSpace:'nowrap'}}
                 onClick={() => setShowRental(true)}>🧮 Calculate Rental Summary</button>
             )}
@@ -910,7 +993,11 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
           How long each cylinder has been with this customer, and the site it was issued from.
         </p>
-        {agingRows.length === 0 ? (
+        {sec.aging === 'loading' ? (
+          <SectionLoading label="Loading aging…" />
+        ) : sec.aging === 'error' ? (
+          <SectionError what="cylinder aging" onRetry={() => retrySection('aging')} />
+        ) : agingRows.length === 0 ? (
           <EmptyState icon="⏳" message="No cylinders currently held" hint="Aging appears here while the customer holds cylinders." />
         ) : (
           <div className="table-container">
@@ -951,11 +1038,15 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       {/* Transaction History — this customer's bills only (Phase 6). Same columns and
           row-click-to-detail behavior as the global Transaction History page. */}
       <div className="card" id="transaction-history">
-        <h2>Transaction History ({billRows.length})</h2>
+        <h2>Transaction History ({sec.bills === 'ok' ? billRows.length : '…'})</h2>
         <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
           Every bill for this customer. Click a row to view the full transaction, its cylinders, and its payment history.
         </p>
-        {billRows.length === 0 ? (
+        {sec.bills === 'loading' ? (
+          <SectionLoading label="Loading transactions…" />
+        ) : sec.bills === 'error' ? (
+          <SectionError what="transactions" onRetry={() => retrySection('bills')} />
+        ) : billRows.length === 0 ? (
           <EmptyState icon="🧾" message="No transactions yet" hint="Bills recorded for this customer will appear here." />
         ) : (
           <div className="table-container">
@@ -990,22 +1081,26 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         <div className="btn-group" style={{flexWrap:'wrap'}}>
           <button className={`btn ${openHist === 'filled' ? 'btn-primary' : 'btn-secondary'}`}
             onClick={() => setOpenHist(openHist === 'filled' ? null : 'filled')}>
-            🛢️ Cylinders Filled History ({givenTransactions.length})
+            🛢️ Cylinders Filled History ({sec.given === 'ok' ? givenTransactions.length : sec.given === 'error' ? '!' : '…'})
           </button>
           <button className={`btn ${openHist === 'empty' ? 'btn-primary' : 'btn-secondary'}`}
             onClick={() => setOpenHist(openHist === 'empty' ? null : 'empty')}>
-            🔄 Cylinders Empty History ({receivedTransactions.length})
+            🔄 Cylinders Empty History ({sec.received === 'ok' ? receivedTransactions.length : sec.received === 'error' ? '!' : '…'})
           </button>
           <button className={`btn ${openHist === 'payments' ? 'btn-primary' : 'btn-secondary'}`}
             onClick={() => setOpenHist(openHist === 'payments' ? null : 'payments')}>
-            💰 Payment History ({payments.length})
+            💰 Payment History ({sec.payments === 'ok' ? payments.length : sec.payments === 'error' ? '!' : '…'})
           </button>
         </div>
 
       {openHist === 'filled' && (
       <div style={{marginTop:'1rem'}}>
         <h2>Cylinders Filled History</h2>
-        {givenTransactions.length === 0 ? (
+        {sec.given === 'loading' ? (
+          <SectionLoading label="Loading filled history…" />
+        ) : sec.given === 'error' ? (
+          <SectionError what="the filled history" onRetry={() => retrySection('given')} />
+        ) : givenTransactions.length === 0 ? (
           <EmptyState icon="🛢️" message="No cylinders filled yet" />
         ) : (
           <div className="table-container">
@@ -1056,7 +1151,11 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       {openHist === 'empty' && (
       <div style={{marginTop:'1rem'}}>
         <h2>Cylinders Empty History</h2>
-        {receivedTransactions.length === 0 ? (
+        {sec.received === 'loading' ? (
+          <SectionLoading label="Loading empty history…" />
+        ) : sec.received === 'error' ? (
+          <SectionError what="the empty history" onRetry={() => retrySection('received')} />
+        ) : receivedTransactions.length === 0 ? (
           <EmptyState icon="🔄" message="No cylinders empty yet" />
         ) : (
           <div className="table-container">
@@ -1104,7 +1203,11 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       {openHist === 'payments' && (
       <div style={{marginTop:'1rem'}}>
         <h2>Payment History</h2>
-        {payments.length === 0 ? (
+        {sec.payments === 'loading' ? (
+          <SectionLoading label="Loading payments…" />
+        ) : sec.payments === 'error' ? (
+          <SectionError what="payment history" onRetry={() => retrySection('payments')} />
+        ) : payments.length === 0 ? (
           <EmptyState icon="💰" message="No payments recorded yet" />
         ) : (
           <div className="table-container">

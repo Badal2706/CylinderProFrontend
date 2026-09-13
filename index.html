@@ -191,6 +191,16 @@
       border: 1px solid var(--border);
     }
 
+    /* Settings: form fields on the left, a live print preview pinned beside them on the right.
+       Stacks to one column where two would squeeze the fields. */
+    .with-preview { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 1.5rem; align-items: start; }
+    .with-preview .preview-col { position: sticky; top: 5rem; }
+    @media (max-width: 1100px) {
+      .with-preview { grid-template-columns: minmax(0, 1fr); }
+      .with-preview .preview-col { position: static; }
+    }
+    .preview-label { font-size: 0.78rem; font-weight: 600; color: var(--text-muted); margin-bottom: 0.35rem; }
+
     .card h2 {
       font-size: 1rem;
       font-weight: 700;

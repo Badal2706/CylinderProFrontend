@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, istDateInput, istTimeInput, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, useLocations, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
@@ -125,6 +125,13 @@ function productsLines(business) {
     ? b.products_lines
     : (b.products_line ? [b.products_line] : []);
   return arr.map((v) => String(v == null ? '' : v)).filter((v) => v.trim());
+}
+
+// The certificate's tagline lines. No fallback to products_lines, by design — see printCertHeader.
+function certificateTaglineLines(business) {
+  const b = business || {};
+  return (Array.isArray(b.certificate_tagline_lines) ? b.certificate_tagline_lines : [])
+    .map((v) => String(v == null ? '' : v)).filter((v) => v.trim());
 }
 
 function printHeaderBox(title, business) {
@@ -278,6 +285,15 @@ export function printNotesBlock(business, docKey) {
   </div>`;
 }
 
+// The customer-left / business-right sign-off shared by every document handed to a customer — the
+// challan, the holding statement and the rental summary. One function so the three can never drift
+// into three looks: the blank above each label (.signs padding-top) is the space signed in, and the
+// business name comes from the Business Profile, never from the code (R74, R147).
+function printSignsBlock(business) {
+  const b = business || {};
+  return `<div class="signs"><div>Customer Signature</div><div class="right">${printEsc(b.business_name || '')}<br/>Authorised Signature</div></div>`;
+}
+
 async function fetchPrintIdentity() {
   try {
     const res = await apiFetch(`${API_URL}/profile/business`);
@@ -392,12 +408,12 @@ export async function printSavedBill(bill) {
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
   <style>${printDocStyles()}</style></head><body>
-  ${printHeaderBox('Delivery Challan', business)}
+  ${printHeaderBox(CHALLAN_TITLE, business)}
   ${printCustomerBlock(bill, metaLeft, metaRight, { showVehicle: true })}
   ${mergedTable}
   ${transferSection}
   ${printNotesBlock(business, 'challan')}
-  <div class="signs"><div>Customer Signature</div><div class="right">${esc(business.business_name || '')}<br/>Authorised Signature</div></div>
+  ${printSignsBlock(business)}
   ${printFitAndPrintScript()}
   </body></html>`;
 
@@ -466,7 +482,7 @@ export async function printHoldingStatement({ customer_name, customer_address, c
   ${table}
   ${breakdownTable ? `<h3 style="margin:16px 0 6px;font-size:12px">Breakdown by Type</h3>${breakdownTable}` : ''}
   ${printNotesBlock(business, 'holding_statement')}
-  <div class="signs"><div>Customer Signature</div><div class="right">${esc(business.business_name || '')}<br/>Authorised Signature</div></div>
+  ${printSignsBlock(business)}
   ${printFitAndPrintScript()}
   </body></html>`;
 
@@ -539,12 +555,16 @@ function printCertStyles() {
     /* The signature block is pushed to the foot of the page by .signs' margin-top:auto, the same
        way the challan's is, so a short certificate still signs off at the bottom. */
     .cert-sign { margin-top: auto; padding-top: 40px; display: flex; justify-content: flex-end; }
-    /* Same box, same place, same width — contents left-aligned within it now. */
-    .cert-sign .box { text-align: left; font-size: 12.5px; line-height: 1.6; min-width: 190px; }
-    .cert-sign .box .for { text-align: left; }
-    /* The blank line signed into. Was the old .sig top margin; it is the space itself now. */
-    .cert-sign .box .gap { height: 46px; }
-    .cert-sign .box .biz { font-weight: 700; }`;
+    /* Business name over "Authorised Signature", right-aligned and bold — the same sign-off as the
+       challan's right-hand signature. The blank above it (padding-top) is the space signed in. */
+    .cert-sign .box { text-align: right; font-size: 12.5px; font-weight: 700; line-height: 1.6; }
+
+    /* Analysis Report: against the left margin, in line with the detail block above it, and only as
+       wide as its content plus modest padding. It used to inherit the challan's full-width table,
+       which stretched three short columns across the page. */
+    .cert-imp { display: table; margin: 4px 0 12px; }
+    .cert-imp table.ctab { width: auto; min-width: 340px; margin: 0; }
+    .cert-imp table.ctab th, .cert-imp table.ctab td { padding: 5px 18px; }`;
 }
 
 // ─── The Quality Certificate's own letterhead ───
@@ -559,7 +579,8 @@ function printCertStyles() {
 // form rather than a letterhead.
 //
 // Every value is read from the Business Profile — nothing here is written into the code (R74,
-// R147). The tagline reuses products_lines rather than adding a parallel field for the same idea.
+// R147). The tagline is the certificate's OWN field, certificate_tagline_lines — not the challan's
+// products_lines. Sharing one field meant rewording the challan changed a lab certificate too.
 function printCertHeader(title, business) {
   const b = business || {};
   const e = printEsc;
@@ -572,7 +593,7 @@ function printCertHeader(title, business) {
     : '';
 
   const left = logo + ll(b.business_address, 'ch-addr');
-  const right = productsLines(b).map((v) => ll(v, 'ch-tag')).join('');
+  const right = certificateTaglineLines(b).map((v) => ll(v, 'ch-tag')).join('');
 
   // The rule closes the letterhead block; the title sits under it, outside .cert-hdr.
   return `
@@ -596,6 +617,95 @@ function printCertFooter(business) {
   if (has(b.business_email)) lines.push(`<span>E-mail: ${e(b.business_email)}</span>`);
   // Nothing configured means no footer at all — never an empty rule across the foot of the page.
   return lines.length ? `<div class="cert-foot">${lines.join('')}</div>` : '';
+}
+
+// ─── Settings previews ───
+// The preview panes in Settings render THESE documents, not a lookalike. Each one is the real
+// print stylesheet plus the real header function, fed the unsaved form values — so a preview can
+// only disagree with a print if the print path itself changes, and then both change together.
+// The print functions above use the same titles and the same <head> order as these.
+const CHALLAN_TITLE = 'Delivery Challan';
+const CERTIFICATE_TITLE = 'Quality Test Certificate';
+
+// Same font links as the print <head>, so a Gujarati address renders in the same face in both.
+const PRINT_FONT_LINKS = `<link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">`;
+
+export function challanHeaderPreviewDoc(business) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+  ${PRINT_FONT_LINKS}
+  <style>${printDocStyles()}</style></head><body>
+  ${printHeaderBox(CHALLAN_TITLE, business)}
+  </body></html>`;
+}
+
+export function certificateHeaderPreviewDoc(business) {
+  return `<!DOCTYPE html><html><head><meta charset="utf-8">
+  ${PRINT_FONT_LINKS}
+  <style>${printDocStyles()}</style>
+  <style>${printCertStyles()}</style></head><body>
+  ${printCertHeader(CERTIFICATE_TITLE, business)}
+  </body></html>`;
+}
+
+// A4 is 210mm wide; the print @page rule takes 10mm off each side. 190mm at 96 dpi.
+const PRINT_PAGE_WIDTH_PX = 718;
+
+// Live preview pane. Renders one of the preview documents above in an iframe at the printed page's
+// real width, then scales the iframe down to fit the column — scaling, never reflowing, so line
+// wraps in the preview are the line wraps on paper. Typing is debounced; the render path is not
+// touched by the debounce, only how often it runs.
+export function PrintHeaderPreview({ doc, label }) {
+  const [html, setHtml] = useState(doc);
+  useEffect(() => {
+    const t = setTimeout(() => setHtml(doc), 250);
+    return () => clearTimeout(t);
+  }, [doc]);
+
+  const boxRef = useRef(null);
+  const frameRef = useRef(null);
+  const [scale, setScale] = useState(1);
+  const [height, setHeight] = useState(140);
+
+  useEffect(() => {
+    const el = boxRef.current;
+    if (!el || typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(() => setScale(Math.min(1, el.clientWidth / PRINT_PAGE_WIDTH_PX) || 1));
+    ro.observe(el);
+    return () => ro.disconnect();
+  }, []);
+
+  // Height = where the header's last element ends, plus the body's bottom padding. Measured from
+  // the elements rather than the body, whose print min-height is the full page.
+  const measure = () => {
+    try {
+      const d = frameRef.current && frameRef.current.contentDocument;
+      if (!d || !d.body) return;
+      let bottom = 0;
+      for (const el of d.body.children) {
+        if (el.tagName === 'SCRIPT') continue;
+        const mb = parseFloat(d.defaultView.getComputedStyle(el).marginBottom) || 0;
+        bottom = Math.max(bottom, el.getBoundingClientRect().bottom + mb);
+      }
+      setHeight(Math.max(40, Math.ceil(bottom + 10)));
+    } catch { /* a preview that cannot measure keeps its last height */ }
+  };
+
+  return (
+    <div>
+      {label && <div className="preview-label">{label}</div>}
+      <div ref={boxRef} data-print-preview={label || ''}
+        style={{border:'1px solid var(--border)', borderRadius:'8px', background:'#fff',
+                overflow:'hidden', height: `${Math.ceil(height * scale)}px`}}>
+        <iframe ref={frameRef} title={label || 'Print preview'} srcDoc={html} onLoad={measure}
+          style={{width:`${PRINT_PAGE_WIDTH_PX}px`, height:`${height}px`, border:0, display:'block',
+                  transform:`scale(${scale})`, transformOrigin:'0 0', background:'#fff'}} />
+      </div>
+      <small style={{color:'var(--text-muted)', fontSize:'0.72rem'}}>
+        Drawn by the same code that prints — updates as you type. Not saved until you press Save.
+      </small>
+    </div>
+  );
 }
 
 export async function printPurityCertificate(cert) {
@@ -631,10 +741,11 @@ export async function printPurityCertificate(cert) {
 
   const impurities = Array.isArray(c.impurities) ? c.impurities : [];
   const impurityTable = impurities.length ? `
+    <div class="cert-imp">
     <div class="cert-imp-title">Analysis Report</div>
     <table class="ctab">
       <thead><tr>
-        <th class="c" style="width:8%">Sr. No.</th><th>Impurity</th><th class="c" style="width:28%">Content (PPM)</th>
+        <th class="c">Sr. No.</th><th>Impurity</th><th class="c">Content (PPM)</th>
       </tr></thead>
       <tbody>${impurities.map((r, i) => `
         <tr>
@@ -642,18 +753,16 @@ export async function printPurityCertificate(cert) {
           <td>${esc(r.name || '')}</td>
           <td class="c">${esc(r.ppm_text || '')}</td>
         </tr>`).join('')}</tbody>
-    </table>` : '';
+    </table>
+    </div>` : '';
 
-  // "For," / a blank line to sign in / the business name. Nothing else: no contact line, no phone
-  // number. The blank IS the signing space, so the name sits under the signature the way a
-  // hand-signed letter reads. The box keeps its existing position and width; only its contents
-  // and their left alignment changed.
+  // Business name, then "Authorised Signature" beneath it — the challan's right-hand sign-off.
+  // The name comes from the Business Profile (R74, R147).
   const signature = `
     <div class="cert-sign">
       <div class="box">
-        <div class="for">For,</div>
-        <div class="gap"></div>
         <div class="biz">${esc(business.business_name || '')}</div>
+        <div class="auth">Authorised Signature</div>
       </div>
     </div>`;
 
@@ -662,7 +771,7 @@ export async function printPurityCertificate(cert) {
   <link href="https://fonts.googleapis.com/css2?family=Noto+Sans+Gujarati&display=swap" rel="stylesheet">
   <style>${printDocStyles()}</style>
   <style>${printCertStyles()}</style></head><body>
-  ${printCertHeader('Quality Test Certificate', business)}
+  ${printCertHeader(CERTIFICATE_TITLE, business)}
 
   <div class="cert-meta">
     <div class="pair">
@@ -2951,6 +3060,7 @@ export async function printRentalSummary(charge) {
     <tfoot><tr class="tot"><td colspan="7" class="r">TOTAL...</td><td class="r">${(c.total_amount || 0).toFixed(2)}</td></tr></tfoot>
   </table>
   <div class="terms">Days charged = days held (since last charge) minus ${c.free_days} free day(s), at ₹${(c.rate_per_day || 0).toFixed(2)} per day per cylinder.</div>
+  ${printSignsBlock(business)}
   ${printFitAndPrintScript()}
   </body></html>`;
   writePrintDoc(w, html);

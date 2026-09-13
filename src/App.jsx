@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import * as XLSX from 'xlsx';
-import { TransactionEntry, StepUpVerificationModal, displayContact } from './components.jsx';
+import { TransactionEntry, StepUpVerificationModal, displayContact, PrintHeaderPreview, challanHeaderPreviewDoc, certificateHeaderPreviewDoc } from './components.jsx';
 import { CustomerDetail, Payments, CylinderInventory, CylinderAgingReport, TransactionHistory, Reports, PaymentForm, FillingListPage } from './pages.jsx';
 // F-11 defaults live in their own module; re-exported so pages.jsx keeps one import source.
 export { GAS_PURITY_DEFAULTS, purityDefaultsFor } from './purityDefaults.js';
@@ -112,6 +112,68 @@ export function maintenanceLocationCode() {
 // The backup fetch is NOT approval-gated (30 Aug 2026, owner's instruction): a daily backup
 // that demands a trusted-person code every time does not get taken. The server records every
 // backup in the audit log instead (R146).
+// ── Backup download progress ──
+// The server sends X-Estimated-Backup-Bytes: an APPROXIMATE size of the zip it is about to stream.
+// Only a whole positive integer counts; anything else means "no estimate", and the caller shows the
+// plain spinner instead of a bar measured against a guess.
+export function parseBackupEstimate(value) {
+  const t = String(value == null ? '' : value).trim();
+  if (!/^\d+$/.test(t)) return null;
+  const n = Number(t);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+// Reads the body chunk by chunk, reporting a percentage of the estimate as bytes arrive. Capped at
+// 99 however far past the estimate the download runs: 100 is only ever reached by the stream
+// actually ending, which is the caller's next step, never by arithmetic. onPercent(null) means
+// "no usable estimate — indeterminate".
+async function readBackupBody(res, onPercent) {
+  const est = parseBackupEstimate(res.headers.get('X-Estimated-Backup-Bytes'));
+  const type = res.headers.get('Content-Type') || 'application/zip';
+  if (!res.body || typeof res.body.getReader !== 'function') {
+    onPercent(null);
+    return await res.blob();
+  }
+  onPercent(est ? 0 : null);
+  const reader = res.body.getReader();
+  const chunks = [];
+  let received = 0, shown = est ? 0 : null;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      chunks.push(value);
+      received += value.byteLength;
+      if (est) {
+        const pct = Math.min(99, Math.round((received / est) * 100));
+        if (pct !== shown) { shown = pct; onPercent(pct); }
+      }
+    }
+  } catch {
+    // A dropped connection, or the server abandoning the archive mid-stream. Nothing has been
+    // written: the folder still holds the previous backup.
+    throw new LB.LocalBackupError('network',
+      'The backup download was interrupted before it finished. Nothing was written — your previous backup is untouched. Try again.');
+  }
+  return new Blob(chunks, { type });
+}
+
+// The one progress bar. `percent` 0–100; `tone` 'active' | 'done' | 'failed'. Purely visual —
+// it shows whatever it is given, and its callers are what keep 100 honest.
+export function ProgressBar({ percent = 0, tone = 'active', height = 8, style, label }) {
+  const pct = Math.max(0, Math.min(100, Number(percent) || 0));
+  const fill = tone === 'failed' ? '#dc2626' : tone === 'done' ? '#16a34a' : 'var(--primary, #2563eb)';
+  return (
+    <div role="progressbar" aria-valuemin={0} aria-valuemax={100} aria-valuenow={Math.round(pct)}
+      aria-label={label || 'Progress'}
+      style={{ height: `${height}px`, background: tone === 'failed' ? '#fee2e2' : 'var(--border, #e2e8f0)',
+               borderRadius: `${height}px`, overflow: 'hidden', ...style }}>
+      <div style={{ height: '100%', width: `${pct}%`, background: fill, borderRadius: `${height}px`,
+                    transition: 'width 0.25s ease-out, background 0.2s' }} />
+    </div>
+  );
+}
+
 export function useLocalBackup() {
   const supported = LB.isSupported();
   const [folder, setFolder] = useState(null);   // { handle, name } | null
@@ -119,6 +181,11 @@ export function useLocalBackup() {
   const [last, setLast] = useState(null);       // Date | null
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  // null when idle. While running: { phase: 'downloading', percent } — percent null means no
+  // estimate, so show a spinner — then { phase: 'finishing' } for the local write. A failure
+  // leaves { phase: 'failed', percent } (where it stopped) until the next attempt, so it can never
+  // be mistaken for a download still in progress.
+  const [progress, setProgress] = useState(null);
 
   useEffect(() => {
     if (!supported) return;
@@ -176,6 +243,9 @@ export function useLocalBackup() {
   const update = async () => {
     if (!folder || busy) return false;
     setError(''); setBusy(true);
+    setProgress({ phase: 'downloading', percent: null });
+    let lastPercent = null;
+    const fail = () => setProgress({ phase: 'failed', percent: lastPercent });
     try {
       // Re-check permission at the moment of use: it can be withdrawn between page load and
       // this click, and a stale 'granted' would surface as an opaque write error instead.
@@ -183,28 +253,35 @@ export function useLocalBackup() {
       if (state === 'gone') {
         await LB.clearFolder(); setFolder(null); setPerm('unset');
         setError('We couldn’t reach your backup folder — set it up again.');
-        setBusy(false); return false;
+        setProgress(null); setBusy(false); return false;
       }
       if (state !== 'granted') {
         setPerm(state);
         setError('This folder needs permission again before a backup can be written.');
-        setBusy(false); return false;
+        setProgress(null); setBusy(false); return false;
       }
 
       const res = await apiFetch(`${API_URL}/profile/backup`);
       if (!res.ok) {
         setError(await apiErrorMessage(res, 'The backup could not be built on the server.'));
-        setBusy(false); return false;
+        fail(); setBusy(false); return false;
       }
-      const blob = await res.blob();
+      const blob = await readBackupBody(res, (pct) => {
+        lastPercent = pct;
+        setProgress({ phase: 'downloading', percent: pct });
+      });
+      // The stream has genuinely ended — only now may anything read as complete.
+      setProgress({ phase: 'finishing' });
       await LB.writeBackup(folder.handle, blob);
 
       // Only now — after close() committed the file. A failed write must never leave a
       // timestamp that makes the next page load look like everything is fine.
       setLast(LB.setLastRunNow());
+      setProgress(null);
       showToast(`Backup written to "${folder.name}".`, 'success');
       setBusy(false); return true;
     } catch (e) {
+      fail();
       if (e && e.kind === 'permission') setPerm('prompt');
       if (e && e.kind === 'gone') { await LB.clearFolder(); setFolder(null); setPerm('unset'); }
       setError((e && e.message) || 'The backup could not be written to that folder.');
@@ -212,7 +289,7 @@ export function useLocalBackup() {
     }
   };
 
-  return { supported, folder, perm, last, busy, error, choose, reconnect, update };
+  return { supported, folder, perm, last, busy, error, progress, choose, reconnect, update };
 }
 // Mutating the arrays does not re-render anything on its own — React has no idea they changed.
 // Components that RENDER a location list call useLocations() so this event forces them to redraw.
@@ -3119,15 +3196,21 @@ export function Dashboard({ onNavigate }) {
           <div
             role="button" tabIndex={0}
             title={`Write a backup into "${backup.folder.name}" now`}
-            style={{ cursor: backup.busy ? 'wait' : 'pointer' }}
             onClick={() => { if (!backup.busy) backup.update(); }}
             onKeyDown={(e) => { if ((e.key === 'Enter' || e.key === ' ') && !backup.busy) { e.preventDefault(); backup.update(); } }}
-            className={`stat-card ${backupDoneToday ? 'green' : 'purple'}`}>
+            className={`stat-card ${backupDoneToday ? 'green' : 'purple'}`}
+            style={{ cursor: backup.busy ? 'wait' : 'pointer', position: 'relative', overflow: 'hidden' }}>
             <div className="stat-icon">{backup.busy ? '⏳' : (backupDoneToday ? '🛟' : '⚠️')}</div>
             <div className="stat-body">
               <h3>Backup</h3>
               <div className="value" style={{fontSize:'1.15rem'}}>
-                {backup.busy ? 'Writing…' : (backupDoneToday ? 'Done today' : 'Back up now')}
+                {(() => {
+                  const p = backup.progress;
+                  if (p && p.phase === 'downloading') return p.percent == null ? 'Writing…' : `${p.percent}%`;
+                  if (p && p.phase === 'finishing') return 'Finishing…';
+                  if (p && p.phase === 'failed') return 'Failed';
+                  return backup.busy ? 'Writing…' : (backupDoneToday ? 'Done today' : 'Back up now');
+                })()}
               </div>
               <div style={{fontSize:'0.72rem', color:'var(--text-muted)', marginTop:'0.25rem'}}>
                 {backup.error
@@ -3135,6 +3218,14 @@ export function Dashboard({ onNavigate }) {
                   : `Last backup: ${LB.lastRunLabel(backup.last)} · ${backup.folder.name}`}
               </div>
             </div>
+            {/* Laid along the card's bottom edge, out of flow, so the tile keeps its exact size
+                while a backup runs. Absent when there is no estimate (the value reads "Writing…"). */}
+            {backup.progress && !(backup.progress.phase === 'downloading' && backup.progress.percent == null) && (
+              <ProgressBar height={4} label="Backup progress"
+                percent={backup.progress.phase === 'finishing' ? 100 : (backup.progress.percent ?? 100)}
+                tone={backup.progress.phase === 'failed' ? 'failed' : backup.progress.phase === 'finishing' ? 'done' : 'active'}
+                style={{ position: 'absolute', left: 0, right: 0, bottom: 0, borderRadius: 0 }} />
+            )}
           </div>
         ) : (
           <div {...cardProps('Set up the local backup folder in Profile', () => {
@@ -4141,6 +4232,42 @@ export function ImportDataSection() {
   );
 }
 
+// An ordered list of one-line letterhead entries with add / remove. Used for the challan's
+// Products / Manufacturing lines and the certificate's tagline — two fields, one editing pattern
+// (R79), so they look alike in Settings while printing on entirely separate documents.
+function LinesEditor({ lines, onChange, placeholder }) {
+  const rows = Array.isArray(lines) && lines.length ? lines : [''];
+  return (
+    <>
+      <div style={{display:'flex', flexDirection:'column', gap:'0.4rem'}}>
+        {rows.map((line, i) => (
+          <div key={i} style={{display:'flex', gap:'0.4rem', alignItems:'center'}}>
+            <input className="form-control" value={line}
+              placeholder={i === 0 ? placeholder : 'Another line…'}
+              onChange={(e) => { const next = [...rows]; next[i] = e.target.value; onChange(next); }} />
+            <button type="button" className="btn btn-secondary" style={{padding:'0.3rem 0.6rem'}}
+              title="Remove this line"
+              onClick={() => onChange(rows.filter((_, j) => j !== i))}>🗑️</button>
+          </div>
+        ))}
+      </div>
+      <button type="button" className="link-btn" style={{fontSize:'0.82rem', marginTop:'0.45rem'}}
+        onClick={() => onChange([...rows, ''])}>+ Add another line</button>
+    </>
+  );
+}
+
+// Settings tabs. Every section is rendered all the time and only the inactive ones are hidden, so
+// switching tabs never unmounts a form — half-typed input in one tab is still there on return.
+const SETTINGS_TABS = [
+  { key: 'business',  label: '🏢 Business & Branding' },
+  { key: 'locations', label: '📍 Locations' },
+  { key: 'numbering', label: '🔢 Numbering' },
+  { key: 'account',   label: '🔐 Account & Security' },
+  { key: 'data',      label: '🛟 Data & Privacy' },
+  { key: 'masters',   label: '🛢️ Gas Types & Import' }
+];
+
 export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
   // cannot see on its own. This subscribes to the refresh so the list below redraws.
@@ -4148,11 +4275,18 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   const [account, setAccount] = useState(null);
   const [business, setBusiness] = useState({ business_name:'', business_address:'', business_phone:'', gst_number:'',
     certification_line:'', business_email:'', products_line:'', products_lines:[], contact_lines:[], logo_scale:100, logo:'',
+    certificate_tagline_lines:[],
     // F-11 certificate identity (kept here so a Business Info save never drops them).
     certificate_prefix:'', footer_contact_line:'',
     // GEN-C numbering. fy_choice_locked / fy_lock_date are read-only, computed by the server.
     fy_reset_numbering:false, fy_choice_locked:false, fy_lock_date:null });
   const [loading, setLoading] = useState(true);
+  // Opens on Data & Privacy when the Dashboard's Backup tile sent the user here (see the deep-link
+  // effect below); otherwise on the first tab.
+  const [tab, setTab] = useState(() => {
+    try { if (sessionStorage.getItem('cp_scroll_local_backup') === '1') return 'data'; } catch {}
+    return 'business';
+  });
   const [exporting, setExporting] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
   // Location profiles (Phase 2): 3 fixed sites, each with manager/contact/challan prefix,
@@ -4283,8 +4417,11 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
       context: 'save Business Information changes (name, address, GST, certification line, e-mail, products line, printed contact lines, logo)',
       action: async (auth) => {
         try {
+          // The certificate's fields save from their own card; leaving them out here means a
+          // Business Info save can never push a half-edited certificate tagline along with it.
+          const { certificate_prefix, footer_contact_line, certificate_tagline_lines, ...letterhead } = business;
           const res = await apiFetch(`${API_URL}/profile/business`, {
-            method:'PUT', headers: { 'x-step-up-token': auth.step_up_token }, body: JSON.stringify(business)
+            method:'PUT', headers: { 'x-step-up-token': auth.step_up_token }, body: JSON.stringify(letterhead)
           });
           if (res.ok) {
             // The name feeds the tab title and every export file name from a synchronous cache;
@@ -4294,6 +4431,31 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           }
           else showToast(await apiErrorMessage(res));
         } catch {}
+      }
+    });
+  };
+
+  // The Quality Certificate card saves ONLY its own fields, so saving the certificate never carries
+  // a half-edited challan letterhead along with it.
+  const saveCertificate = (e) => {
+    e.preventDefault();
+    setStepUpAsk({
+      title: 'Approve saving the Quality Certificate settings',
+      context: 'save the Quality Certificate settings (certificate prefix, signature line, certificate tagline)',
+      action: async (auth) => {
+        try {
+          const res = await apiFetch(`${API_URL}/profile/business`, {
+            method: 'PUT',
+            headers: { 'x-step-up-token': auth.step_up_token },
+            body: JSON.stringify({
+              certificate_prefix: business.certificate_prefix || '',
+              footer_contact_line: business.footer_contact_line || '',
+              certificate_tagline_lines: business.certificate_tagline_lines || []
+            })
+          });
+          if (res.ok) showToast('Certificate settings saved.', 'success');
+          else showToast(await apiErrorMessage(res));
+        } catch { showToast('Could not save the certificate settings.'); }
       }
     });
   };
@@ -4570,7 +4732,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // backup ran today or whether the folder is still reachable.
   const {
     supported: lbSupported, folder: lbFolder, perm: lbPerm, last: lbLast,
-    busy: lbBusy, error: lbError, choose: lbChoose, reconnect: lbReconnect, update: lbUpdate
+    busy: lbBusy, error: lbError, progress: lbProgress, choose: lbChoose, reconnect: lbReconnect, update: lbUpdate
   } = useLocalBackup();
   // No longer approval-gated (30 Aug 2026, owner's instruction): a daily backup that demands a
   // trusted-person code every time does not get taken. The server records every backup in the
@@ -4711,6 +4873,20 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
 
   return (
     <div>
+      {/* Settings tabs — same button-row pattern as Customer Detail's history sections. */}
+      <div className="card" style={{padding:'0.75rem 1rem'}}>
+        <div className="btn-group" role="tablist" style={{flexWrap:'wrap', margin:0}}>
+          {SETTINGS_TABS.map(t => (
+            <button key={t.key} type="button" role="tab" aria-selected={tab === t.key}
+              className={`btn ${tab === t.key ? 'btn-primary' : 'btn-secondary'}`}
+              onClick={() => setTab(t.key)}>
+              {t.label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <div hidden={tab !== 'business'}>
       {/* A. Business Information */}
       <div className="card">
         <h2>Business Information</h2>
@@ -4719,6 +4895,8 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           capitals stay capitals, and a blank field is left off the page entirely.
         </p>
         <form onSubmit={saveBusiness}>
+          <div className="with-preview">
+          <div>
           <div className="form-row">
             <div className="form-group">
               <label>Business Name</label>
@@ -4761,64 +4939,18 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                 onChange={(e) => setBusiness({...business, business_email: e.target.value})} />
             </div>
           </div>
-          {/* An ordered list rather than one box: this line grew into several on the certificate
-              letterhead, and a business should be able to add or drop one without a developer.
-              Same shape as Printed Contact Lines above (R79) — one idea, one pattern. */}
+          {/* An ordered list rather than one box, so a business can add or drop a line without a
+              developer. The CHALLAN's line only — the certificate has its own, below. */}
           <div className="form-group">
             <label>Products / Manufacturing Lines</label>
             <small style={{display:'block', color:'var(--text-muted)', fontSize:'0.75rem', marginBottom:'0.5rem'}}>
-              Printed under the letterhead and on the right of a certificate's header — one line
-              each, exactly as typed. Add as many as you need; blank ones are left off the page.
+              Printed under the challan and holding-statement letterhead — one line each, exactly as
+              typed. Blank ones are left off the page. The Quality Certificate has its own tagline
+              under Quality Certificate below, and is not affected by these.
             </small>
-            <div style={{display:'flex', flexDirection:'column', gap:'0.4rem'}}>
-              {(business.products_lines && business.products_lines.length
-                  ? business.products_lines : ['']).map((line, i) => (
-                <div key={i} style={{display:'flex', gap:'0.4rem', alignItems:'center'}}>
-                  <input className="form-control" value={line}
-                    placeholder={i === 0 ? 'e.g. Mfg.: Industrial & Medical gases' : 'Another line…'}
-                    onChange={(e) => {
-                      const next = [...(business.products_lines || [''])];
-                      next[i] = e.target.value;
-                      setBusiness({...business, products_lines: next});
-                    }} />
-                  <button type="button" className="btn btn-secondary"
-                    style={{padding:'0.3rem 0.6rem'}}
-                    title="Remove this line"
-                    onClick={() => {
-                      const next = (business.products_lines || ['']).filter((_, j) => j !== i);
-                      setBusiness({...business, products_lines: next});
-                    }}>🗑️</button>
-                </div>
-              ))}
-            </div>
-            <button type="button" className="link-btn" style={{fontSize:'0.82rem', marginTop:'0.45rem'}}
-              onClick={() => setBusiness({
-                ...business, products_lines: [...(business.products_lines || ['']), '']
-              })}>+ Add another line</button>
-          </div>
-          {/* F-11: identity used only by Purity Test Certificates. Both blank by default — a
-              guessed prefix would print one client's initials on another client's certificate. */}
-          <div className="form-row">
-            <div className="form-group">
-              <label>Certificate Prefix</label>
-              <input className="form-control" value={business.certificate_prefix || ''}
-                placeholder="e.g. GI"
-                onChange={(e) => setBusiness({...business, certificate_prefix: e.target.value})} />
-              <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
-                Starts every certificate number: <code>PREFIX/TC/2026-27/1</code>. Leave blank and
-                the segment is dropped entirely rather than printing a leading slash.
-              </small>
-            </div>
-            <div className="form-group">
-              <label>Certificate Signature Line</label>
-              <input className="form-control" value={business.footer_contact_line || ''}
-                placeholder="e.g. M 90000 00000"
-                onChange={(e) => setBusiness({...business, footer_contact_line: e.target.value})} />
-              <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
-                Printed under the business name where a certificate is signed off. Separate from the
-                letterhead contact box above — a certificate signs off with one line, not three.
-              </small>
-            </div>
+            <LinesEditor lines={business.products_lines}
+              placeholder="e.g. Mfg.: Industrial & Medical gases"
+              onChange={(next) => setBusiness({...business, products_lines: next})} />
           </div>
           <div className="form-group">
             <label>Printed Contact Lines</label>
@@ -4859,7 +4991,67 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                         borderRadius:'6px', border:'1px solid var(--border)'}} />
             </div>
           )}
+          </div>
+          <div className="preview-col">
+            <PrintHeaderPreview label="Challan header — live preview"
+              doc={challanHeaderPreviewDoc(business)} />
+          </div>
+          </div>
           <button type="submit" className="btn btn-primary">Save Business Info</button>
+        </form>
+      </div>
+
+      {/* Quality Certificate. Its own card and its own save: the certificate's letterhead is a
+          different document from the challan's, and its tagline is a different field. */}
+      <div className="card">
+        <h2>Quality Certificate</h2>
+        <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
+          Settings used only on Quality Test Certificates. The logo and address come from Business
+          Information above; everything here prints on the certificate and nowhere else.
+        </p>
+        <form onSubmit={saveCertificate}>
+          <div className="with-preview">
+            <div>
+              <div className="form-group">
+                <label>Certificate Tagline</label>
+                <small style={{display:'block', color:'var(--text-muted)', fontSize:'0.75rem', marginBottom:'0.5rem'}}>
+                  Printed on the right of the certificate header, one line each, <strong>exactly as
+                  typed</strong> — no label is added. Separate from the challan's Products /
+                  Manufacturing Lines: changing one never changes the other.
+                </small>
+                <LinesEditor lines={business.certificate_tagline_lines}
+                  placeholder="e.g. Manufacturers of Industrial & Medical Gases"
+                  onChange={(next) => setBusiness({...business, certificate_tagline_lines: next})} />
+              </div>
+              <div className="form-row">
+                <div className="form-group">
+                  <label>Certificate Prefix</label>
+                  <input className="form-control" value={business.certificate_prefix || ''}
+                    placeholder="e.g. GI"
+                    onChange={(e) => setBusiness({...business, certificate_prefix: e.target.value})} />
+                  <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                    Starts every certificate number: <code>PREFIX/TC/2026-27/1</code>. Leave blank and
+                    the segment is dropped entirely rather than printing a leading slash.
+                  </small>
+                </div>
+                <div className="form-group">
+                  <label>Certificate Signature Line</label>
+                  <input className="form-control" value={business.footer_contact_line || ''}
+                    placeholder="e.g. M 90000 00000"
+                    onChange={(e) => setBusiness({...business, footer_contact_line: e.target.value})} />
+                  <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
+                    Stored for the certificate's sign-off. The current certificate layout signs off
+                    with "For," and the business name only, so this line is not printed at present.
+                  </small>
+                </div>
+              </div>
+            </div>
+            <div className="preview-col">
+              <PrintHeaderPreview label="Certificate header — live preview"
+                doc={certificateHeaderPreviewDoc(business)} />
+            </div>
+          </div>
+          <button type="submit" className="btn btn-primary">Save Certificate Settings</button>
         </form>
       </div>
 
@@ -4970,65 +5162,14 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         </form>
       </div>
 
-      {/* A1b. Bill & Receipt Numbering (Phase GEN-C) */}
-      <div className="card">
-        <h2>Bill &amp; Receipt Numbering</h2>
-        <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
-          Whether your bill and receipt numbers start again at the beginning of each financial year.
-        </p>
-
-        <div style={{display:'flex', flexDirection:'column', gap:'0.6rem'}}>
-          {[
-            { value:false, title:'One continuous series',
-              detail:'Numbers keep counting up for the life of the account — 1A001, 1A002, … and on past 1 April.' },
-            { value:true, title:'Restart every financial year',
-              detail:'On 1 April the series begins again at 1A001 and RCP-0001. Last year\u2019s numbers stay exactly as they were printed.' }
-          ].map(opt => {
-            const selected = !!business.fy_reset_numbering === opt.value;
-            return (
-              <label key={String(opt.value)}
-                style={{
-                  display:'flex', gap:'0.7rem', alignItems:'flex-start', padding:'0.75rem 0.9rem',
-                  border:`1px solid ${selected ? 'var(--primary, #2563eb)' : 'var(--border)'}`,
-                  borderRadius:'8px',
-                  background: selected ? 'color-mix(in srgb, var(--primary, #2563eb) 7%, transparent)' : 'transparent',
-                  cursor: business.fy_choice_locked ? 'not-allowed' : 'pointer',
-                  opacity: business.fy_choice_locked && !selected ? 0.55 : 1
-                }}>
-                <input type="radio" name="fy_reset_numbering" style={{marginTop:'0.2rem'}}
-                  checked={selected}
-                  disabled={business.fy_choice_locked}
-                  onChange={() => { if (!business.fy_choice_locked) saveNumbering(opt.value); }} />
-                <span>
-                  <span style={{fontWeight:600, fontSize:'0.9rem', display:'block'}}>{opt.title}</span>
-                  <span style={{fontSize:'0.8rem', color:'var(--text-muted)'}}>{opt.detail}</span>
-                </span>
-              </label>
-            );
-          })}
-        </div>
-
-        {business.fy_choice_locked ? (
-          <div className="alert alert-info" style={{marginTop:'1rem', fontSize:'0.82rem'}}>
-            🔒 This choice is now permanent. It locked on{' '}
-            <strong>{business.fy_lock_date ? formatDate(business.fy_lock_date) : '1 April'}</strong> — the first
-            1 April after this account was created. A full year of bills has been issued under it, so changing
-            it now would either repeat numbers already given to customers or skip a year.
-          </div>
-        ) : (
-          <div className="alert alert-warning" style={{marginTop:'1rem', fontSize:'0.82rem'}}>
-            ⏳ You can change this until{' '}
-            <strong>{business.fy_lock_date ? formatDate(business.fy_lock_date) : '1 April'}</strong>, after which
-            it is permanent. Pick it before your first 1 April — it cannot be undone later.
-          </div>
-        )}
       </div>
 
+      <div hidden={tab !== 'locations'}>
       {/* A2. Location Profiles — one card per fixed site (manager / contact / challan prefix) */}
       <div className="card">
         <h2>Location Profiles</h2>
         <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
-          Per-site manager, contact number, and challan prefix. Business Information above stays shared across all sites.
+          Per-site manager, contact number, and challan prefix. Business Information (under Business &amp; Branding) stays shared across all sites.
         </p>
         {!addLoc && (
           <div style={{marginBottom:'1rem'}}>
@@ -5174,7 +5315,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                   onChange={(e) => setLocField(p.location, 'contact_number', e.target.value)} />
                 <small style={{color:'var(--text-muted)', fontSize:'0.75rem'}}>
                   This site's own contact. The numbers printed on challans are set separately, under
-                  Business Information.
+                  Business &amp; Branding → Business Information.
                 </small>
               </div>
               <div className="form-group">
@@ -5214,6 +5355,66 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         </div>
       </div>
 
+      </div>
+
+      <div hidden={tab !== 'numbering'}>
+      {/* A1b. Bill & Receipt Numbering (Phase GEN-C) */}
+      <div className="card">
+        <h2>Bill &amp; Receipt Numbering</h2>
+        <p style={{color:'var(--text-muted)', fontSize:'0.82rem', marginTop:'-0.5rem', marginBottom:'1rem'}}>
+          Whether your bill and receipt numbers start again at the beginning of each financial year.
+        </p>
+
+        <div style={{display:'flex', flexDirection:'column', gap:'0.6rem'}}>
+          {[
+            { value:false, title:'One continuous series',
+              detail:'Numbers keep counting up for the life of the account — 1A001, 1A002, … and on past 1 April.' },
+            { value:true, title:'Restart every financial year',
+              detail:'On 1 April the series begins again at 1A001 and RCP-0001. Last year\u2019s numbers stay exactly as they were printed.' }
+          ].map(opt => {
+            const selected = !!business.fy_reset_numbering === opt.value;
+            return (
+              <label key={String(opt.value)}
+                style={{
+                  display:'flex', gap:'0.7rem', alignItems:'flex-start', padding:'0.75rem 0.9rem',
+                  border:`1px solid ${selected ? 'var(--primary, #2563eb)' : 'var(--border)'}`,
+                  borderRadius:'8px',
+                  background: selected ? 'color-mix(in srgb, var(--primary, #2563eb) 7%, transparent)' : 'transparent',
+                  cursor: business.fy_choice_locked ? 'not-allowed' : 'pointer',
+                  opacity: business.fy_choice_locked && !selected ? 0.55 : 1
+                }}>
+                <input type="radio" name="fy_reset_numbering" style={{marginTop:'0.2rem'}}
+                  checked={selected}
+                  disabled={business.fy_choice_locked}
+                  onChange={() => { if (!business.fy_choice_locked) saveNumbering(opt.value); }} />
+                <span>
+                  <span style={{fontWeight:600, fontSize:'0.9rem', display:'block'}}>{opt.title}</span>
+                  <span style={{fontSize:'0.8rem', color:'var(--text-muted)'}}>{opt.detail}</span>
+                </span>
+              </label>
+            );
+          })}
+        </div>
+
+        {business.fy_choice_locked ? (
+          <div className="alert alert-info" style={{marginTop:'1rem', fontSize:'0.82rem'}}>
+            🔒 This choice is now permanent. It locked on{' '}
+            <strong>{business.fy_lock_date ? formatDate(business.fy_lock_date) : '1 April'}</strong> — the first
+            1 April after this account was created. A full year of bills has been issued under it, so changing
+            it now would either repeat numbers already given to customers or skip a year.
+          </div>
+        ) : (
+          <div className="alert alert-warning" style={{marginTop:'1rem', fontSize:'0.82rem'}}>
+            ⏳ You can change this until{' '}
+            <strong>{business.fy_lock_date ? formatDate(business.fy_lock_date) : '1 April'}</strong>, after which
+            it is permanent. Pick it before your first 1 April — it cannot be undone later.
+          </div>
+        )}
+      </div>
+
+      </div>
+
+      <div hidden={tab !== 'account'}>
       {/* B. Account Information */}
       <div className="card">
         <h2>Account Information</h2>
@@ -5296,6 +5497,22 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
       {/* C3. Currently logged-in devices/sessions (Phase 17) */}
       <SessionsSection onLoggedOut={onLoggedOut} />
 
+      {/* C4. This browser's session — was a sub-block at the foot of Data & Privacy. */}
+      <div className="card">
+          <h2>Active Session</h2>
+          <p style={{fontSize:'0.85rem', color:'var(--text-2)'}}>
+            <strong>Signed in:</strong> {account.last_login ? formatDateTime(account.last_login) : '—'}<br/>
+            <strong>Device:</strong> {sessionInfo.device}
+          </p>
+          <div style={{display:'flex', flexWrap:'wrap', gap:'0.5rem'}}>
+            <button className="btn btn-primary" onClick={onLoggedOut}>Sign Out</button>
+            <button className="btn btn-secondary" onClick={logoutAll}>Log Out All Sessions</button>
+          </div>
+        </div>
+
+      </div>
+
+      <div hidden={tab !== 'data'}>
       {/* D. Data & Privacy */}
       <div className="card">
         <h2>Data &amp; Privacy</h2>
@@ -5433,7 +5650,35 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                   <button className="btn btn-primary" onClick={lbUpdate} disabled={lbBusy}>
                     {lbBusy ? 'Writing backup…' : 'Update Backup'}
                   </button>
-                  {lbBusy && <div style={{marginTop:'0.5rem'}}><Spinner label="Building and writing the backup…" /></div>}
+                  {lbProgress && (
+                    lbProgress.phase === 'downloading' && lbProgress.percent == null
+                      // No usable size estimate: the spinner this always showed, not a bar at 0%.
+                      ? <div style={{marginTop:'0.5rem'}}><Spinner label="Building and writing the backup…" /></div>
+                      : (
+                        <div style={{marginTop:'0.75rem', maxWidth:'420px'}}>
+                          <div style={{display:'flex', justifyContent:'space-between', gap:'0.5rem', fontSize:'0.8rem', marginBottom:'0.3rem',
+                                       color: lbProgress.phase === 'failed' ? '#b91c1c' : 'var(--text-muted)'}}>
+                            <span>
+                              {lbProgress.phase === 'downloading' && 'Downloading backup…'}
+                              {lbProgress.phase === 'finishing' && `Finishing… writing it into "${lbFolder.name}"`}
+                              {lbProgress.phase === 'failed' && 'Backup failed — nothing was saved'}
+                            </span>
+                            <span style={{fontWeight:600, whiteSpace:'nowrap'}}>
+                              {lbProgress.phase === 'downloading' && `${lbProgress.percent}%`}
+                              {lbProgress.phase === 'failed' && lbProgress.percent != null && `stopped at ${lbProgress.percent}%`}
+                            </span>
+                          </div>
+                          <ProgressBar label="Backup progress"
+                            percent={lbProgress.phase === 'finishing' ? 100 : (lbProgress.percent ?? 100)}
+                            tone={lbProgress.phase === 'failed' ? 'failed' : lbProgress.phase === 'finishing' ? 'done' : 'active'} />
+                          {lbProgress.phase === 'downloading' && (
+                            <div style={{fontSize:'0.72rem', color:'var(--text-muted)', marginTop:'0.25rem'}}>
+                              Approximate — measured against an estimate of the backup's size.
+                            </div>
+                          )}
+                        </div>
+                      )
+                  )}
                 </>
               )}
             </div>
@@ -5569,24 +5814,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           )}
         </div>
 
-        <div style={{marginTop:'1.5rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>
-          <h3 style={{fontSize:'1rem'}}>Active Session</h3>
-          <p style={{fontSize:'0.85rem', color:'var(--text-2)'}}>
-            <strong>Signed in:</strong> {account.last_login ? formatDateTime(account.last_login) : '—'}<br/>
-            <strong>Device:</strong> {sessionInfo.device}
-          </p>
-          <div style={{display:'flex', flexWrap:'wrap', gap:'0.5rem'}}>
-            <button className="btn btn-primary" onClick={onLoggedOut}>Sign Out</button>
-            <button className="btn btn-secondary" onClick={logoutAll}>Log Out All Sessions</button>
-          </div>
-        </div>
       </div>
-
-      {/* E0. Gas Types & Cylinder Sizes (Phase 9) — open (no auth) until auth-gating lands */}
-      <MastersSection />
-
-      {/* E. Bulk Import (one-time onboarding) */}
-      <ImportDataSection />
 
       {/* F. Danger Zone */}
       <div className="danger-zone">
@@ -5599,6 +5827,16 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           <button className="btn btn-danger" onClick={() => setShowDelete(true)}>Delete Account</button>
         </div>
       </div>
+      </div>
+
+      <div hidden={tab !== 'masters'}>
+      {/* E0. Gas Types & Cylinder Sizes (Phase 9) — open (no auth) until auth-gating lands */}
+      <MastersSection />
+
+      {/* E. Bulk Import (one-time onboarding) */}
+      <ImportDataSection />
+      </div>
+
       {showDelete && <DeleteAccountModal onClose={() => setShowDelete(false)} onDeleted={onLoggedOut} />}
       {stepUpAsk && (
         <StepUpVerificationModal title={stepUpAsk.title} context={stepUpAsk.context}
