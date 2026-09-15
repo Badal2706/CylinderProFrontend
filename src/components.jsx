@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, showToast, formatDate, istDateInput, istTimeInput, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, useLocations, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
+import { API_URL, apiFetch, apiErrorMessage, fetchAllPages, readListResponse, showToast, formatDate, istDateInput, istTimeInput, directionText, GAS_CAPACITIES, sortGasTypes, sortCapacities, LOCATIONS, LOCATION_LABELS, useLocations, locationText, getActiveLocation, Modal, Spinner } from './App.jsx';
 import { PaymentForm, directionLabel } from './pages.jsx';
 
 // Phase 34: Bill Date time-of-day helpers. nowHHMM() seeds the time input with the current time;
@@ -928,6 +928,87 @@ export function StepUpVerificationModal({ title = 'Approval required', message =
 }
 
 // Transaction Entry Component
+// ─── New Transaction's picker lists, kept for the life of this browser tab ───
+// The customer, cylinder and in-rotation lists used to be downloaded from scratch every time the
+// form opened — about 10 MB of database reads per open on a real account, and on the free Atlas
+// tier that repeated reading used up the weekly data-transfer allowance and got the database
+// throttled (15 Sep 2026). They are now kept here and reused, and refreshed only when:
+//   · the kept copy is older than TXN_LISTS_MAX_AGE_MS when the form opens,
+//   · anything in this tab changed data (apiFetch announces every successful write),
+//   · a bill is saved from this form, or the server refuses a save,
+//   · the user presses Refresh.
+// The pickers may therefore be a few minutes behind another computer's entries. That is safe:
+// every save is still checked against live data by the server, which refuses a cylinder that is
+// no longer available — and a refused save refreshes the lists at once.
+const TXN_LISTS_MAX_AGE_MS = 5 * 60 * 1000;
+const txnLists = { owner: null, data: null, loadedAt: 0, stale: false, inflight: null, error: '', listeners: new Set() };
+
+// Whose lists these are. A different sign-in in the same tab must never see the previous account's.
+const txnListsOwner = () => { try { return localStorage.getItem('currentUser') || ''; } catch { return ''; } };
+const notifyTxnLists = () => txnLists.listeners.forEach((fn) => fn());
+
+if (typeof window !== 'undefined') {
+  window.addEventListener('cp-data-changed', () => { txnLists.stale = true; });
+  window.addEventListener('auth-logout', () => { txnLists.data = null; txnLists.owner = null; txnLists.loadedAt = 0; });
+}
+
+// Every page of a paginated list, or an error — never a silently partial list. (fetchAllPages
+// returns [] on failure, which would replace good kept lists with empty pickers.)
+async function fetchAllRowsStrict(baseUrl, pageSize = 200) {
+  const join = baseUrl.includes('?') ? '&' : '?';
+  const first = await readListResponse(await apiFetch(`${baseUrl}${join}page=1&limit=${pageSize}`));
+  if (!first.ok) throw new Error(first.error);
+  const totalPages = first.pagination ? first.pagination.totalPages : 1;
+  const rest = await Promise.all(Array.from({ length: Math.max(0, totalPages - 1) }, (_, i) =>
+    apiFetch(`${baseUrl}${join}page=${i + 2}&limit=${pageSize}`).then((r) => readListResponse(r))));
+  const bad = rest.find((r) => !r.ok);
+  if (bad) throw new Error(bad.error);
+  return [...first.rows, ...rest.flatMap((r) => r.rows)];
+}
+
+// One load at a time; a second request while one is running just waits for it.
+function loadTxnLists() {
+  if (txnLists.inflight) return txnLists.inflight;
+  const owner = txnListsOwner();
+  txnLists.inflight = (async () => {
+    try {
+      const [customers, cylinders, inRotation] = await Promise.all([
+        fetchAllRowsStrict(`${API_URL}/customers`),
+        fetchAllRowsStrict(`${API_URL}/cylinders`),
+        (async () => {
+          const r = await apiFetch(`${API_URL}/cylinders/in-rotation`);
+          if (!r.ok) throw new Error(await apiErrorMessage(r, 'Could not load the cylinders out with customers.'));
+          const d = await r.json();
+          return Array.isArray(d) ? d : [];
+        })()
+      ]);
+      if (owner !== txnListsOwner()) return;          // signed out or switched account mid-load
+      txnLists.owner = owner;
+      txnLists.data = { customers, cylinders, inRotation };
+      txnLists.loadedAt = Date.now();
+      txnLists.stale = false;
+      txnLists.error = '';
+    } catch (e) {
+      txnLists.error = (e && e.message) || 'Could not refresh the lists.';
+      // With nothing kept to fall back on, the form cannot be used — say so, as before.
+      if (!txnLists.data) showToast(txnLists.error);
+    } finally {
+      txnLists.inflight = null;
+      notifyTxnLists();
+    }
+  })();
+  notifyTxnLists();                                   // announce "updating"
+  return txnLists.inflight;
+}
+
+const listsAgeLabel = (at) => {
+  if (!at) return '';
+  const mins = Math.floor((Date.now() - at) / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins} min ago`;
+  return `${Math.floor(mins / 60)} h ago`;
+};
+
 export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
   // cannot see on its own. This subscribes to the refresh so the list below redraws.
@@ -1042,11 +1123,35 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   }, [selectedCustomer?.customer_id]);
 
   useEffect(() => {
-    fetchCustomers();
     fetchMasterData();
-    fetchCylinders();
-    fetchInRotation();
     fetchLocationContext();
+  }, []);
+
+  // Picker lists: shown instantly from what this tab kept, refreshed in the background only when
+  // they are old, marked changed, or not loaded yet. See txnLists above.
+  const [listsInfo, setListsInfo] = useState({ loadedAt: 0, refreshing: false, error: '' });
+  const [, setAgeTick] = useState(0);
+  useEffect(() => {
+    const apply = () => {
+      const d = txnLists.data;
+      if (d && txnLists.owner === txnListsOwner()) {
+        setCustomers(d.customers);
+        // Keep the chosen customer, but on its refreshed record (holdings, balances).
+        setSelectedCustomer(prev => prev
+          ? (d.customers.find(c => String(c.customer_id) === String(prev.customer_id)) || prev)
+          : prev);
+        setCylinders(d.cylinders);
+        setInRotationCyls(d.inRotation);
+      }
+      setListsInfo({ loadedAt: txnLists.loadedAt, refreshing: !!txnLists.inflight, error: txnLists.error || '' });
+    };
+    txnLists.listeners.add(apply);
+    apply();
+    const fresh = txnLists.data && txnLists.owner === txnListsOwner() && !txnLists.stale
+      && (Date.now() - txnLists.loadedAt) < TXN_LISTS_MAX_AGE_MS;
+    if (!fresh) loadTxnLists();
+    const tick = setInterval(() => setAgeTick(n => n + 1), 30000);   // keeps "updated N min ago" true
+    return () => { txnLists.listeners.delete(apply); clearInterval(tick); };
   }, []);
 
   // Phase 27: prefill Bill Number from the sequence. Only fills the default while the user
@@ -1196,41 +1301,6 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
     setShowDrafts(false);
     setChallanError('');
     showToast(`Draft ${d.bill_number} loaded.`, 'success');
-  };
-
-  // Full inventory, not a first-200 slice — see fetchAllPages in App.jsx for why.
-  const fetchCylinders = async () => {
-    try {
-      setCylinders(await fetchAllPages(`${API_URL}/cylinders`));
-    } catch (error) {
-      console.error('Error fetching cylinders:', error);
-    }
-  };
-
-  // ALL in-rotation cylinders (each with its current holder) — pool for the Received / swap-return
-  // dropdown, and the source for client-side cross-customer mismatch detection.
-  const fetchInRotation = async () => {
-    try {
-      const res = await apiFetch(`${API_URL}/cylinders/in-rotation`);
-      const data = await res.json();
-      setInRotationCyls(Array.isArray(data) ? data : []);
-    } catch (e) {
-      console.error('Error fetching in-rotation cylinders:', e);
-      setInRotationCyls([]);
-    }
-  };
-
-  // Full customer list, not a first-200 slice — see fetchAllPages in App.jsx for why.
-  const fetchCustomers = async () => {
-    try {
-      const data = await fetchAllPages(`${API_URL}/customers`);
-      setCustomers(data);
-      setSelectedCustomer(prev => prev
-        ? (data.find(c => String(c.customer_id) === String(prev.customer_id)) || prev)
-        : prev);
-    } catch (error) {
-      console.error('Error fetching customers:', error);
-    }
   };
 
   const fetchMasterData = async () => {
@@ -1561,9 +1631,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           setDraftId(null); setDraftBillNo(''); // draft (if any) was finalized
           setEditingBillId(null); setEditingBillNo('');
           setTransferPc([]);
-          fetchCylinders(); // locations changed
+          loadTxnLists(); // cylinders moved between sites — refresh every kept list
         } else {
           showToast(await apiErrorMessage(response, 'Error saving transfer'));
+          loadTxnLists(); // the refusal may be because the kept lists were behind
         }
       } catch (error) {
         console.error('Error:', error);
@@ -1683,9 +1754,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
           });
           setEditingBillId(null); setEditingBillNo('');
           showToast(`Bill ${editingBillNo} updated.`, 'success');
-          fetchCustomers(); // refresh personalCylindersAtPlant / holdings for follow-up transactions
+          loadTxnLists(); // holdings, stock and in-rotation all changed — refresh the kept lists
         } else {
           showToast(await apiErrorMessage(response, 'Error updating bill'));
+          loadTxnLists(); // the refusal may be because the kept lists were behind
         }
         return;
       }
@@ -1710,7 +1782,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         });
         showToast(`Bill ${result.bill_number} saved.`, 'success');
         setDraftId(null); setDraftBillNo(''); // draft (if any) was finalized
-        fetchCustomers(); // refresh personalCylindersAtPlant / holdings for follow-up transactions
+        loadTxnLists(); // holdings, stock and in-rotation all changed — refresh the kept lists
       };
       const postBill = (extra) => apiFetch(`${API_URL}/bills`, {
         method: 'POST', body: JSON.stringify({ ...billData, ...(extra || {}) })
@@ -1723,6 +1795,7 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         const response = await postBill(extra);
         if (!response.ok) {
           showToast(await apiErrorMessage(response, 'Error creating bill'));
+          loadTxnLists(); // e.g. a cylinder another computer already gave out — refresh the pickers
           return;
         }
         const result = await response.json();
@@ -2286,6 +2359,22 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
             📂 Resume Saved Draft
           </button>
         )}
+      </div>
+      {/* How fresh the customer / cylinder pickers are. Saving always checks live data regardless. */}
+      <div data-lists-status
+        title="Customer and cylinder lists used by the pickers. Saving a bill always checks the live database."
+        style={{display:'flex', alignItems:'center', gap:'0.45rem', flexWrap:'wrap', fontSize:'0.75rem',
+                color:'var(--text-muted)', margin:'0.4rem 0 0.9rem'}}>
+        <span>
+          {listsInfo.refreshing
+            ? (listsInfo.loadedAt ? 'Updating lists…' : 'Loading lists…')
+            : listsInfo.loadedAt ? `Lists updated ${listsAgeLabel(listsInfo.loadedAt)}` : ''}
+        </span>
+        {!listsInfo.refreshing && listsInfo.error && listsInfo.loadedAt > 0 && (
+          <span style={{color:'#b45309'}}>· couldn’t refresh just now, showing the last good lists</span>
+        )}
+        <button type="button" className="link-btn" style={{fontSize:'0.75rem'}}
+          disabled={listsInfo.refreshing} onClick={() => loadTxnLists()}>↻ Refresh</button>
       </div>
       {draftId && (
         <div className="alert alert-warning" style={{margin:'0.75rem 0 0', fontSize:'0.82rem'}}>

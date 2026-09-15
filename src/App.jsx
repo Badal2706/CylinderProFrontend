@@ -1236,6 +1236,12 @@ export async function apiFetch(url, options = {}) {
     showToast('Network error — is the server running?');
     throw e;
   }
+  // A successful write anywhere in the app marks kept lists (New Transaction's pickers) as
+  // possibly behind, so the next use refreshes them. Sign-in and session calls are not data.
+  const method = String(options.method || 'GET').toUpperCase();
+  if (res.ok && method !== 'GET' && !/\/auth\//.test(String(url))) {
+    try { window.dispatchEvent(new CustomEvent('cp-data-changed')); } catch { /* no window */ }
+  }
   if (res.status === 401) {
     localStorage.removeItem('authToken');
     localStorage.removeItem('currentUser');
