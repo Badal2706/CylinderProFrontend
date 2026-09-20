@@ -532,7 +532,7 @@ export function Modal({ title, danger = false, size, onClose, children }) {
   const ref = useModalA11y(onClose);
   return (
     <div className="modal-overlay" onClick={onClose}>
-      <div className={`modal-card ${size === 'lg' ? 'modal-lg' : ''} ${size === 'wide' ? 'modal-wide' : ''}`} ref={ref} onClick={(e) => e.stopPropagation()}>
+      <div className={`modal-card ${size === 'lg' ? 'modal-lg' : ''} ${size === 'wide' ? 'modal-wide' : ''} ${size === 'list' ? 'modal-list' : ''}`} ref={ref} onClick={(e) => e.stopPropagation()}>
         <div className={`modal-header ${danger ? 'danger' : ''}`}>
           <span>{title}</span>
           <button className="modal-close" onClick={onClose} aria-label="Close">✕</button>
@@ -600,14 +600,14 @@ export function ViewAllButton({ count, onClick }) {
 // `rows` may arrive empty and fill in later, so the count resets whenever the identity of the
 // list changes — otherwise switching customer would leave the previous customer's "showing 40"
 // applied to the new one.
-export function useLoadMore(rows, step) {
+export function useLoadMore(rows, step, initial = step) {
   const list = Array.isArray(rows) ? rows : [];
-  const [shown, setShown] = useState(step);
+  const [shown, setShown] = useState(initial);
   const key = list.length;
   const lastKey = useRef(key);
   useEffect(() => {
-    if (lastKey.current !== key) { lastKey.current = key; setShown(step); }
-  }, [key, step]);
+    if (lastKey.current !== key) { lastKey.current = key; setShown(initial); }
+  }, [key, step, initial]);
   return {
     visible: list.slice(0, shown),
     hasMore: list.length > shown,
@@ -635,7 +635,7 @@ export function LoadMoreFooter({ hasMore, remaining, step, total, onLoadMore, sh
       <button className="btn btn-secondary" style={{fontSize:'0.82rem'}} onClick={onLoadMore}>
         {all
           ? `View All (${total.toLocaleString()}) →`
-          : `Load Next ${Math.min(step, remaining)} (${remaining.toLocaleString()} left)`}
+          : `View More (${Math.min(step, remaining)})`}
       </button>
     </div>
   );
@@ -968,6 +968,15 @@ export function DashboardCharts({ stock, onNavigate }) {
 //    exceeds the 100 req/min limiter; at 200/page it is 15. Rows are appended in the same sort
 //    order, so the already-visible rows keep their position and the scrollbar does not jump.
 export const INITIAL_BATCH = 50;
+
+// The paging query a list hook asks for. The first load sends page=1; every later batch sends its
+// absolute offset, because a list that opens with 5 rows and then fetches 10 at a time has no page
+// number to send (see parsePagination on the server).
+export function pageParam(pageOrOffset, limit, opts = {}) {
+  return opts.offset
+    ? `offset=${pageOrOffset}&limit=${limit}`
+    : `page=${pageOrOffset}&limit=${limit}`;
+}
 const BACKGROUND_BATCH = 200; // server clamps `limit` to 200 (utils/paginate.js)
 
 // Phase 29: an OPTIONAL cap for lists with unbounded growth (Transaction History). When
@@ -975,9 +984,26 @@ const BACKGROUND_BATCH = 200; // server clamps `limit` to 200 (utils/paginate.js
 // auto-loading; beyond that the caller shows a "Load N more" control wired to `loadMore`, which
 // fetches exactly `options.increment` older records per click. When no options are passed the
 // behaviour is byte-identical to before — Customers and Cylinder Inventory are unaffected.
+// `options`:
+//   initial   — rows fetched when the screen opens            (default INITIAL_BATCH)
+//   increment — rows fetched per "View More" / auto-load       (default 100)
+//   mode      — how the next batch is asked for:
+//                 'viewAll'        one click loads the rest in the background (the old behaviour)
+//                 'manual'         a "View More" button, every time
+//                 'manualThenAuto' first batch by button, then automatically while scrolling
+//                 'auto'           automatically from the first extra batch onwards
+//   cap       — 'viewAll' only: stop the background load after this many rows
+// Auto modes fire from `rowRef`, which the table attaches to the row TRIGGER_FROM_END from the
+// bottom — so the next batch is already on its way before the last rows are reached.
 export function useBatchList(buildUrl, deps, options = {}) {
   const cap = Number(options.cap) || 0;              // 0 = uncapped (full background batch-load)
   const increment = Number(options.increment) || 100;
+  const initial = Number(options.initial) || INITIAL_BATCH;
+  const mode = options.mode || 'viewAll';
+  // `enabled: false` holds the first fetch back until the screen knows what to ask for — the
+  // Aging Report, for example, must wait for the active location or it fetches the whole report
+  // once for "all locations" and then immediately again for the right one.
+  const enabled = options.enabled !== false;
   const [rows, setRows] = useState([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
@@ -988,16 +1014,25 @@ export function useBatchList(buildUrl, deps, options = {}) {
 
   const buildRef = useRef(buildUrl);
   buildRef.current = buildUrl;              // always call the latest closure, never a stale one
+  const initialRef = useRef(initial);
+  initialRef.current = initial;
+  // 'manualThenAuto': scrolling only takes over once the first "View More" has been clicked.
+  const [autoArmed, setAutoArmed] = useState(mode === 'auto');
   const reqRef = useRef(0);                 // guards against out-of-order responses
   const rowsRef = useRef([]);
   rowsRef.current = rows;                   // current length, read inside loadMore without stale closure
-  const key = JSON.stringify(deps);
+  const key = JSON.stringify([deps, enabled]);
+
+  const enabledRef = useRef(enabled);
+  enabledRef.current = enabled;
 
   const loadFirst = useCallback(async () => {
+    if (!enabledRef.current) return;        // still waiting: stay on the spinner, ask nothing
     const reqId = ++reqRef.current;
     setLoading(true); setLoadingAll(false); setLoadedAll(false); setCapReached(false); setLoadingMore(false);
+    setAutoArmed(mode === 'auto');          // a new search/filter starts the sequence again
     try {
-      const res = await apiFetch(buildRef.current(1, INITIAL_BATCH));
+      const res = await apiFetch(buildRef.current(1, initialRef.current));
       const { ok, rows: got, pagination, error } = await readListResponse(res);
       if (reqId !== reqRef.current) return;
       if (!ok) { showToast(error); setRows([]); setTotal(0); setLoadedAll(true); }
@@ -1053,15 +1088,21 @@ export function useBatchList(buildUrl, deps, options = {}) {
     const reqId = reqRef.current;
     setLoadingMore(true);
     try {
+      // Ask by offset, not by page number: the first batch can be a different size from the
+      // increment (5 then +10), so page arithmetic over a fixed size would skip or repeat rows.
       const offset = rowsRef.current.length;
-      const pageNum = Math.floor(offset / increment) + 1;
-      const res = await apiFetch(buildRef.current(pageNum, increment));
+      const res = await apiFetch(buildRef.current(offset, increment, { offset: true }));
       const { ok, rows: got, error } = await readListResponse(res);
       if (reqId !== reqRef.current) return;
       if (!ok) { showToast(error); }
       else {
-        setRows(prev => [...prev, ...got]);
+        // De-duplicate by id in case a row was inserted server-side between two batches.
+        setRows(prev => {
+          const seen = new Set(prev.map(r => String(r._id || r.id || r.bill_id || r.entry_id || JSON.stringify(r))));
+          return [...prev, ...got.filter(r => !seen.has(String(r._id || r.id || r.bill_id || r.entry_id || JSON.stringify(r))))];
+        });
         if (got.length < increment || offset + got.length >= total) setLoadedAll(true);
+        setAutoArmed(true);                 // 'manualThenAuto': scrolling takes it from here
       }
     } catch (e) {
       console.error('Load-more failed:', e);
@@ -1069,8 +1110,82 @@ export function useBatchList(buildUrl, deps, options = {}) {
     if (reqId === reqRef.current) setLoadingMore(false);
   }, [increment, total]);
 
+  // The auto-load trigger. The table attaches this to the row TRIGGER_FROM_END from the end;
+  // when that row scrolls into view the next batch is fetched.
+  const hasMore = !loadedAll && rows.length < total;
+  const stateRef = useRef({});
+  stateRef.current = { hasMore, loadingMore, loading, autoArmed, loadMore };
+  const observerRef = useRef(null);
+  const rowRef = useCallback((node) => {
+    if (observerRef.current) { observerRef.current.disconnect(); observerRef.current = null; }
+    if (!node || mode === 'viewAll' || mode === 'manual') return;
+    const obs = new IntersectionObserver(([entry]) => {
+      const st = stateRef.current;
+      if (entry.isIntersecting && st.autoArmed && st.hasMore && !st.loadingMore && !st.loading) st.loadMore();
+    }, { rootMargin: '120px' });
+    obs.observe(node);
+    observerRef.current = obs;
+  }, [mode]);
+  useEffect(() => () => { if (observerRef.current) observerRef.current.disconnect(); }, []);
+  // Which row carries the trigger: two from the end (row 8 of 10, 18 of 20, …).
+  const triggerIndex = hasMore ? Math.max(0, rows.length - TRIGGER_FROM_END) : -1;
+
   return { rows, total, loading, loadingAll, loadedAll, loadAll, reload: loadFirst,
-           capReached, loadingMore, loadMore, increment };
+           capReached, loadingMore, loadMore, increment, initial, mode,
+           hasMore, autoArmed, rowRef, triggerIndex };
+}
+
+// The same scroll trigger for a list already in memory (useLoadMore). Attach the returned ref to
+// the row TRIGGER_FROM_END from the end; while `enabled`, scrolling to it reveals the next block.
+// `key` re-arms it after each reveal — the observer must move to the NEW trigger row.
+export function useAutoLoadRow({ enabled, onLoad, key }) {
+  const cbRef = useRef(onLoad);
+  cbRef.current = onLoad;
+  const obsRef = useRef(null);
+  useEffect(() => () => { if (obsRef.current) obsRef.current.disconnect(); }, []);
+  return useCallback((node) => {
+    if (obsRef.current) { obsRef.current.disconnect(); obsRef.current = null; }
+    if (!node || !enabled) return;
+    const obs = new IntersectionObserver(([entry]) => { if (entry.isIntersecting) cbRef.current(); },
+      { rootMargin: '120px' });
+    obs.observe(node);
+    obsRef.current = obs;
+  }, [enabled, key]);
+}
+
+// Auto-load starts when the row this many from the end comes into view: at 10 rows loaded that is
+// row 8, at 20 it is row 18 — the next batch arrives before the reader gets to the bottom.
+export const TRIGGER_FROM_END = 2;
+
+// Footer for the paged lists above. Manual modes show a button; auto modes show progress only.
+export function PagedListFooter({ shown, total, hasMore, loadingMore, onLoadMore, increment,
+                                  autoArmed = false, noun = 'records' }) {
+  if (loadingMore) {
+    return <div style={{ textAlign: 'center', padding: '0.75rem' }}>
+      <Spinner label={`Loading ${increment} more…`} />
+    </div>;
+  }
+  if (!hasMore) {
+    return total > 0
+      ? <div style={{ textAlign: 'center', padding: '0.75rem', fontSize: '0.8rem', color: 'var(--text-muted)' }}>
+          — showing all {total.toLocaleString()} {noun} —
+        </div>
+      : null;
+  }
+  const remaining = total - shown;
+  return (
+    <div style={{ textAlign: 'center', padding: '0.75rem' }}>
+      {!autoArmed && (
+        <button className="btn btn-secondary" style={{ fontSize: '0.82rem' }} onClick={onLoadMore}>
+          View More ({Math.min(increment, remaining).toLocaleString()})
+        </button>
+      )}
+      <div style={{ fontSize: '0.78rem', color: 'var(--text-muted)', marginTop: autoArmed ? 0 : '0.35rem' }}>
+        Showing {shown.toLocaleString()} of {total.toLocaleString()}
+        {autoArmed ? ' — scroll for more' : ''}. Search covers all {total.toLocaleString()}.
+      </div>
+    </div>
+  );
 }
 
 // The "View All (N)" footer for a useBatchList-backed table.
@@ -2243,7 +2358,7 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
 
   // Same shape as the Customers list: 50 first, the rest on one click. The rows are already
   // in memory here, so no further fetch is needed to reveal them.
-  const outMore_ = useLoadMore(data, 50);
+  const outMore_ = useLoadMore(data, 10, 5);   // 5 on open, then 10 more per click
 
   // Column spec shared by the inline table and the "View All" modal.
   const outColumns = [
@@ -2372,7 +2487,8 @@ export function OutstandingReceivables({ onNavigate, onSelectCustomer }) {
                 </tr>
               </tfoot>
             </table>
-            {<LoadMoreFooter hasMore={outMore_.hasMore} remaining={outMore_.remaining} step={50} total={outMore_.total} onLoadMore={outMore_.showAll} all />}
+            {<LoadMoreFooter hasMore={outMore_.hasMore} remaining={outMore_.remaining} step={10}
+              total={outMore_.total} onLoadMore={outMore_.loadMore} showTotal />}
           </div>
         )}
       </div>
@@ -3336,15 +3452,18 @@ export function CustomerMaster({ onNavigate, onSelectCustomer, initialFilter = n
 
   // Search and status are sent to the server, so they always match against all customers —
   // not just the batch currently on screen.
-  const buildUrl = (page, limit) => {
-    let url = `${API_URL}/customers?page=${page}&limit=${limit}&`;
+  const buildUrl = (pageOrOffset, limit, opts) => {
+    let url = `${API_URL}/customers?${pageParam(pageOrOffset, limit, opts)}&`;
     if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
     if (statusFilter) url += `status=${statusFilter}`;
     return url;
   };
+  // This list is used by SEARCHING far more than by browsing, so it opens with 5 rows and grows
+  // 10 at a time on request. The search box queries every customer on the server regardless.
   const {
-    rows: customers, total, loading, loadingAll, loadedAll, loadAll, reload: fetchCustomers
-  } = useBatchList(buildUrl, [debouncedSearch, statusFilter]);
+    rows: customers, total, loading, loadedAll, reload: fetchCustomers,
+    hasMore, loadingMore, loadMore, increment
+  } = useBatchList(buildUrl, [debouncedSearch, statusFilter], { initial: 5, increment: 10, mode: 'manual' });
 
   const [custOpen, setCustOpen] = useState(false);
 
@@ -3526,8 +3645,8 @@ export function CustomerMaster({ onNavigate, onSelectCustomer, initialFilter = n
               ))}
             </tbody>
           </table>
-          <BatchListFooter shown={customers.length} total={total} loadedAll={loadedAll}
-            loadingAll={loadingAll} onLoadAll={loadAll} noun="customers" />
+          <PagedListFooter shown={customers.length} total={total} hasMore={hasMore}
+            loadingMore={loadingMore} onLoadMore={loadMore} increment={increment} noun="customers" />
         </div>
         )}
       </div>

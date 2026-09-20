@@ -653,6 +653,13 @@
     .modal-card.modal-lg { width: fit-content; min-width: min(94vw, 900px); max-width: 96vw; }
     /* Wide variant for horizontal/multi-column form modals (Record Payment, Add/Edit Cylinder, etc.) */
     .modal-card.modal-wide { width: min(94vw, 980px); }
+    /* List popups: as wide as the screen sensibly allows, because a table that has to be scrolled
+       sideways to read a size or a bill number is harder to use than a wide popup. */
+    .modal-card.modal-list { width: min(85vw, 1280px); max-width: 90vw; }
+    /* Inside any popup table, a value never wraps onto a second line: "7 m3" and "1B438" are one
+       thing each. Long free text (remarks, addresses) is allowed to wrap, via .wrap on the cell. */
+    .modal-card table th, .modal-card table td { white-space: nowrap; }
+    .modal-card table th.wrap, .modal-card table td.wrap { white-space: normal; }
     @media (min-width: 820px) { .modal-card.modal-wide { min-width: min(94vw, 780px); } }
     /* Explicit horizontal grid rows used inside wide form modals */
     .form-row.cols-2 { grid-template-columns: 1fr 1fr; }

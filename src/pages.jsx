@@ -6,7 +6,8 @@ import {
   ConfirmModal, useModalA11y, ListModal, ViewAllButton, GAS_CAPACITIES,
   GAS_TYPE_LIST, sortGasTypes, sortCapacities, directionText, CustomerForm,
   LOCATIONS, LOCATION_LABELS, locationText, getActiveLocation, stockStateText, cylinderStateText,
-  useDebounce, useBatchList, BatchListFooter, useLocations, useLoadMore, LoadMoreFooter,
+  useDebounce, useBatchList, BatchListFooter, PagedListFooter, pageParam, TRIGGER_FROM_END, useAutoLoadRow,
+  useLocations, useLoadMore, LoadMoreFooter,
   purityDefaultsFor, fillingLocationCode, maintenanceLocationCode
 } from './App.jsx';
 import { printSavedBill, printHoldingStatement, printPurityCertificate, printNotesBlock, RentalSummaryModal, printRentalSummary, StepUpVerificationModal, displayContact, billTimeFrom, nowHHMM } from './components.jsx';
@@ -148,37 +149,136 @@ function SectionError({ what, onRetry }) {
 }
 
 // The seven sections loaded after the customer record, and the label each shows while it waits.
-const DETAIL_SECTIONS = ['given', 'received', 'payments', 'pcHist', 'aging', 'bills', 'certs'];
+// ─── Customer Detail's lists ───
+// Opening a customer used to fetch eight lists at once — every bill, payment, cylinder movement
+// and certificate — before anyone had asked to see any of them. Now:
+//   · the record itself loads immediately (header, summaries, Currently Holding),
+//   · Personal Cylinder History shows its 5 newest rows,
+//   · everything else is a button that fetches nothing until it is pressed.
+// Each list then opens in a popup with 5 rows and a "View More" that adds 10 at a time.
+const PREVIEW_ROWS = 5;
+const SECTION_STEP = 10;
+
+// The line under a 5-row preview: how much is shown, and the way into the full list.
+function SectionPreviewFooter({ shown, total, onViewMore }) {
+  if (total <= shown) {
+    return <div style={{textAlign:'center', padding:'0.6rem', fontSize:'0.78rem', color:'var(--text-muted)'}}>
+      — showing all {total} —
+    </div>;
+  }
+  return (
+    <div style={{textAlign:'center', padding:'0.6rem'}}>
+      <button className="btn btn-secondary" style={{fontSize:'0.82rem'}} onClick={onViewMore}>
+        View More ({total - shown} more)
+      </button>
+      <div style={{fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.3rem'}}>
+        Showing {shown} of {total}
+      </div>
+    </div>
+  );
+}
+
+// A popup list that pages from the server (or, for Currently Holding, from the record already in
+// hand). `fetchPage(offset, limit)` returns { rows, total }.
+export function PagedSectionModal({ title, fetchPage, columns, onRowClick, rowKey, emptyIcon = '📄',
+                                    emptyMessage = 'Nothing to show', onClose }) {
+  const [rows, setRows] = useState([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState('');
+
+  const load = async (offset) => {
+    const first = offset === 0;
+    first ? setLoading(true) : setLoadingMore(true);
+    try {
+      const { rows: got, total: n } = await fetchPage(offset, first ? PREVIEW_ROWS : SECTION_STEP);
+      setRows(prev => (first ? got : [...prev, ...got]));
+      setTotal(n);
+      setError('');
+    } catch (e) {
+      setError((e && e.message) || 'Could not load this list.');
+    }
+    first ? setLoading(false) : setLoadingMore(false);
+  };
+  useEffect(() => { load(0); }, []);
+
+  const hasMore = rows.length < total;
+  return (
+    <Modal title={`${title}${total ? ` (${total})` : ''}`} size="list" onClose={onClose}>
+      {loading ? <Spinner label="Loading…" />
+        : error ? (
+          <div className="alert alert-danger" style={{display:'flex', justifyContent:'space-between', alignItems:'center', gap:'0.75rem', flexWrap:'wrap'}}>
+            <span>{error}</span>
+            <button className="btn btn-secondary" style={{padding:'0.25rem 0.7rem'}} onClick={() => load(0)}>Retry</button>
+          </div>
+        ) : rows.length === 0 ? <EmptyState icon={emptyIcon} message={emptyMessage} />
+        : (
+        <div className="table-container">
+          <table>
+            <thead><tr>{columns.map((c, i) => <th key={i}>{c.header}</th>)}</tr></thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={rowKey ? rowKey(r, i) : i}
+                  style={onRowClick ? {cursor:'pointer'} : undefined}
+                  onClick={onRowClick ? () => onRowClick(r) : undefined}>
+                  {columns.map((c, j) => <td key={j}>{c.cell(r, i)}</td>)}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+          {loadingMore ? <div style={{textAlign:'center', padding:'0.75rem'}}><Spinner label={`Loading ${SECTION_STEP} more…`} /></div>
+            : hasMore ? (
+              <div style={{textAlign:'center', padding:'0.75rem'}}>
+                <button className="btn btn-secondary" style={{fontSize:'0.82rem'}} onClick={() => load(rows.length)}>
+                  View More ({Math.min(SECTION_STEP, total - rows.length)})
+                </button>
+                <div style={{fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.35rem'}}>
+                  Showing {rows.length} of {total}
+                </div>
+              </div>
+            ) : (
+              <div style={{textAlign:'center', padding:'0.75rem', fontSize:'0.8rem', color:'var(--text-muted)'}}>
+                — showing all {total} —
+              </div>
+            )}
+        </div>
+      )}
+    </Modal>
+  );
+}
+
+// Reads a paginated API response into the { rows, total } shape PagedSectionModal wants.
+async function fetchPagedApi(url, offset, limit) {
+  const res = await apiFetch(`${url}${url.includes('?') ? '&' : '?'}offset=${offset}&limit=${limit}`);
+  if (!res.ok) throw new Error(await apiErrorMessage(res, 'Could not load this list.'));
+  const body = await res.json();
+  if (Array.isArray(body)) return { rows: body, total: body.length };
+  return { rows: body.data || [], total: (body.pagination && body.pagination.total) || 0 };
+}
 
 export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo = null }) {
   const [customer, setCustomer] = useState(null);
-  const [givenTransactions, setGivenTransactions] = useState([]);
-  const [receivedTransactions, setReceivedTransactions] = useState([]);
-  const [payments, setPayments] = useState([]);
-  const [personalHistory, setPersonalHistory] = useState([]);
   const [detailBillId, setDetailBillId] = useState(null);
   const [editBillId, setEditBillId] = useState(null);
   const [editAuth, setEditAuth] = useState(null);
-  const [openHist, setOpenHist] = useState(null);
-  const [customerBills, setCustomerBills] = useState([]);
-  const [agingRows, setAgingRows] = useState([]);
   const [showRental, setShowRental] = useState(false);
   const [loading, setLoading] = useState(true);
   const [showPaymentForm, setShowPaymentForm] = useState(false);
   const [showEdit, setShowEdit] = useState(false);
+  // Which list popup is open: 'given' | 'received' | 'payments' | 'pcHist' | 'aging' | 'bills' |
+  // 'certs' | 'held' | null. Nothing is fetched for a list until its popup opens.
+  const [openList, setOpenList] = useState(null);
   // F-11: purity test certificates. `viewCert` and `deleteCert` are the ONLY two things that can
   // happen to one after it is issued — there is no editCert, by design.
-  const [certificates, setCertificates] = useState([]);
   const [showCertForm, setShowCertForm] = useState(false);
   const [viewCert, setViewCert] = useState(null);
   const [deleteCert, setDeleteCert] = useState(null);
   const [deletingCert, setDeletingCert] = useState(false);
-
-  // 'loading' | 'ok' | 'error' per background section. Everything starts as loading; each flips on
-  // its own as its own call returns.
-  const allLoading = () => Object.fromEntries(DETAIL_SECTIONS.map(k => [k, 'loading']));
-  const [sec, setSec] = useState(allLoading);
-  const setSection = (key, state) => setSec(prev => ({ ...prev, [key]: state }));
+  // The one list that previews on the page: 5 newest personal-cylinder movements.
+  const [pcPreview, setPcPreview] = useState({ rows: [], total: 0, state: 'loading' });
+  // The days-held list under Cylinder Rental: 5 rows here, the rest in the popup.
+  const [agingPreview, setAgingPreview] = useState({ rows: [], total: 0, state: 'loading' });
   // Bumped whenever a new customer is opened, so a slow answer about the PREVIOUS customer can
   // never land in this one's tables.
   const reqRef = useRef(0);
@@ -188,9 +288,9 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       reqRef.current++;
       setLoading(true);
       setCustomer(null);
-      setGivenTransactions([]); setReceivedTransactions([]); setPayments([]);
-      setPersonalHistory([]); setAgingRows([]); setCustomerBills([]); setCertificates([]);
-      setSec(allLoading());
+      setOpenList(null);
+      setPcPreview({ rows: [], total: 0, state: 'loading' });
+      setAgingPreview({ rows: [], total: 0, state: 'loading' });
       fetchCustomerDetail();
     }
   }, [customerId]);
@@ -206,28 +306,20 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     return () => clearTimeout(t);
   }, [loading, scrollTo]);
 
-  // ── Two phases ──
-  // 1. The customer record alone. The header, summaries, Financial Summary and Currently Holding
-  //    all come from it, so the page is usable the moment it lands.
-  // 2. The seven history sections, all started together and each written to its own state as it
-  //    arrives. None waits for another, and one failing leaves the other six (and the page) intact.
-  //
-  // Called again after a payment, an edit or a new certificate. On those refreshes the sections
-  // keep showing their current rows until the new ones arrive, rather than flashing back to a
-  // loading state for data that is only being brought up to date.
+  // The customer record, then the one small preview. Everything else waits for a click.
   const fetchCustomerDetail = async () => {
     const token = reqRef.current;
     try {
-      const customerRes = await apiFetch(`${API_URL}/customers/${customerId}`);
+      const res = await apiFetch(`${API_URL}/customers/${customerId}`);
       if (token !== reqRef.current) return;
-      if (!customerRes.ok) {
-        showToast(await apiErrorMessage(customerRes, 'Could not load this customer.'));
+      if (!res.ok) {
+        showToast(await apiErrorMessage(res, 'Could not load this customer.'));
         setLoading(false);
         return;
       }
-      const customerData = await customerRes.json();
+      const data = await res.json();
       if (token !== reqRef.current) return;
-      setCustomer(customerData);
+      setCustomer(data);
     } catch (error) {
       console.error('Error fetching customer detail:', error);
       showToast('Could not load customer details. Please try again.');
@@ -235,49 +327,60 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       return;
     }
     setLoading(false);
-    loadSections(token);
+    loadPcPreview(token);
+    loadAgingPreview(token);
   };
 
-  // asRows unwraps a response into the array the section stores. Paginated endpoints answer
-  // { data: [...] }, the others a bare array — the same unwrapping the single Promise.all did.
-  const asRows = (raw) => {
-    const d = raw && raw.data ? raw.data : raw;
-    return Array.isArray(d) ? d : [];
-  };
-  const SECTION_SOURCES = {
-    given:    { url: () => `${API_URL}/customers/${customerId}/transactions/given?page=1&limit=${HISTORY_LIMIT}`, set: (r) => setGivenTransactions(asRows(r)) },
-    received: { url: () => `${API_URL}/customers/${customerId}/transactions/received?page=1&limit=${HISTORY_LIMIT}`, set: (r) => setReceivedTransactions(asRows(r)) },
-    payments: { url: () => `${API_URL}/customers/${customerId}/payments?page=1&limit=${HISTORY_LIMIT}`, set: (r) => setPayments(asRows(r)) },
-    pcHist:   { url: () => `${API_URL}/customers/${customerId}/personal-cylinder-history`, set: (r) => setPersonalHistory(asRows(r)) },
-    aging:    { url: () => `${API_URL}/customers/${customerId}/aging`, set: (r) => setAgingRows(asRows(r)) },
-    bills:    { url: () => `${API_URL}/bills?customer_id=${customerId}&limit=200`, set: (r) => setCustomerBills(asRows(r)) },
-    certs:    { url: () => `${API_URL}/purity-certificates?customer_id=${customerId}`, set: (r) => setCertificates(asRows(r)) }
-  };
-
-  const loadSection = async (key, token = reqRef.current) => {
-    const src = SECTION_SOURCES[key];
+  const loadPcPreview = async (token = reqRef.current) => {
+    setPcPreview(prev => ({ ...prev, state: prev.rows.length ? prev.state : 'loading' }));
     try {
-      const res = await apiFetch(src.url());
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const raw = await res.json();
+      const { rows, total } = await fetchPagedApi(`${API_URL}/customers/${customerId}/personal-cylinder-history`, 0, PREVIEW_ROWS);
       if (token !== reqRef.current) return;
-      src.set(raw);
-      setSection(key, 'ok');
-    } catch (e) {
-      if (token !== reqRef.current) return;
-      console.error(`Customer detail: ${key} failed to load`, e);
-      setSection(key, 'error');
+      setPcPreview({ rows, total, state: 'ok' });
+    } catch {
+      if (token === reqRef.current) setPcPreview(prev => ({ ...prev, state: 'error' }));
     }
   };
 
-  // Fire-and-forget on purpose: each loadSection handles its own result, so there is nothing to
-  // await together — awaiting them as a group is exactly the all-at-once wait this replaced.
-  const loadSections = (token) => DETAIL_SECTIONS.forEach(key => { loadSection(key, token); });
+  const loadAgingPreview = async (token = reqRef.current) => {
+    setAgingPreview(prev => ({ ...prev, state: prev.rows.length ? prev.state : 'loading' }));
+    try {
+      const { rows, total } = await fetchPagedApi(`${API_URL}/customers/${customerId}/aging`, 0, PREVIEW_ROWS);
+      if (token !== reqRef.current) return;
+      setAgingPreview({ rows, total, state: 'ok' });
+    } catch {
+      if (token === reqRef.current) setAgingPreview(prev => ({ ...prev, state: 'error' }));
+    }
+  };
 
-  // A retry shows the loading state again, since the section currently shows an error, not data.
-  const retrySection = (key) => { setSection(key, 'loading'); loadSection(key); };
+  // After a save anywhere on this page: the record and the previews are the only things on screen,
+  // so they are the only things to refresh. An open popup reloads itself when it is next opened.
+  const refreshDetail = () => { fetchCustomerDetail(); };
 
-  const exportCustomerExcel = () => {
+  // Print and Export need the full history. The page no longer holds it, so they fetch it on the
+  // click — the whole point of this screen is that opening a customer downloads almost nothing.
+  const [docBusy, setDocBusy] = useState('');
+  const fetchHistoryForDocuments = async () => {
+    const one = async (url) => {
+      const res = await apiFetch(url);
+      if (!res.ok) throw new Error(await apiErrorMessage(res, 'Could not load this customer\'s history.'));
+      const body = await res.json();
+      return Array.isArray(body) ? body : (body.data || []);
+    };
+    return Promise.all([
+      one(`${API_URL}/customers/${customerId}/transactions/given?page=1&limit=${HISTORY_LIMIT}`),
+      one(`${API_URL}/customers/${customerId}/transactions/received?page=1&limit=${HISTORY_LIMIT}`),
+      one(`${API_URL}/customers/${customerId}/payments?page=1&limit=${HISTORY_LIMIT}`)
+    ]);
+  };
+
+  const exportCustomerExcel = async () => {
+    if (docBusy) return;
+    setDocBusy('excel');
+    let givenTransactions = [], receivedTransactions = [], payments = [];
+    try { [givenTransactions, receivedTransactions, payments] = await fetchHistoryForDocuments(); }
+    catch (e) { showToast(e.message); setDocBusy(''); return; }
+    setDocBusy('');
     const d2 = (d) => formatDate(d);
     const rs = (n) => parseFloat((n || 0).toFixed(2));
 
@@ -343,7 +446,13 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
   };
 
   const printCustomer = async () => {
+    if (docBusy) return;
+    setDocBusy('print');
+    let givenTransactions = [], receivedTransactions = [], payments = [];
+    try { [givenTransactions, receivedTransactions, payments] = await fetchHistoryForDocuments(); }
+    catch (e) { showToast(e.message); setDocBusy(''); return; }
     const bizName = await getBusinessName();
+    setDocBusy('');
     const d2 = (d) => formatDate(d);
     const rs = (n) => '₹' + (n || 0).toFixed(2);
 
@@ -402,14 +511,8 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     else { showToast('Please allow pop-ups to use Print / PDF.', 'info'); }
   };
 
-  // Paginated views — most recent first (backend already sorts -bill_date / -date).
-  const givenMore_ = useLoadMore(givenTransactions, 10);
-  const receivedMore_ = useLoadMore(receivedTransactions, 10);
-  const paymentsMore_ = useLoadMore(payments, 10);
-  const pcHistMore_ = useLoadMore(personalHistory, 10);
-
-  // Customer-scoped bill list (Phase 6) — same row shape as the global Transaction History.
-  const billRows = customerBills.map(b => ({
+  // One bill row, shaped the way the global Transaction History shows them.
+  const billRow = (b) => ({
     _id: b._id,
     date: b.bill_date,
     bill_number: b.bill_number,
@@ -418,8 +521,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     cylinders: (b.total_given_qty || 0) + (b.total_received_qty || 0),
     amount: b.total_bill_amount || 0,
     edited: !!(b.edit_history && b.edit_history.length)
-  }));
-  const [billsVisible, billsMore, billsOpen, setBillsOpen] = useViewAll(billRows, 10);
+  });
   const billColumns = [
     { header: 'Date', cell: (r) => formatDate(r.date) },
     { header: 'Bill No.', cell: (r) => <><strong>{r.bill_number}</strong>{r.edited && <span className="badge badge-warning" style={{marginLeft:'0.35rem', fontSize:'0.62rem'}}>Updated</span>}</> },
@@ -431,8 +533,9 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
 
   // Cylinders this customer is currently holding (backend nets given vs. own returns, excluding
   // cross-customer returns). Most recent first.
+  // Comes with the customer record, worked out by the shared computeHoldings service (R70) — so
+  // paging it costs no request at all: the rows are already here.
   const heldCylinders = customer?.held_cylinders || [];
-  const heldMore_ = useLoadMore(heldCylinders, 50);
   const daysHeld = (d) => d ? Math.floor((Date.now() - new Date(d).getTime()) / 86400000) : null;
   const heldColumns = [
     { header: 'Serial No.', cell: (c) => <strong>{c.serial_number}</strong> },
@@ -472,9 +575,6 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     finally { setReprinting(false); }
   };
 
-  // Cylinder Aging History pagination (Phase 31) — 10 rows + "View All", same pattern as
-  // Currently Holding above. agingRows is the full dataset, so search in the modal sees everything.
-  const agingMore_ = useLoadMore(agingRows, 10);
   const agingColumns = [
     { header: 'Rotational No.', cell: (r) => <strong>{r.serial_number}</strong> },
     { header: 'Gas Type', cell: (r) => r.gas_type },
@@ -553,7 +653,6 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
   ];
   // F-11. Deliberately no edit column: the row opens a read-only view, from which the only
   // actions are Print and Delete.
-  const [certsVisible, certsMore, certsOpen, setCertsOpen] = useViewAll(certificates, 5);
   const certColumns = [
     { header: 'Certificate No.', cell: (c) => <strong>{c.certificate_number}</strong> },
     { header: 'Date', cell: (c) => formatDate(c.date) },
@@ -563,6 +662,68 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
     { header: 'Qty', cell: (c) => c.qty || '-' }
   ];
 
+  // Every popup list on this page: its title, where its rows come from, and how they are shown.
+  // `fetch` is called with (offset, limit) and only ever runs while the popup is open.
+  const SECTIONS = {
+    given: {
+      title: 'Cylinders Filled History', icon: '🛢️', emptyMessage: 'No cylinders filled yet',
+      columns: givenColumns, rowKey: (t) => t.line_item_id,
+      fetch: (o, l) => fetchPagedApi(`${API_URL}/customers/${customerId}/transactions/given`, o, l)
+    },
+    received: {
+      title: 'Cylinders Empty History', icon: '🔄', emptyMessage: 'No cylinders empty yet',
+      columns: receivedColumns, rowKey: (t) => t.line_item_id,
+      fetch: (o, l) => fetchPagedApi(`${API_URL}/customers/${customerId}/transactions/received`, o, l)
+    },
+    payments: {
+      title: 'Payment History', icon: '💰', emptyMessage: 'No payments recorded yet',
+      columns: paymentColumns, rowKey: (p) => p.receipt_id,
+      fetch: (o, l) => fetchPagedApi(`${API_URL}/customers/${customerId}/payments`, o, l)
+    },
+    pcHist: {
+      title: 'Personal Cylinder History', icon: '📦', emptyMessage: 'No personal cylinder movements',
+      columns: pcHistColumns, rowKey: (r, i) => `${r.bill_id}-${i}`,
+      fetch: (o, l) => fetchPagedApi(`${API_URL}/customers/${customerId}/personal-cylinder-history`, o, l)
+    },
+    aging: {
+      title: 'Cylinder Aging History', icon: '⏳', emptyMessage: 'No cylinders currently held',
+      columns: agingColumns, rowKey: (r) => r.serial_number,
+      fetch: (o, l) => fetchPagedApi(`${API_URL}/customers/${customerId}/aging`, o, l)
+    },
+    bills: {
+      title: 'Transaction History', icon: '🧾', emptyMessage: 'No transactions yet',
+      columns: billColumns, rowKey: (r) => r._id,
+      onRowClick: (r) => { setOpenList(null); setDetailBillId(r._id); },
+      fetch: async (o, l) => {
+        const { rows, total } = await fetchPagedApi(`${API_URL}/bills?customer_id=${customerId}`, o, l);
+        return { rows: rows.map(billRow), total };
+      }
+    },
+    certs: {
+      title: 'Purity Test Certificates', icon: '📄', emptyMessage: 'No certificates issued yet',
+      columns: [...certColumns, {
+        header: '', cell: (c) => (
+          <span style={{whiteSpace:'nowrap'}} onClick={(e) => e.stopPropagation()}>
+            <button type="button" className="link-btn" onClick={() => { setOpenList(null); setViewCert(c); }}>View</button>
+            {' · '}
+            <button type="button" className="link-btn" onClick={() => printPurityCertificate(c)}>Print</button>
+            {' · '}
+            <button type="button" className="link-btn" style={{color:'var(--danger, #dc2626)'}}
+              onClick={() => { setOpenList(null); setDeleteCert(c); }}>Delete</button>
+          </span>
+        )
+      }],
+      rowKey: (c) => c._id,
+      fetch: (o, l) => fetchPagedApi(`${API_URL}/purity-certificates?customer_id=${customerId}`, o, l)
+    },
+    held: {
+      title: 'Currently Holding Cylinders', icon: '✅', emptyMessage: 'No cylinders currently held',
+      columns: heldColumns, rowKey: (c, i) => `${c.serial_number}-${i}`,
+      // Already in hand with the customer record — paged from memory, no request.
+      fetch: async (o, l) => ({ rows: heldCylinders.slice(o, o + l), total: heldCylinders.length })
+    }
+  };
+
   const removeCertificate = async (cert) => {
     setDeletingCert(true);
     try {
@@ -571,7 +732,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
       showToast(`Certificate ${cert.certificate_number} deleted.`, 'success');
       setDeleteCert(null);
       setViewCert(null);
-      setCertificates(prev => prev.filter(c => c._id !== cert._id));
+      refreshDetail();
     } catch {
       showToast('Could not delete the certificate. Please try again.');
     } finally {
@@ -595,19 +756,14 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         <button className="btn btn-secondary" onClick={onBack}>← Back to List</button>
         <div className="btn-group" style={{margin:0}}>
           <button className="btn btn-primary" onClick={() => setShowEdit(true)}>✏️ Edit</button>
-          {/* Both documents include the filled / empty / payment history, so they wait for those
-              three sections rather than printing a report that is silently missing rows. */}
-          {(() => {
-            const ready = ['given', 'received', 'payments'].every(k => sec[k] === 'ok');
-            const why = ['given', 'received', 'payments'].some(k => sec[k] === 'error')
-              ? 'Some history failed to load — retry it below first' : 'Loading history…';
-            return (<>
-              <button className="btn btn-secondary" onClick={printCustomer} disabled={!ready}
-                title={ready ? '' : why}>Print / PDF</button>
-              <button className="btn btn-secondary" onClick={exportCustomerExcel} disabled={!ready}
-                title={ready ? '' : why}>Export Excel</button>
-            </>);
-          })()}
+          {/* Both documents include the filled / empty / payment history, which this page no
+              longer holds — they fetch it on the click and say so while they do. */}
+          <button className="btn btn-secondary" onClick={printCustomer} disabled={!!docBusy}>
+            {docBusy === 'print' ? 'Preparing…' : 'Print / PDF'}
+          </button>
+          <button className="btn btn-secondary" onClick={exportCustomerExcel} disabled={!!docBusy}>
+            {docBusy === 'excel' ? 'Preparing…' : 'Export Excel'}
+          </button>
         </div>
       </div>
 
@@ -780,117 +936,52 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
         </div>
       )}
 
-      {/* Personal Cylinder History — every transaction where personal cylinders moved.
+      {/* Personal Cylinder History — the 5 newest movements, the rest in a popup.
           Hidden entirely when this customer has no personal-cylinder activity. */}
-      {personalHistory.length > 0 && (
+      {(pcPreview.total > 0 || pcPreview.state === 'loading') && (
         <div className="card">
-          <h2>Personal Cylinder History</h2>
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Bill No.</th>
-                  <th>Challan No.</th>
-                  <th>Gas Type</th>
-                  <th>Size</th>
-                  <th>{isVendorCust ? pcReturnedHeader : pcTakenHeader}</th>
-                  <th>{isVendorCust ? pcTakenHeader : pcReturnedHeader}</th>
-                  <th>{pcNetHeader}</th>
-                </tr>
-              </thead>
-              <tbody>
-                {pcHistMore_.visible.map((r, i) => (
-                  <tr key={`${r.bill_id}-${i}`}>
-                    <td>{formatDate(r.date)}</td>
-                    <td>
-                      <button type="button" className="link-btn" onClick={() => setDetailBillId(r.bill_id)}>
-                        <strong>{r.bill_number}</strong>
-                      </button>
-                    </td>
-                    <td>{r.challan_no || '-'}</td>
-                    <td>{r.gas_type_name}</td>
-                    <td>{r.size_label}</td>
-                    <td>{isVendorCust ? (r.returned > 0 ? r.returned : '—') : (r.taken > 0 ? r.taken : '—')}</td>
-                    <td>{isVendorCust ? (r.taken > 0 ? r.taken : '—') : (r.returned > 0 ? r.returned : '—')}</td>
-                    <td>{pcNetCell(r)}</td>
+          <h2>Personal Cylinder History{pcPreview.state === 'ok' ? ` (${pcPreview.total})` : ''}</h2>
+          {pcPreview.state === 'loading' ? <SectionLoading label="Loading personal cylinder history…" />
+            : pcPreview.state === 'error' ? <SectionError what="personal cylinder history" onRetry={() => loadPcPreview()} />
+            : (
+            <div className="table-container">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Date</th><th>Bill No.</th><th>Challan No.</th><th>Gas Type</th><th>Size</th>
+                    <th>{isVendorCust ? pcReturnedHeader : pcTakenHeader}</th>
+                    <th>{isVendorCust ? pcTakenHeader : pcReturnedHeader}</th>
+                    <th>{pcNetHeader}</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-            {<LoadMoreFooter hasMore={pcHistMore_.hasMore} remaining={pcHistMore_.remaining} step={10} total={pcHistMore_.total} onLoadMore={pcHistMore_.loadMore} showTotal />}
-          </div>
+                </thead>
+                <tbody>
+                  {pcPreview.rows.map((r, i) => (
+                    <tr key={`${r.bill_id}-${i}`}>
+                      <td>{formatDate(r.date)}</td>
+                      <td>
+                        <button type="button" className="link-btn" onClick={() => setDetailBillId(r.bill_id)}>
+                          <strong>{r.bill_number}</strong>
+                        </button>
+                      </td>
+                      <td>{r.challan_no || '-'}</td>
+                      <td>{r.gas_type_name}</td>
+                      <td>{r.size_label}</td>
+                      <td>{isVendorCust ? (r.returned > 0 ? r.returned : '—') : (r.taken > 0 ? r.taken : '—')}</td>
+                      <td>{isVendorCust ? (r.taken > 0 ? r.taken : '—') : (r.returned > 0 ? r.returned : '—')}</td>
+                      <td>{pcNetCell(r)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <SectionPreviewFooter shown={pcPreview.rows.length} total={pcPreview.total}
+                onViewMore={() => setOpenList('pcHist')} />
+            </div>
+          )}
         </div>
       )}
 
-      {sec.pcHist === 'error' && (
-        <div className="card">
-          <h2>Personal Cylinder History</h2>
-          <SectionError what="personal cylinder history" onRetry={() => retrySection('pcHist')} />
-        </div>
-      )}
-
-      {/* F-11: Purity Test Certificates. View / Print / Delete only — a certificate is frozen
-          the moment it is saved, so this section has no edit affordance anywhere. */}
-      <div className="card" id="purity-certificates">
-        <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
-          <h2 style={{margin:0, border:'none', padding:0}}>Purity Test Certificates ({sec.certs === 'ok' ? certificates.length : '…'})</h2>
-          <button className="btn btn-primary" onClick={() => setShowCertForm(true)}>+ New Certificate</button>
-        </div>
-
-        {sec.certs === 'loading' ? (
-          <SectionLoading label="Loading certificates…" />
-        ) : sec.certs === 'error' ? (
-          <SectionError what="certificates" onRetry={() => retrySection('certs')} />
-        ) : certificates.length === 0 ? (
-          <EmptyState icon="📄" message="No certificates issued yet"
-            hint="Issue one with “+ New Certificate” above." />
-        ) : (
-          <div className="table-container" style={{marginTop:'0.75rem'}}>
-            <table>
-              <thead>
-                <tr>
-                  <th>Certificate No.</th><th>Date</th><th>Gas Type</th>
-                  <th>Purity (%)</th><th>Cylinder No.</th><th>Qty</th><th></th>
-                </tr>
-              </thead>
-              <tbody>
-                {certsVisible.map((c) => (
-                  <tr key={c._id}>
-                    <td><strong>{c.certificate_number}</strong></td>
-                    <td>{formatDate(c.date)}</td>
-                    <td>{c.gas_type || '-'}</td>
-                    <td>{c.purity_percent || '-'}</td>
-                    <td>{c.cylinder_serial_no || '-'}</td>
-                    <td>{c.qty || '-'}</td>
-                    <td style={{whiteSpace:'nowrap'}}>
-                      <button type="button" className="link-btn" onClick={() => setViewCert(c)}>View</button>
-                      {' · '}
-                      <button type="button" className="link-btn" onClick={() => printPurityCertificate(c)}>Print</button>
-                      {' · '}
-                      <button type="button" className="link-btn" style={{color:'var(--danger, #dc2626)'}}
-                        onClick={() => setDeleteCert(c)}>Delete</button>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {certsMore && <ViewAllButton count={certificates.length} onClick={() => setCertsOpen(true)} />}
-          </div>
-        )}
-
-        {showCertForm && (
-          <Modal title={`New Purity Test Certificate — ${customer.company_name}`} size="wide"
-            onClose={() => setShowCertForm(false)}>
-            <PurityCertificateForm
-              customer={customer}
-              onSuccess={() => { setShowCertForm(false); fetchCustomerDetail(); }}
-              onCancel={() => setShowCertForm(false)} />
-          </Modal>
-        )}
-      </div>
-
-      {/* Currently Holding Cylinders */}
+      {/* Currently Holding — the 5 newest, the rest in a popup. These rows come with the customer
+          record (computeHoldings), so the popup costs no request at all. */}
       <div className="card" id="currently-holding">
         <div style={{display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'0.5rem'}}>
           <h2 style={{margin:0, border:'none', padding:0}}>Currently Holding Cylinders ({heldCylinders.length})</h2>
@@ -898,7 +989,6 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
             {customer.status === 'OVER LIMIT' && (
               <span className="badge badge-danger">Over limit by {(customer.cylinders_held || 0) - (customer.holding_limit || 0)}</span>
             )}
-            {/* Phase 27: print a holding-status statement (no amounts) reusing the challan header. */}
             <button className="btn btn-secondary" disabled={!heldCylinders.length}
               onClick={() => printHoldingStatement({
                 customer_name: customer.company_name,
@@ -910,7 +1000,6 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                   date_filled: c.date_given, days_held: daysHeld(c.date_given),
                   bill_number: c.bill_number, challan_no: c.challan_no
                 })),
-                // Same data as the on-screen "Breakdown by Type" table (Phase 31).
                 breakdown: customer.cylinder_breakdown || []
               })}>🖨 Print Statement</button>
           </div>
@@ -931,7 +1020,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {heldMore_.visible.map((c, i) => {
+                {heldCylinders.slice(0, PREVIEW_ROWS).map((c, i) => {
                   const d = daysHeld(c.date_given);
                   return (
                     <tr key={c.serial_number + '-' + i}>
@@ -948,22 +1037,19 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 })}
               </tbody>
             </table>
-            {<LoadMoreFooter hasMore={heldMore_.hasMore} remaining={heldMore_.remaining} step={50} total={heldMore_.total} onLoadMore={heldMore_.showAll} all />}
+            <SectionPreviewFooter shown={Math.min(PREVIEW_ROWS, heldCylinders.length)} total={heldCylinders.length}
+              onViewMore={() => setOpenList('held')} />
           </div>
         )}
       </div>
 
-      {/* Cylinder Aging History (Phase 4): days-held per currently-held cylinder + rental calculator.
-          The calculator and the past-summaries picker sit ON the heading line rather than in a row
-          of their own under the table — the row below the table pushed the card taller for two
-          controls that belong to the section, not to the last table row. */}
+      {/* Cylinder Aging History: the days-held list (5 rows, the rest in the popup) with the rental
+          actions that belong to it. */}
       <div className="card" id="aging-history">
         <div style={{display:'flex', justifyContent:'space-between', alignItems:'center',
                      gap:'0.75rem', flexWrap:'wrap'}}>
-          <h2 style={{margin:0, border:'none', padding:0}}>Cylinder Aging History ({sec.aging === 'ok' ? agingRows.length : '…'})</h2>
+          <h2 style={{margin:0, border:'none', padding:0}}>Cylinder Aging History</h2>
           <div style={{display:'flex', gap:'0.5rem', alignItems:'center', flexWrap:'wrap'}}>
-            {/* Shown even with nothing in it, and disabled instead of hidden: a control that only
-                appears once you already have history is a control nobody discovers. */}
             <select className="form-control"
               style={{width:'auto', maxWidth:'15rem', fontSize:'0.82rem', padding:'0.3rem 0.5rem'}}
               value=""
@@ -984,22 +1070,20 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </option>
               ))}
             </select>
-            {sec.aging === 'ok' && agingRows.length > 0 && (
-              <button className="btn btn-primary" style={{whiteSpace:'nowrap'}}
-                onClick={() => setShowRental(true)}>🧮 Calculate Rental Summary</button>
-            )}
+            <button className="btn btn-primary" style={{whiteSpace:'nowrap'}}
+              disabled={!heldCylinders.length}
+              onClick={() => setShowRental(true)}>🧮 Calculate Rental Summary</button>
           </div>
         </div>
         <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
           How long each cylinder has been with this customer, and the site it was issued from.
+          Charge rent for them here, or reprint a summary already issued.
         </p>
-        {sec.aging === 'loading' ? (
-          <SectionLoading label="Loading aging…" />
-        ) : sec.aging === 'error' ? (
-          <SectionError what="cylinder aging" onRetry={() => retrySection('aging')} />
-        ) : agingRows.length === 0 ? (
-          <EmptyState icon="⏳" message="No cylinders currently held" hint="Aging appears here while the customer holds cylinders." />
-        ) : (
+        {agingPreview.state === 'loading' ? <SectionLoading label="Loading aging…" />
+          : agingPreview.state === 'error' ? <SectionError what="cylinder aging" onRetry={() => loadAgingPreview()} />
+          : agingPreview.total === 0 ? (
+            <EmptyState icon="⏳" message="No cylinders currently held" hint="Aging appears here while the customer holds cylinders." />
+          ) : (
           <div className="table-container">
             <table>
               <thead>
@@ -1009,7 +1093,7 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 </tr>
               </thead>
               <tbody>
-                {agingMore_.visible.map((r) => (
+                {agingPreview.rows.map((r) => (
                   <tr key={r.serial_number}>
                     <td><strong>{r.serial_number}</strong></td>
                     <td>{r.gas_type}</td>
@@ -1021,7 +1105,8 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
                 ))}
               </tbody>
             </table>
-            {<LoadMoreFooter hasMore={agingMore_.hasMore} remaining={agingMore_.remaining} step={10} total={agingMore_.total} onLoadMore={agingMore_.loadMore} />}
+            <SectionPreviewFooter shown={agingPreview.rows.length} total={agingPreview.total}
+              onViewMore={() => setOpenList('aging')} />
           </div>
         )}
       </div>
@@ -1031,246 +1116,73 @@ export function CustomerDetail({ customerId, onBack, onSelectCustomer, scrollTo 
           customer={customer}
           customerId={customerId}
           onClose={() => setShowRental(false)}
-          onGenerated={() => { fetchCustomerDetail(); loadRentalHistory(); }}
+          onGenerated={() => { refreshDetail(); loadRentalHistory(); loadAgingPreview(); }}
         />
       )}
 
-      {/* Transaction History — this customer's bills only (Phase 6). Same columns and
-          row-click-to-detail behavior as the global Transaction History page. */}
-      <div className="card" id="transaction-history">
-        <h2>Transaction History ({sec.bills === 'ok' ? billRows.length : '…'})</h2>
+      {/* Everything else is a button. None of these fetch anything until they are pressed; each
+          opens with 5 rows and adds 10 per click. */}
+      <div className="card" id="purity-certificates">
+        <h2>Purity Test Certificates</h2>
         <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
-          Every bill for this customer. Click a row to view the full transaction, its cylinders, and its payment history.
+          Issued certificates for this customer. Opening the list loads it; a certificate can be
+          viewed, printed or deleted, never edited.
         </p>
-        {sec.bills === 'loading' ? (
-          <SectionLoading label="Loading transactions…" />
-        ) : sec.bills === 'error' ? (
-          <SectionError what="transactions" onRetry={() => retrySection('bills')} />
-        ) : billRows.length === 0 ? (
-          <EmptyState icon="🧾" message="No transactions yet" hint="Bills recorded for this customer will appear here." />
-        ) : (
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Date</th><th>Bill No.</th><th>Challan No.</th>
-                  <th>Type</th><th>Cylinders</th><th>Total Amount</th>
-                </tr>
-              </thead>
-              <tbody>
-                {billsVisible.map((r) => (
-                  <tr key={r._id} style={{cursor:'pointer'}} onClick={() => setDetailBillId(r._id)}>
-                    <td>{formatDate(r.date)}</td>
-                    <td><strong>{r.bill_number}</strong>{r.edited && <span className="badge badge-warning" style={{marginLeft:'0.35rem', fontSize:'0.62rem'}}>Updated</span>}</td>
-                    <td>{r.challan_no || '-'}</td>
-                    <td>{directionLabel(r.transaction_type)}</td>
-                    <td>{r.cylinders}</td>
-                    <td>₹{r.amount.toFixed(2)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {billsMore && <ViewAllButton count={billRows.length} onClick={() => setBillsOpen(true)} />}
-          </div>
-        )}
-      </div>
-
-      {/* History sections (Phase 7/8): three side-by-side buttons, collapsed by default;
-          clicking one expands its table inline directly below the row. */}
-      <div className="card">
         <div className="btn-group" style={{flexWrap:'wrap'}}>
-          <button className={`btn ${openHist === 'filled' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => setOpenHist(openHist === 'filled' ? null : 'filled')}>
-            🛢️ Cylinders Filled History ({sec.given === 'ok' ? givenTransactions.length : sec.given === 'error' ? '!' : '…'})
+          <button className="btn btn-secondary" onClick={() => setOpenList('certs')}>
+            {SECTIONS.certs.icon} {SECTIONS.certs.title}
           </button>
-          <button className={`btn ${openHist === 'empty' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => setOpenHist(openHist === 'empty' ? null : 'empty')}>
-            🔄 Cylinders Empty History ({sec.received === 'ok' ? receivedTransactions.length : sec.received === 'error' ? '!' : '…'})
-          </button>
-          <button className={`btn ${openHist === 'payments' ? 'btn-primary' : 'btn-secondary'}`}
-            onClick={() => setOpenHist(openHist === 'payments' ? null : 'payments')}>
-            💰 Payment History ({sec.payments === 'ok' ? payments.length : sec.payments === 'error' ? '!' : '…'})
-          </button>
+          <button className="btn btn-primary" onClick={() => setShowCertForm(true)}>+ New Certificate</button>
         </div>
-
-      {openHist === 'filled' && (
-      <div style={{marginTop:'1rem'}}>
-        <h2>Cylinders Filled History</h2>
-        {sec.given === 'loading' ? (
-          <SectionLoading label="Loading filled history…" />
-        ) : sec.given === 'error' ? (
-          <SectionError what="the filled history" onRetry={() => retrySection('given')} />
-        ) : givenTransactions.length === 0 ? (
-          <EmptyState icon="🛢️" message="No cylinders filled yet" />
-        ) : (
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Bill No.</th>
-                  <th>Gas Type</th>
-                  <th>Size</th>
-                  <th>Serial Number</th>
-                  <th>Personal Cyls.</th>
-                  <th>Rate</th>
-                  <th>Amount</th>
-                </tr>
-              </thead>
-              <tbody>
-                {givenMore_.visible.map(txn => {
-                  // A GIVEN cylinder returned via another customer (cross-customer return).
-                  const returnedVia = !!txn.returned_via;
-                  const badge = returnedVia
-                    ? `Returned via ${txn.returned_via_name || 'another customer'}${txn.returned_date ? ' on ' + formatDate(txn.returned_date) : ''}`
-                    : null;
-                  return (
-                  <tr key={txn.line_item_id} style={returnedVia ? RETURN_ROW_STYLE : {}}>
-                    <td>{formatDate(txn.date)}</td>
-                    <td>{txn.bill_number}</td>
-                    <td>{txn.gas_type_name}</td>
-                    <td>{txn.size_label}</td>
-                    <td>
-                      {txn.serial_number}
-                      {badge && <ReturnBadge text={badge} customerId={txn.returned_via} onSelectCustomer={onSelectCustomer} />}
-                    </td>
-                    <td>{txn.personal_cylinders > 0 ? txn.personal_cylinders : '—'}</td>
-                    <td>₹{(txn.rate || 0).toFixed(2)}</td>
-                    <td>₹{(txn.amount || 0).toFixed(2)}</td>
-                  </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {<LoadMoreFooter hasMore={givenMore_.hasMore} remaining={givenMore_.remaining} step={10} total={givenMore_.total} onLoadMore={givenMore_.loadMore} />}
-          </div>
-        )}
-      </div>
-      )}
-
-      {openHist === 'empty' && (
-      <div style={{marginTop:'1rem'}}>
-        <h2>Cylinders Empty History</h2>
-        {sec.received === 'loading' ? (
-          <SectionLoading label="Loading empty history…" />
-        ) : sec.received === 'error' ? (
-          <SectionError what="the empty history" onRetry={() => retrySection('received')} />
-        ) : receivedTransactions.length === 0 ? (
-          <EmptyState icon="🔄" message="No cylinders empty yet" />
-        ) : (
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Date</th>
-                  <th>Bill No.</th>
-                  <th>Gas Type</th>
-                  <th>Size</th>
-                  <th>Serial Number</th>
-                  <th>Personal Cyls.</th>
-                  <th>Quantity</th>
-                </tr>
-              </thead>
-              <tbody>
-                {receivedMore_.visible.map(txn => {
-                  // A cylinder this customer returned on behalf of its original holder.
-                  const onBehalf = !!txn.returned_on_behalf_of;
-                  return (
-                  <tr key={txn.line_item_id} style={onBehalf ? RETURN_ROW_STYLE : {}}>
-                    <td>{formatDate(txn.date)}</td>
-                    <td>{txn.bill_number}</td>
-                    <td>{txn.gas_type_name}</td>
-                    <td>{txn.size_label}</td>
-                    <td>
-                      {txn.serial_number}
-                      {onBehalf && <ReturnBadge
-                        text={`Returned on behalf of ${txn.returned_on_behalf_of_name || 'another customer'}`}
-                        customerId={txn.returned_on_behalf_of} onSelectCustomer={onSelectCustomer} />}
-                    </td>
-                    <td>{txn.personal_cylinders > 0 ? txn.personal_cylinders : '—'}</td>
-                    <td>{txn.quantity}</td>
-                  </tr>
-                  );
-                })}
-              </tbody>
-            </table>
-            {<LoadMoreFooter hasMore={receivedMore_.hasMore} remaining={receivedMore_.remaining} step={10} total={receivedMore_.total} onLoadMore={receivedMore_.loadMore} />}
-          </div>
-        )}
-      </div>
-      )}
-
-      {openHist === 'payments' && (
-      <div style={{marginTop:'1rem'}}>
-        <h2>Payment History</h2>
-        {sec.payments === 'loading' ? (
-          <SectionLoading label="Loading payments…" />
-        ) : sec.payments === 'error' ? (
-          <SectionError what="payment history" onRetry={() => retrySection('payments')} />
-        ) : payments.length === 0 ? (
-          <EmptyState icon="💰" message="No payments recorded yet" />
-        ) : (
-          <div className="table-container">
-            <table>
-              <thead>
-                <tr>
-                  <th>Receipt No.</th>
-                  <th>Challan No.</th>
-                  <th>Date</th>
-                  <th>Amount</th>
-                  <th>Discount</th>
-                  <th>Mode</th>
-                  <th>Cheque No. / UPI Txn ID</th>
-                  <th>Remarks</th>
-                </tr>
-              </thead>
-              <tbody>
-                {paymentsMore_.visible.map(payment => (
-                  <tr key={payment.receipt_id}>
-                    <td>{payment.receipt_number}</td>
-                    <td>{payment.challan_no || '-'}</td>
-                    <td>{formatDate(payment.date)}</td>
-                    <td>₹{payment.amount_received.toFixed(2)}</td>
-                    <td>₹{payment.discount.toFixed(2)}</td>
-                    <td>{paymentModeLabel(payment.payment_mode)}</td>
-                    <td>{paymentRef(payment)}</td>
-                    <td>{payment.remarks || '-'}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-            {<LoadMoreFooter hasMore={paymentsMore_.hasMore} remaining={paymentsMore_.remaining} step={10} total={paymentsMore_.total} onLoadMore={paymentsMore_.loadMore} />}
-          </div>
-        )}
-      </div>
-      )}
       </div>
 
-      {billsOpen && (
-        <ListModal title="Transaction History" items={billRows} columns={billColumns}
-          searchKeys={['bill_number', 'challan_no', 'transaction_type', dateKey('date')]}
-          searchPlaceholder="Search by bill no., challan no., type, or date…"
-          onRowClick={(r) => { setBillsOpen(false); setDetailBillId(r._id); }}
-          onClose={() => setBillsOpen(false)} />
+      <div className="card" id="history">
+        <h2>History</h2>
+        <p style={{color:'var(--text-muted)', fontSize:'0.8rem', margin:'0.4rem 0 0.75rem'}}>
+          Open any of these to load it. Nothing here is downloaded while the page is simply open.
+        </p>
+        <div className="btn-group" style={{flexWrap:'wrap'}}>
+          {['given', 'received', 'payments', 'bills'].map(key => (
+            <button key={key} className="btn btn-secondary" onClick={() => setOpenList(key)}>
+              {SECTIONS[key].icon} {SECTIONS[key].title}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {showCertForm && (
+        <Modal title={`New Purity Test Certificate — ${customer.company_name}`} size="wide"
+          onClose={() => setShowCertForm(false)}>
+          <PurityCertificateForm
+            customer={customer}
+            onSuccess={() => { setShowCertForm(false); refreshDetail(); }}
+            onCancel={() => setShowCertForm(false)} />
+        </Modal>
       )}
+
+      {openList && (
+        <PagedSectionModal
+          key={openList}
+          title={SECTIONS[openList].title}
+          columns={SECTIONS[openList].columns}
+          rowKey={SECTIONS[openList].rowKey}
+          onRowClick={SECTIONS[openList].onRowClick}
+          emptyIcon={SECTIONS[openList].icon}
+          emptyMessage={SECTIONS[openList].emptyMessage}
+          fetchPage={SECTIONS[openList].fetch}
+          onClose={() => setOpenList(null)} />
+      )}
+
       {detailBillId && !editBillId && (
-        <TransactionDetailModal billId={detailBillId} payments={payments}
+        <TransactionDetailModal billId={detailBillId}
           onClose={() => setDetailBillId(null)}
           onEdit={(auth) => { setEditAuth(auth); setEditBillId(detailBillId); }}
-          onBillNumberChanged={(id, n) => setCustomerBills(prev => prev.map(b => b._id === id ? { ...b, bill_number: n } : b))}
-          onDeleted={() => { setDetailBillId(null); fetchCustomerDetail(); }} />
+          onDeleted={() => { setDetailBillId(null); refreshDetail(); }} />
       )}
       {editBillId && (
         <EditBillModal billId={editBillId} stepUpToken={editAuth?.step_up_token || ''}
           onClose={() => setEditBillId(null)}
-          onSaved={() => { const id = editBillId; setEditBillId(null); fetchCustomerDetail(); setDetailBillId(id); }} />
-      )}
-      {certsOpen && (
-        <ListModal title="Purity Test Certificates" items={certificates} columns={certColumns}
-          searchKeys={['certificate_number', 'gas_type', 'cylinder_serial_no', dateKey('date')]}
-          searchPlaceholder="Search by certificate no., gas type, cylinder no., or date…"
-          onRowClick={(c) => { setCertsOpen(false); setViewCert(c); }}
-          onClose={() => setCertsOpen(false)} />
+          onSaved={() => { const id = editBillId; setEditBillId(null); refreshDetail(); setDetailBillId(id); }} />
       )}
       {viewCert && (
         <Modal title={`Purity Test Certificate — ${viewCert.certificate_number}`} size="wide"
@@ -1802,7 +1714,9 @@ export async function printReportPopup(title, rows, fileName) {
 
 // Reports Component
 export function Reports() {
-  const [reportType, setReportType] = useState('ledger');
+  // Opens with nothing selected: the ledger used to load itself on arrival, reading every bill for
+  // every customer before anyone had asked for a report.
+  const [reportType, setReportType] = useState('');
   const [reportData, setReportData] = useState([]);
   const [loading, setLoading] = useState(false);
 
@@ -1823,7 +1737,7 @@ export function Reports() {
     }
   };
 
-  useEffect(() => { fetchReport(reportType); }, [reportType]);
+  useEffect(() => { if (reportType) fetchReport(reportType); else setReportData([]); }, [reportType]);
 
   const reportLabel = {
     'ledger': 'All Customer Ledger',
@@ -1876,17 +1790,18 @@ export function Reports() {
           >
             {/* Exactly these 6 entries in this order (Phase 8). Old Daily Transaction Report
                 and Cylinder Stock Summary are superseded by DSR / Stock Summary. */}
-            <option value="ledger">All Customer Ledger</option>
+            <option value="">— Select a report —</option>
             <option value="over-limit">Over Limit Customer</option>
             <option value="dsr">DSR — Daily Sales Report</option>
             <option value="stock-summary">Stock Summary (Filled / Empty)</option>
             <option value="outstanding">Outstanding Due Report</option>
             <option value="deposits">Deposit Summary</option>
+            <option value="ledger">All Customer Ledger</option>
           </select>
         </div>
       </div>
 
-      {!isDedicated && (
+      {!isDedicated && reportType && (
         <div className="btn-group">
           <button className="btn btn-primary" onClick={() => fetchReport(reportType)}>
             Refresh
@@ -1902,6 +1817,9 @@ export function Reports() {
 
       {isDedicated ? (
         reportType === 'dsr' ? <DSRReport /> : <StockSummaryReport />
+      ) : !reportType ? (
+        <EmptyState icon="📈" message="Pick a report above"
+          hint="Nothing is loaded until you choose one, so this page opens instantly." />
       ) : loading ? (
         <Spinner label="Loading report…" />
       ) : (
@@ -2446,7 +2364,6 @@ export function ReportTable({ reportType, data }) {
 
 // Payments Component
 export function Payments({ onNavigate }) {
-  const [customers, setCustomers] = useState([]);
   const [showForm, setShowForm] = useState(false);
   const [searchTerm, setSearchTerm] = useState('');
   const debouncedSearch = useDebounce(searchTerm, 300);
@@ -2457,30 +2374,19 @@ export function Payments({ onNavigate }) {
   // Search now goes to the SERVER on every (debounced) keystroke. The old page=&limit + useViewAll
   // pair filtered only the 50 rows that happened to be loaded, so a receipt on any other page
   // could not be found at all — the search box silently lied about the rest of the ledger.
-  const buildUrl = (page, limit) => {
-    let url = `${API_URL}/payments?page=${page}&limit=${limit}`;
+  const buildUrl = (pageOrOffset, limit, opts) => {
+    let url = `${API_URL}/payments?${pageParam(pageOrOffset, limit, opts)}`;
     if (debouncedSearch) url += `&search=${encodeURIComponent(debouncedSearch)}`;
     return url;
   };
   const {
-    rows: payments, total, loading, loadingAll, loadedAll, loadAll, reload: fetchPayments
-  } = useBatchList(buildUrl, [debouncedSearch]);
+    rows: payments, total, loading, loadedAll, reload: fetchPayments,
+    hasMore, loadingMore, loadMore, increment
+  } = useBatchList(buildUrl, [debouncedSearch], { initial: 10, increment: 10, mode: 'manual' });
 
-  useEffect(() => { fetchCustomers(); }, []);
-
-  const fetchCustomers = async () => {
-    try {
-      const response = await apiFetch(`${API_URL}/customers?limit=200`);
-      const result = await response.json();
-      setCustomers(result.data || result);
-    } catch (error) {
-      console.error('Error fetching customers:', error);
-    }
-  };
-
-  if (loading) {
-    return <Spinner label="Loading payments…" />;
-  }
+  // NOTE: deliberately no `if (loading) return <Spinner/>` here — that early return unmounted the
+  // search box on every keystroke's refetch, so only the first character could ever be typed. The
+  // spinner renders in place of the table instead (see below), keeping the input mounted.
 
   return (
     <div>
@@ -2514,7 +2420,6 @@ export function Payments({ onNavigate }) {
         {showForm && (
           <Modal title="Record New Payment" size="wide" onClose={() => setShowForm(false)}>
             <PaymentFormStandalone
-              customers={customers}
               onSuccess={() => {
                 setShowForm(false);
                 fetchPayments();
@@ -2539,7 +2444,9 @@ export function Payments({ onNavigate }) {
         </div>
 
         <div className="table-container" style={{marginTop: '1rem'}}>
-          {payments.length === 0 ? (
+          {loading ? (
+            <Spinner label="Loading payments…" />
+          ) : payments.length === 0 ? (
             <EmptyState icon="💰" message="No payments found" hint={searchTerm ? 'Try a different search.' : 'Record your first payment above.'} />
           ) : (
             <table>
@@ -2577,8 +2484,8 @@ export function Payments({ onNavigate }) {
               </tbody>
             </table>
           )}
-          <BatchListFooter shown={payments.length} total={total} loadedAll={loadedAll}
-            loadingAll={loadingAll} onLoadAll={loadAll} noun="payments" />
+          <PagedListFooter shown={payments.length} total={total} hasMore={hasMore}
+            loadingMore={loadingMore} onLoadMore={loadMore} increment={increment} noun="payments" />
         </div>
 
         <div style={{marginTop: '1rem', padding: '1rem', backgroundColor: '#f8f9fa', borderRadius: '4px'}}>
@@ -2598,7 +2505,7 @@ export function Payments({ onNavigate }) {
 }
 
 // Standalone Payment Form Component (with customer selection)
-export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
+export function PaymentFormStandalone({ onSuccess, onCancel }) {
   const [formData, setFormData] = useState({
     customer_id: '',
     date: istDateInput(),
@@ -2610,9 +2517,31 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
     remarks: ''
   });
   const [errors, setErrors] = useState({});
-  // Live-filtering combobox (Phase 11) — same pattern as the New Transaction page.
+  // Server-searched combobox: the screen used to download 200 customers just to fill this list.
+  // It now asks the server as the user types (the same search the Customers screen uses, so it
+  // matches every customer, not a preloaded slice) and shows the 20 best matches.
   const [custQuery, setCustQuery] = useState('');
   const [custOpen, setCustOpen] = useState(false);
+  const [custResults, setCustResults] = useState([]);
+  const [selectedCust, setSelectedCust] = useState(null);   // the row the user picked
+  const [custLoading, setCustLoading] = useState(false);
+  const debouncedCustQuery = useDebounce(custQuery, 300);
+  useEffect(() => {
+    if (!custOpen) return;
+    let live = true;
+    (async () => {
+      setCustLoading(true);
+      try {
+        const q = debouncedCustQuery.trim();
+        const url = `${API_URL}/customers?page=1&limit=20${q ? `&search=${encodeURIComponent(q)}` : ''}`;
+        const res = await apiFetch(url);
+        const body = res.ok ? await res.json() : { data: [] };
+        if (live) setCustResults(Array.isArray(body) ? body : (body.data || []));
+      } catch { if (live) setCustResults([]); }
+      if (live) setCustLoading(false);
+    })();
+    return () => { live = false; };
+  }, [debouncedCustQuery, custOpen]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -2653,7 +2582,7 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
             value={custQuery}
             placeholder="Type to search by name, contact person, or phone…"
             autoComplete="off"
-            onChange={(e) => { setCustQuery(e.target.value); setCustOpen(true); if (formData.customer_id) setFormData({ ...formData, customer_id: '' }); }}
+            onChange={(e) => { setCustQuery(e.target.value); setCustOpen(true); if (formData.customer_id) { setFormData({ ...formData, customer_id: '' }); setSelectedCust(null); } }}
             onFocus={() => setCustOpen(true)}
             onBlur={() => setTimeout(() => setCustOpen(false), 150)}
           />
@@ -2665,20 +2594,16 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
               maxHeight:'240px', overflowY:'auto'
             }}>
               {(() => {
-                const q = custQuery.trim().toLowerCase();
-                const list = (q
-                  ? customers.filter(c =>
-                      (c.company_name || '').toLowerCase().includes(q) ||
-                      (c.contact_person || '').toLowerCase().includes(q) ||
-                      (c.phone_primary || '').includes(q))
-                  : customers
-                ).slice(0, 50);
+                const list = custResults;
+                if (custLoading) return (
+                  <div style={{padding:'0.5rem 0.75rem', color:'var(--text-muted)', fontSize:'0.85rem'}}>Searching…</div>
+                );
                 return list.length === 0 ? (
                   <div style={{padding:'0.5rem 0.75rem', color:'var(--text-muted)', fontSize:'0.85rem'}}>No matching customers</div>
                 ) : list.map(c => (
                   <div key={c._id}
                     onMouseDown={(e) => e.preventDefault()}
-                    onClick={() => { setFormData({ ...formData, customer_id: c._id }); setCustQuery(`${c.company_name}${displayContact(c.phone_primary) ? ' - ' + displayContact(c.phone_primary) : ''}`); setCustOpen(false); }}
+                    onClick={() => { setFormData({ ...formData, customer_id: c._id }); setSelectedCust(c); setCustQuery(`${c.company_name}${displayContact(c.phone_primary) ? ' - ' + displayContact(c.phone_primary) : ''}`); setCustOpen(false); }}
                     style={{padding:'0.5rem 0.75rem', cursor:'pointer', fontSize:'0.85rem', borderBottom:'1px solid #f1f5f9'}}>
                     <strong>{c.company_name}</strong>
                     {c.contact_person ? ` · ${c.contact_person}` : ''} {displayContact(c.phone_primary) ? ` · ${displayContact(c.phone_primary)}` : ''}
@@ -2692,7 +2617,7 @@ export function PaymentFormStandalone({ customers, onSuccess, onCancel }) {
       </div>
 
       {(() => {
-        const sel = customers.find(c => String(c._id) === String(formData.customer_id));
+        const sel = (selectedCust && String(selectedCust._id) === String(formData.customer_id)) ? selectedCust : null;
         if (!sel) return null;
         const pending = sel.current_bill_amount || 0;
         const isDue = pending > 0, isCredit = pending < 0;
@@ -3104,16 +3029,18 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
 
   // Search + filters go to the server on every keystroke (debounced), so a search always spans
   // the full 2,965-cylinder inventory rather than whatever batch happens to be loaded.
-  const buildUrl = (page, limit) => {
-    let url = `${API_URL}/cylinders?page=${page}&limit=${limit}&`;
+  const buildUrl = (pageOrOffset, limit, opts) => {
+    let url = `${API_URL}/cylinders?${pageParam(pageOrOffset, limit, opts)}&`;
     if (debouncedSearch) url += `search=${encodeURIComponent(debouncedSearch)}&`;
     if (stateFilters.length) url += `state=${stateFilters.join(',')}&`;
     if (locFilters.length) url += `location=${locFilters.join(',')}`;
     return url;
   };
   const {
-    rows: cylinders, total, loading, loadingAll, loadedAll, loadAll, reload: fetchCylinders
-  } = useBatchList(buildUrl, [debouncedSearch, locFilters, stateFilters]);
+    rows: cylinders, total, loading, loadedAll, reload: fetchCylinders,
+    hasMore, loadingMore, loadMore, increment
+  } = useBatchList(buildUrl, [debouncedSearch, locFilters, stateFilters],
+                  { initial: 10, increment: 20, mode: 'manual' });
 
   useEffect(() => { fetchCounts(); fetchHolders(); }, []);
 
@@ -3427,8 +3354,8 @@ export function CylinderInventory({ onViewCustomer, initialFilter = null, onFilt
                   ))}
                 </tbody>
               </table>
-              <BatchListFooter shown={cylinders.length} total={total} loadedAll={loadedAll}
-                loadingAll={loadingAll} onLoadAll={loadAll} noun="cylinders" />
+              <PagedListFooter shown={cylinders.length} total={total} hasMore={hasMore}
+                loadingMore={loadingMore} onLoadMore={loadMore} increment={increment} noun="cylinders" />
               </>
             )}
           </div>
@@ -3524,7 +3451,6 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
   // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
   // cannot see on its own. This subscribes to the refresh so the list below redraws.
   useLocations();
-  const [payments, setPayments] = useState([]);
   const [searchTerm, setSearchTerm] = useState(initialFilter?.searchTerm || '');
   const debouncedSearch = useDebounce(searchTerm, 300);
   useEffect(() => { if (initialFilter && onFilterConsumed) onFilterConsumed(); }, []);
@@ -3540,30 +3466,23 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
 
   // Search is sent to the server (bill no., challan no., type, customer name) so it matches
   // every bill, not only the batch on screen.
-  const buildUrl = (page, limit) => {
-    let url = `${API_URL}/bills?page=${page}&limit=${limit}`;
+  const buildUrl = (pageOrOffset, limit, opts) => {
+    let url = `${API_URL}/bills?${pageParam(pageOrOffset, limit, opts)}`;
     if (dateFilter) url += `&date=${dateFilter}`;
     if (debouncedSearch) url += `&search=${encodeURIComponent(debouncedSearch)}`;
     return url;
   };
-  // Phase 29: Transaction History grows without bound (~15–20/day → tens of thousands/yr), so cap
-  // the automatic "View All" batch-load at the most recent 2,000; beyond that the footer offers a
-  // manual "Load 100 more". Server-side search still queries the FULL dataset (buildUrl carries it).
+  // Transaction History grows without bound (~15-20/day → tens of thousands a year), so it opens
+  // with 10 rows and fetches 10 more as the reader approaches the bottom — the next batch starts
+  // two rows early, so scrolling does not stop. Search and the date filter still query the FULL
+  // dataset on the server (buildUrl carries them).
   const {
-    rows: bills, total, loading, loadingAll, loadedAll, loadAll, reload: load,
-    capReached, loadingMore, loadMore, increment
-  } = useBatchList(buildUrl, [dateFilter, debouncedSearch], { cap: 2000, increment: 100 });
+    rows: bills, total, loading, loadedAll, reload: load,
+    hasMore, loadingMore, loadMore, increment, autoArmed, rowRef
+  } = useBatchList(buildUrl, [dateFilter, debouncedSearch],
+                  { initial: 10, increment: 10, mode: 'auto' });   // loads as you scroll
 
-  useEffect(() => {
-    (async () => {
-      try {
-        const res = await apiFetch(`${API_URL}/payments?limit=200`);
-        const { rows } = await readListResponse(res);
-        setPayments(rows);
-      } catch (e) { console.error('Error loading payments:', e); }
-    })();
-  }, []);
-
+  
   const rows = bills.map(b => {
     const isTransfer = b.transaction_category === 'INTERNAL_TRANSFER';
     return {
@@ -3601,6 +3520,11 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
     return [r.bill_number, r.challan_no, r.vehicle_number, r.company_name, formatDate(r.date), directionText(r.transaction_type)]
       .some(v => String(v || '').toLowerCase().includes(term));
   });
+
+  // The row that starts the next fetch: TRIGGER_FROM_END from the bottom of what is on screen, so
+  // the following 10 are already arriving by the time the reader gets there.
+  const autoLoadRowId = filtered.length > TRIGGER_FROM_END
+    ? filtered[filtered.length - TRIGGER_FROM_END]._id : null;
 
   // Grouped by calendar day (rows arrive newest-first from the API) — no truncation (Phase 8).
   const groups = [];
@@ -3722,7 +3646,8 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
                     </tr>
                     )}
                     {g.rows.map((r) => (
-                      <tr key={r._id} style={{cursor:'pointer'}} onClick={() => setDetailBillId(r._id)}>
+                      <tr key={r._id} style={{cursor:'pointer'}} onClick={() => setDetailBillId(r._id)}
+                        ref={r._id === autoLoadRowId ? rowRef : null}>
                         <td>{r.sr}</td>
                         <td>{formatDate(r.date)}</td>
                         <td><strong>{r.bill_number}</strong>{r.edited && <span className="badge badge-warning" style={{marginLeft:'0.35rem', fontSize:'0.62rem'}}>Updated</span>}</td>
@@ -3737,10 +3662,9 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
                 ))}
               </tbody>
             </table>
-            <BatchListFooter shown={bills.length} total={total} loadedAll={loadedAll}
-              loadingAll={loadingAll} onLoadAll={loadAll} noun="transactions"
-              cap={2000} capReached={capReached} onLoadMore={loadMore}
-              loadingMore={loadingMore} increment={increment} />
+            <PagedListFooter shown={bills.length} total={total} hasMore={hasMore}
+              loadingMore={loadingMore} onLoadMore={loadMore} increment={increment}
+              autoArmed={autoArmed} noun="transactions" />
           </div>
         )}
       </div>
@@ -3755,7 +3679,7 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
       )}
 
       {detailBillId && !editBillId && (
-        <TransactionDetailModal billId={detailBillId} payments={payments}
+        <TransactionDetailModal billId={detailBillId}
           onClose={() => setDetailBillId(null)}
           onEdit={(auth) => { setEditAuth(auth); setEditBillId(detailBillId); }}
           onBillNumberChanged={onBillNumberChanged}
@@ -3774,7 +3698,7 @@ export function TransactionHistory({ initialFilter = null, onFilterConsumed }) {
 // Full bill detail modal: summary + cylinders + payment history, with Print/PDF and Excel export.
 // Edit/Delete respect the 3-day creation window (backend re-enforces); bill_number stays
 // editable forever via the inline "Edit Bill No." control shown once the bill is locked.
-export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDeleted, onBillNumberChanged }) {
+export function TransactionDetailModal({ billId, onClose, onEdit, onDeleted, onBillNumberChanged }) {
   const [bill, setBill] = useState(null);
   const [loading, setLoading] = useState(true);
   const [confirmDelete, setConfirmDelete] = useState(false);
@@ -3837,8 +3761,22 @@ export function TransactionDetailModal({ billId, payments, onClose, onEdit, onDe
     return () => { active = false; };
   }, [billId]);
 
-  // Payments linked to this bill (by bill number).
-  const billPayments = (bill && payments) ? payments.filter(p => p.bill_number && p.bill_number === bill.bill_number) : [];
+  // This bill's receipts, asked for by bill. Previously the opener handed down the 200 most recent
+  // payments and this filtered them by bill number — which quietly showed nothing for an older
+  // bill, and made every visit to Transaction History download those 200.
+  const [billPayments, setBillPayments] = useState([]);
+  useEffect(() => {
+    if (!billId) { setBillPayments([]); return; }
+    let live = true;
+    (async () => {
+      try {
+        const res = await apiFetch(`${API_URL}/payments?bill_id=${billId}&limit=200`);
+        const { rows } = await readListResponse(res);
+        if (live) setBillPayments(rows);
+      } catch { if (live) setBillPayments([]); }
+    })();
+    return () => { live = false; };
+  }, [billId]);
 
   // Transform the API bill into the shape printSavedBill expects, and print.
   const handlePrint = () => {
@@ -4714,8 +4652,6 @@ export function CylinderAgingReport({ onViewCustomer }) {
   // GEN-B2: LOCATIONS is mutated in place when the account's locations change, which React
   // cannot see on its own. This subscribes to the refresh so the list below redraws.
   useLocations();
-  const [rows, setRows] = useState([]);
-  const [loading, setLoading] = useState(true);
   const [mode, setMode] = useState('gte');        // 'gte' (default) | 'range'
   const [minDays, setMinDays] = useState('');
   const [maxDays, setMaxDays] = useState('');
@@ -4728,26 +4664,28 @@ export function CylinderAgingReport({ onViewCustomer }) {
   // Default tab = this browser's Active Location (Phase 32, localStorage — no server round-trip).
   useEffect(() => { setLocTab(getActiveLocation()); }, []);
 
-  const fetchReport = async () => {
-    setLoading(true);
-    try {
-      const p = new URLSearchParams({ mode, sortBy, sortOrder, location: locTab });
-      if (mode === 'range') {
-        if (minDays !== '') p.set('minDays', minDays);
-        if (maxDays !== '') p.set('maxDays', maxDays);
-      } else {
-        if (thresholdDays !== '') p.set('thresholdDays', thresholdDays);
-      }
-      const res = await apiFetch(`${API_URL}/cylinders/aging-report?${p.toString()}`);
-      setRows(await res.json());
-      setLoading(false);
-    } catch (error) {
-      console.error('Error fetching aging report:', error);
-      setLoading(false);
-    }
+  // Filters, search and paging all go to the server: the report is built there, so a search box
+  // that only looked at the rows on screen would answer from a tenth of the data.
+  const [agingSearch, setAgingSearch] = useState('');
+  const debouncedAgingSearch = useDebounce(agingSearch, 300);
+  const agingFilters = (p) => {
+    p.set('mode', mode); p.set('sortBy', sortBy); p.set('sortOrder', sortOrder); p.set('location', locTab || '');
+    if (mode === 'range') {
+      if (minDays !== '') p.set('minDays', minDays);
+      if (maxDays !== '') p.set('maxDays', maxDays);
+    } else if (thresholdDays !== '') p.set('thresholdDays', thresholdDays);
+    if (debouncedAgingSearch) p.set('search', debouncedAgingSearch);
+    return p;
   };
-
-  useEffect(() => { if (locTab) fetchReport(); }, [mode, minDays, maxDays, thresholdDays, sortBy, sortOrder, locTab]);
+  const buildAgingUrl = (pageOrOffset, limit, opts) =>
+    `${API_URL}/cylinders/aging-report?${agingFilters(new URLSearchParams(pageParam(pageOrOffset, limit, opts)))}`;
+  const {
+    rows, total, loading, hasMore, loadingMore, loadMore, increment, reload: fetchReport
+  } = useBatchList(buildAgingUrl,
+      [mode, minDays, maxDays, thresholdDays, sortBy, sortOrder, locTab, debouncedAgingSearch],
+      // Nothing is fetched until the active location is known: asking first for "all locations"
+      // and then again for the right one cost a second full run of the report on every open.
+      { initial: 10, increment: 10, mode: 'manual', enabled: !!locTab });
 
   // Rows with a resolved holder navigate to that customer's detail (aging-history section).
   const rowNav = (r) => {
@@ -4758,9 +4696,20 @@ export function CylinderAgingReport({ onViewCustomer }) {
   const liveDays = (d) => d ? Math.floor((Date.now() - new Date(d).getTime()) / 86400000) : null;
   const fmtDate = (d) => d ? formatDate(d) : '—';
 
-  const handleExport = () => {
+  // Export and print take the FULL report (no page/limit), never the rows currently on screen.
+  const fetchAllAgingRows = async () => {
+    try {
+      const res = await apiFetch(`${API_URL}/cylinders/aging-report?${agingFilters(new URLSearchParams())}`);
+      const body = await res.json();
+      return Array.isArray(body) ? body : (body.data || []);
+    } catch { showToast('Could not load the full report for export.'); return []; }
+  };
+
+  const handleExport = async () => {
+    const all = await fetchAllAgingRows();
+    if (!all.length) return;
     exportToExcel(
-      rows.map((r, i) => ({
+      all.map((r, i) => ({
         'Sr.': i + 1,
         'Rotational No.': r.rotational_number,
         'Days Out': liveDays(r.date_given) ?? '',
@@ -4777,7 +4726,9 @@ export function CylinderAgingReport({ onViewCustomer }) {
     );
   };
 
-  const [agingVisible, agingMore, agingOpen, setAgingOpen] = useViewAll(rows, 10);
+  const [agingOpen, setAgingOpen] = useState(false);
+  const [agingAllRows, setAgingAllRows] = useState([]);
+  const openAgingAll = async () => { setAgingAllRows(await fetchAllAgingRows()); setAgingOpen(true); };
 
   // Physical No. lives only in Cylinder Inventory (Phase 7/8); Sr. No. added for the view-all.
   const agingColumns = [
@@ -4811,6 +4762,13 @@ export function CylinderAgingReport({ onViewCustomer }) {
             <button key={l} className={`btn ${locTab === l ? 'btn-primary' : 'btn-secondary'}`}
               onClick={() => setLocTab(l)}>{LOCATION_LABELS[l]}</button>
           ))}
+        </div>
+
+        {/* Search — sent to the server, so it looks at every cylinder in the report, not the page. */}
+        <div className="search-bar" style={{marginTop:'1rem'}}>
+          <input type="text" className="form-control" value={agingSearch}
+            onChange={(e) => setAgingSearch(e.target.value)}
+            placeholder="Search by rotational no., gas, size, customer, bill or challan…" />
         </div>
 
         {/* Filters */}
@@ -4886,7 +4844,7 @@ export function CylinderAgingReport({ onViewCustomer }) {
                 </tr>
               </thead>
               <tbody>
-                {agingVisible.map((r, index) => {
+                {rows.map((r, index) => {
                   const days = liveDays(r.date_given);
                   return (
                     <tr key={r.rotational_number + '-' + index}
@@ -4912,16 +4870,18 @@ export function CylinderAgingReport({ onViewCustomer }) {
                 })}
               </tbody>
             </table>
-            {agingMore && <ViewAllButton count={rows.length} onClick={() => setAgingOpen(true)} />}
+            <PagedListFooter shown={rows.length} total={total} hasMore={hasMore}
+              loadingMore={loadingMore} onLoadMore={loadMore} increment={increment} noun="cylinders" />
+            {total > rows.length && <ViewAllButton count={total} onClick={openAgingAll} />}
           </div>
         )}
         <p style={{color:'var(--text-muted)', fontSize:'0.78rem', marginTop:'0.75rem'}}>
-          Showing {rows.length} cylinder(s). Rows highlighted in red are in-rotation but have no matching "Filled" transaction — they always appear regardless of the day filter.
+          Showing {rows.length} of {total} cylinder(s). Rows highlighted in red are in-rotation but have no matching "Filled" transaction — they always appear regardless of the day filter.
         </p>
       </div>
 
       {agingOpen && (
-        <ListModal title={`Cylinder Aging Report — ${locTab ? LOCATION_LABELS[locTab] : ''}`} items={rows} columns={agingColumns}
+        <ListModal title={`Cylinder Aging Report — ${locTab ? LOCATION_LABELS[locTab] : ''}`} items={agingAllRows} columns={agingColumns}
           searchKeys={['rotational_number', 'gas_type', 'capacity', 'customer_name']}
           searchPlaceholder="Search by rotational no., gas type, or customer…"
           onRowClick={(r) => { if (r.customer_id && onViewCustomer) { setAgingOpen(false); rowNav(r); } }}
@@ -4959,6 +4919,15 @@ export function FillingListPage() {
   // Cylinders on the saved list that are not standing at the filling site. Informational only —
   // the list saved regardless (R33). Cleared when the day is reloaded or edited again.
   const [saveWarnings, setSaveWarnings] = useState([]);
+  // The day's saved list shows 10 rows. The first "View More" is a click; after that the next 10
+  // arrive as the reader scrolls, two rows before the bottom.
+  const savedMore_ = useLoadMore(saved, 10, 10);
+  const [savedAutoArmed, setSavedAutoArmed] = useState(false);
+  const savedRowRef = useAutoLoadRow({
+    enabled: savedAutoArmed && savedMore_.hasMore,
+    onLoad: savedMore_.loadMore,
+    key: savedMore_.visible.length
+  });
 
   const load = async () => {
     setLoading(true);
@@ -4969,6 +4938,7 @@ export function FillingListPage() {
       setStaged([]);
       setDirty(false);
       setSaveWarnings([]);        // they belong to the save that produced them, not to the day
+      setSavedAutoArmed(false);   // a new day starts at 10 rows and one manual click again
       setMode(list.length ? 'view' : 'edit');
     } catch { setSaved([]); setStaged([]); setMode('edit'); }
     setLoading(false);
@@ -5188,8 +5158,9 @@ export function FillingListPage() {
               <table>
                 <thead><tr><th>Sr.</th><th>Gas Type</th><th>Size</th><th>Cylinder No.</th><th>Recorded At</th></tr></thead>
                 <tbody>
-                  {saved.map((e, i) => (
-                    <tr key={e.entry_id}>
+                  {savedMore_.visible.map((e, i) => (
+                    <tr key={e.entry_id}
+                      ref={i === savedMore_.visible.length - TRIGGER_FROM_END ? savedRowRef : null}>
                       <td>{i + 1}</td>
                       <td>{e.gas_type}</td>
                       <td>{e.capacity}</td>
@@ -5202,6 +5173,19 @@ export function FillingListPage() {
                   ))}
                 </tbody>
               </table>
+              {savedMore_.hasMore && !savedAutoArmed && (
+                <div style={{textAlign:'center', marginTop:'0.75rem'}}>
+                  <button className="btn btn-secondary" style={{fontSize:'0.82rem'}}
+                    onClick={() => { setSavedAutoArmed(true); savedMore_.loadMore(); }}>
+                    View More ({Math.min(10, savedMore_.remaining)})
+                  </button>
+                </div>
+              )}
+              <div style={{textAlign:'center', marginTop:'0.5rem', fontSize:'0.78rem', color:'var(--text-muted)'}}>
+                {savedMore_.hasMore
+                  ? `Showing ${savedMore_.visible.length} of ${savedMore_.total}${savedAutoArmed ? ' — scroll for more' : ''}`
+                  : `All ${savedMore_.total} shown.`}
+              </div>
             </div>
           )}
         </div>
