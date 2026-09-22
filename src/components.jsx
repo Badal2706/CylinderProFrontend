@@ -2028,6 +2028,10 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
   // Set of all rotational numbers known to inventory (used to flag manually-entered/unmapped numbers)
   const knownRotational = new Set(cylinders.map(c => c.rotational_number));
 
+  // How many of OUR cylinders this bill hands over. Only inventory serials count: `personalCyl` is
+  // the customer's own cylinder going back to them, which leaves nothing outstanding to return.
+  const ourCylindersGoingOut = givenItems.reduce((n, it) => n + (it.serial_numbers || []).length, 0);
+
   const renderGivenSection = () => (
     <div className="txn-section txn-section-given" style={{marginTop: '2rem'}}>
       <h3>{isInternal
@@ -2037,6 +2041,21 @@ export function TransactionEntry({ onBack, onViewCustomer, onNewTransaction }) {
         <p style={{color:'var(--text-muted)', fontSize:'0.78rem', margin:'0.25rem 0 0.5rem'}}>
           Filling vendor: these cylinders leave {locationText(location)} to be filled by {selectedCustomer?.company_name}. No holding limit applies.
         </p>
+      )}
+      {/* A nudge, never a block — the bill saves either way. A one-time customer gets a brand-new
+          customer record for this bill and is then hidden from every picker, so the same person can
+          never be chosen again. That is fine for a cash sale, but our OWN cylinders going out create
+          something that has to come back, and the return can then only be recorded as "on behalf of"
+          them. Regular customers stay selectable, so the cylinder simply comes home to the same name. */}
+      {!isInternal && customerType === 'ONE_TIME' && ourCylindersGoingOut > 0 && (
+        <div className="alert alert-warning" style={{fontSize:'0.8rem', margin:'0.25rem 0 0.75rem'}}>
+          ⚠️ {ourCylindersGoingOut === 1
+            ? 'One of your own cylinders is going out'
+            : `${ourCylindersGoingOut} of your own cylinders are going out`} to a one-time customer.
+          A one-time customer cannot be selected again, so the return would have to be recorded as
+          returned <em>on their behalf</em>. Consider <strong>Regular Customer</strong> instead — then
+          {ourCylindersGoingOut === 1 ? ' it' : ' they'} can be returned under this same name.
+        </div>
       )}
       {givenItems.map((item, index) => (
         <CylinderItem
