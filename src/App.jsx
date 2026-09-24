@@ -4417,6 +4417,10 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   });
   const [exporting, setExporting] = useState(false);
   const [showDelete, setShowDelete] = useState(false);
+  // R161: emptying the account so a backup can be restored into it. The server demands a backup
+  // taken within 30 minutes; the page tracks its own download so it can say so before asking.
+  const [showEmpty, setShowEmpty] = useState(false);
+  const [backupDoneAt, setBackupDoneAt] = useState(0);
   // Location profiles (Phase 2): 3 fixed sites, each with manager/contact/challan prefix,
   // plus the user's active (default) location.
   // active_location comes from THIS browser (localStorage), not the shared account (Phase 32);
@@ -4884,6 +4888,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           document.body.appendChild(a); a.click(); a.remove();
           URL.revokeObjectURL(url);
           showToast('Backup downloaded. Keep it somewhere safe and off this machine.', 'success');
+          setBackupDoneAt(Date.now());
         } catch { showToast('Backup failed.'); }
         setBackingUp(false);
     })();
@@ -5821,7 +5826,8 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           <p style={{fontSize:'0.82rem', color:'var(--text-muted)'}}>
             Loads a backup into this account. It only works on an account that is completely
             empty — there is no overwrite and no way to force it, so an existing account can never
-            be damaged by a restore.
+            be damaged by a restore. If this account already has data, empty it first
+            (Danger Zone below), then restore.
           </p>
 
           <input ref={rsInput} type="file" accept=".zip,application/zip" style={{display:'none'}}
@@ -5865,6 +5871,11 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                   <ul style={{margin:'0.4rem 0 0', paddingLeft:'1.1rem'}}>
                     {rsPreview.problems.map((x, i) => <li key={i}>{x}</li>)}
                   </ul>
+                  {rsPreview.needs_purge && (
+                    <button className="btn btn-danger" style={{marginTop:'0.6rem'}} onClick={() => setShowEmpty(true)}>
+                      Empty This Account First…
+                    </button>
+                  )}
                 </div>
               )}
               {(rsPreview.warnings || []).length > 0 && (
@@ -5952,6 +5963,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           or permanently delete your account and everything in it.
         </p>
         <div style={{display:'flex', flexWrap:'wrap', gap:'0.5rem'}}>
+          <button className="btn btn-danger" onClick={() => setShowEmpty(true)}>Empty This Account…</button>
           <button className="btn btn-danger" onClick={() => setShowDelete(true)}>Delete Account</button>
         </div>
       </div>
@@ -5966,6 +5978,10 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
       </div>
 
       {showDelete && <DeleteAccountModal onClose={() => setShowDelete(false)} onDeleted={onLoggedOut} />}
+      {showEmpty && (
+        <EmptyAccountModal backupDoneAt={backupDoneAt} backingUp={backingUp} onDownloadBackup={downloadBackup}
+          onClose={() => setShowEmpty(false)} />
+      )}
       {stepUpAsk && (
         <StepUpVerificationModal title={stepUpAsk.title} context={stepUpAsk.context}
           message="Saving this change needs approval from a trusted person."
@@ -6007,6 +6023,132 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
 // 3-step account deletion modal
 // Phase 21: password alone is no longer enough — deletion also needs an OWNER-ONLY step-up
 // approval (no other trusted person can authorize it, even fully verified + enrolled).
+// ─── R161: empty this account so a backup can be restored into it ───
+// A restore never overwrites, so an account that holds data must be emptied first — this, then a
+// restore, as two separate deliberate steps. Gated like deleting the account (password, then an
+// owner-only approval) plus a backup of this account downloaded within the last 30 minutes, which
+// the server enforces too. Removes everything a backup carries; keeps the login, trusted people and
+// licence; puts the default gas list back.
+const EMPTY_BACKUP_WINDOW_MS = 30 * 60 * 1000;
+export function EmptyAccountModal({ onClose, backupDoneAt, backingUp, onDownloadBackup }) {
+  const [understood, setUnderstood] = useState(false);
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [askOwner, setAskOwner] = useState(false);
+  const [pwError, setPwError] = useState('');
+  const haveBackup = backupDoneAt && (Date.now() - backupDoneAt) < EMPTY_BACKUP_WINDOW_MS;
+
+  const continueToApproval = async () => {
+    setPwError('');
+    if (!password) { setPwError('Enter your password to continue.'); return; }
+    setBusy(true);
+    try {
+      const res = await apiFetch(`${API_URL}/profile/verify-password`, {
+        method: 'POST',
+        body: JSON.stringify({ password })
+      });
+      if (res.ok) setAskOwner(true);
+      else setPwError(await apiErrorMessage(res, 'Incorrect password'));
+    } catch {
+      setPwError('Network error — is the server running?');
+    }
+    setBusy(false);
+  };
+
+  const doEmpty = async (auth) => {
+    setBusy(true);
+    try {
+      const res = await apiFetch(`${API_URL}/profile/empty-account`, {
+        method: 'POST',
+        headers: { 'x-step-up-token': auth.step_up_token },
+        body: JSON.stringify({ password })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        showToast(data.message || 'This account is now empty.', 'success');
+        // Every screen, cache and kept list still shows the old data — start the page afresh.
+        setTimeout(() => window.location.reload(), 1200);
+      } else {
+        showToast(await apiErrorMessage(res));
+        setBusy(false);
+      }
+    } catch { setBusy(false); }
+  };
+
+  const a11yRef = useModalA11y(onClose);
+
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" ref={a11yRef} onClick={(e) => e.stopPropagation()} style={{maxWidth:'480px'}}>
+        <div className="modal-header danger">
+          <span>⚠️ Empty This Account</span>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div className="alert alert-danger" style={{fontSize:'0.86rem'}}>
+            This removes every customer, cylinder, bill, payment, certificate and history record in
+            this account, and its settings — so that a backup can be restored into it. Your login,
+            trusted people and licence stay. Use it only to restore a backup straight afterwards.
+          </div>
+
+          {!haveBackup ? (
+            <>
+              <p style={{fontSize:'0.86rem'}}>
+                <strong>First, download this account's backup.</strong> It is your way back if the
+                restore does not go as planned. Emptying is allowed for 30 minutes after it.
+              </p>
+              <div className="btn-group" style={{justifyContent:'flex-end'}}>
+                <button className="btn btn-secondary" onClick={onClose}>Cancel</button>
+                <button className="btn btn-primary" onClick={onDownloadBackup} disabled={backingUp}>
+                  {backingUp ? 'Preparing backup…' : '⬇ Download Backup'}
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="alert alert-success" style={{fontSize:'0.82rem'}}>
+                ✓ Backup downloaded {formatTime(new Date(backupDoneAt))}. Keep it safe.
+              </div>
+              <label style={{display:'flex', gap:'0.5rem', alignItems:'flex-start', margin:'1rem 0', fontSize:'0.88rem'}}>
+                <input type="checkbox" checked={understood} onChange={(e) => setUnderstood(e.target.checked)} style={{marginTop:'0.2rem'}} />
+                <span>I understand everything in this account will be removed, and I will restore a backup next</span>
+              </label>
+              <div className="form-group">
+                <label>Enter your password to confirm</label>
+                <input type="password" className="form-control" value={password}
+                  onChange={(e) => { setPassword(e.target.value); setPwError(''); }}
+                  onKeyDown={(e) => { if (e.key === 'Enter' && understood && password && !busy) continueToApproval(); }}
+                  autoFocus />
+                {pwError && (
+                  <div className="alert alert-danger" style={{marginTop:'0.5rem', fontSize:'0.82rem'}}>{pwError}</div>
+                )}
+              </div>
+              <div className="btn-group" style={{justifyContent:'flex-end'}}>
+                <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Cancel</button>
+                <button className="btn btn-danger" onClick={continueToApproval} disabled={!understood || !password || busy}>
+                  {busy ? 'Checking…' : 'Continue to owner approval'}
+                </button>
+              </div>
+              <p style={{fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.5rem', textAlign:'right'}}>
+                👑 Next step: only the account owner can approve emptying the account.
+              </p>
+            </>
+          )}
+        </div>
+        {askOwner && (
+          <StepUpVerificationModal
+            title="Owner approval — empty account"
+            context="EMPTY this account (customers, transactions, cylinders, payments, history and settings) so a backup can be restored into it"
+            ownerOnly
+            onVerified={(auth) => { setAskOwner(false); doEmpty(auth); }}
+            onClose={() => setAskOwner(false)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
 export function DeleteAccountModal({ onClose, onDeleted }) {
   const [understood, setUnderstood] = useState(false);
   const [password, setPassword] = useState('');
