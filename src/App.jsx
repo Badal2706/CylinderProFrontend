@@ -2549,8 +2549,11 @@ export function App() {
     return () => window.removeEventListener('auth-logout', handleLogout);
   }, []);
 
-  // Load the live gas → sizes catalog once at startup (Phase 10).
-  useEffect(() => { loadGasCatalog(); }, []);
+  // Load the signed-in account's gas → sizes catalog (Phase 10) — once there is a session, and again
+  // for whoever signs in next. Catalogs belong to an account and their endpoint needs a login: asked
+  // for before signing in, it would 401, and the 401 handler would show "Your session has expired"
+  // on the sign-in screen to everyone who simply opened the site.
+  useEffect(() => { if (authToken) loadGasCatalog(); }, [authToken]);
 
   // Phase GEN-B2: pull the account's real locations as soon as there is a session. Until this
   // lands the cached registry from this browser's last session is used, so dropdowns are not empty.
