@@ -1366,7 +1366,76 @@ export async function apiFetch(url, options = {}) {
       detail: { message: 'Your session has expired. Please log in again.' }
     }));
   }
+  // R162: a write refused because this account is being restored — make sure the banner knows,
+  // even if the state changed on another device since this page loaded.
+  if (res.status === 409) {
+    res.clone().json().then(b => { if (b && b.code === 'RESTORE_STATE') refreshRestoreState(); }).catch(() => {});
+  }
   return res;
+}
+
+// ─── R162: where this account stands between "emptied for a restore" and "restore finished" ───
+// One copy for the whole page, shared by the app-wide banner and Settings → Data & Privacy, and
+// refreshed after any restore action or any write the server refused because of it.
+//   { restore_state: 'none' | 'empty_pending_restore' | 'restore_in_progress',
+//     running_job_id, unfinished, last_job }
+let restoreStateCache = null;
+export async function refreshRestoreState() {
+  try {
+    const res = await apiFetch(`${API_URL}/profile/restore-state`);
+    if (res.ok) {
+      restoreStateCache = await res.json();
+      window.dispatchEvent(new CustomEvent('cp-restore-state', { detail: restoreStateCache }));
+    }
+  } catch { /* the banner simply stays as it was */ }
+  return restoreStateCache;
+}
+export function useRestoreState() {
+  const [state, setState] = useState(restoreStateCache);
+  useEffect(() => {
+    const on = (e) => setState(e.detail);
+    window.addEventListener('cp-restore-state', on);
+    refreshRestoreState();
+    return () => window.removeEventListener('cp-restore-state', on);
+  }, []);
+  return state;
+}
+
+// Shown on every page while the account is not in normal use — it is a real block on saving, so
+// it cannot be dismissed. The button opens Settings → Data & Privacy at the restore section.
+export function RestoreStateBanner({ onOpen }) {
+  const rs = useRestoreState();
+  const state = rs && rs.restore_state;
+  // While a restore is writing, look again every few seconds so the banner goes the moment it ends.
+  useEffect(() => {
+    if (state !== 'restore_in_progress' || (rs && rs.unfinished)) return;
+    const t = setInterval(refreshRestoreState, 5000);
+    return () => clearInterval(t);
+  }, [state, rs && rs.unfinished]);
+  if (!state || state === 'none') return null;
+
+  const unfinished = !!rs.unfinished;
+  const text = state === 'empty_pending_restore'
+    ? <>🛟 This account was emptied and is <strong>waiting for a backup to be restored</strong>. New records can't be added until the restore is finished or cancelled.</>
+    : unfinished
+      ? <>⚠️ <strong>A restore into this account didn't finish.</strong> Nothing can be changed until it is cleared.</>
+      : <>⏳ <strong>A backup is being restored into this account.</strong> Nothing can be changed until it finishes.</>;
+  const bad = unfinished;
+  return (
+    <div role="status" style={{background: bad ? '#FEE2E2' : '#FEF3C7', borderBottom: `1px solid ${bad ? '#FCA5A5' : '#FDE68A'}`,
+      color: bad ? '#991B1B' : '#92400E', padding:'0.5rem 1.25rem', display:'flex', alignItems:'center', gap:'0.75rem',
+      flexWrap:'wrap', fontSize:'0.85rem'}}>
+      <span>{text}</span>
+      <button className="btn btn-primary" style={{padding:'0.2rem 0.7rem', fontSize:'0.78rem'}}
+        onClick={() => {
+          try { sessionStorage.setItem('cp_open_restore', '1'); } catch {}
+          onOpen();
+          window.dispatchEvent(new CustomEvent('cp-open-restore'));
+        }}>
+        Open Data &amp; Privacy
+      </button>
+    </div>
+  );
 }
 
 // Read a JSON error message from a failed response, falling back to a friendly default.
@@ -2726,6 +2795,7 @@ export function App() {
           <span className="topbar-date">{today}</span>
         </div>
         <SecurityReminderBanner onGoToProfile={() => setCurrentPage('profile')} />
+        <RestoreStateBanner onOpen={() => setCurrentPage('profile')} />
         <div className="container">
           <PageErrorBoundary pageKey={currentPage}>
             {renderPage()}
@@ -4412,7 +4482,10 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // Opens on Data & Privacy when the Dashboard's Backup tile sent the user here (see the deep-link
   // effect below); otherwise on the first tab.
   const [tab, setTab] = useState(() => {
-    try { if (sessionStorage.getItem('cp_scroll_local_backup') === '1') return 'data'; } catch {}
+    try {
+      if (sessionStorage.getItem('cp_scroll_local_backup') === '1') return 'data';
+      if (sessionStorage.getItem('cp_open_restore') === '1') return 'data';   // R162 banner
+    } catch {}
     return 'business';
   });
   const [exporting, setExporting] = useState(false);
@@ -4421,6 +4494,11 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
   // taken within 30 minutes; the page tracks its own download so it can say so before asking.
   const [showEmpty, setShowEmpty] = useState(false);
   const [backupDoneAt, setBackupDoneAt] = useState(0);
+  // R162: the account's restore state, and which way out the owner picked
+  // ('cancel' | 'retry' | 'discard'), for RestoreStateActionModal.
+  const restoreState = useRestoreState();
+  const [rsAction, setRsAction] = useState(null);
+  const rsState = (restoreState && restoreState.restore_state) || 'none';
   // Location profiles (Phase 2): 3 fixed sites, each with manager/contact/challan prefix,
   // plus the user's active (default) location.
   // active_location comes from THIS browser (localStorage), not the shared account (Phase 32);
@@ -4959,8 +5037,9 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         if (res.ok) {
           const st = await res.json();
           setRsStatus(st);
-          if (['DONE', 'FAILED', 'ROLLBACK_FAILED', 'CANCELLED'].includes(st.status)) {
+          if (['DONE', 'FAILED', 'ROLLBACK_FAILED', 'CANCELLED', 'INTERRUPTED'].includes(st.status)) {
             setRsBusy('');
+            refreshRestoreState();
             if (st.status === 'DONE') showToast('Restore complete. Set up your Trusted People now.', 'success');
             else showToast('The restore did not finish — see the details below.');
             return;
@@ -4971,6 +5050,35 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
     }
     setRsBusy('');
   };
+
+  // R162: a restore is running into this account but this page did not start it (another tab, or a
+  // reload mid-restore) — follow it here too, with the same progress display.
+  const rsFollowing = useRef(false);
+  useEffect(() => {
+    const id = restoreState && restoreState.running_job_id;
+    if (!id || rsStatus || rsFollowing.current) return;
+    rsFollowing.current = true;
+    setRsBusy('restoring');
+    rsPoll(id).finally(() => { rsFollowing.current = false; });
+  }, [restoreState && restoreState.running_job_id]);
+
+  // R162: the banner's "Open Data & Privacy" — switch to the tab and bring the restore section into
+  // view, whether this page was already open or has just mounted.
+  useEffect(() => {
+    const go = () => {
+      try { sessionStorage.removeItem('cp_open_restore'); } catch {}
+      setTab('data');
+      setTimeout(() => {
+        const el = document.getElementById('restore-section');
+        if (el) el.scrollIntoView({ behavior: 'smooth', block: 'start' });
+      }, 150);
+    };
+    window.addEventListener('cp-open-restore', go);
+    let want = false;
+    try { want = sessionStorage.getItem('cp_open_restore') === '1'; } catch {}
+    if (want && !loading) go();
+    return () => window.removeEventListener('cp-open-restore', go);
+  }, [loading]);
 
   // ── Logout all sessions ──
   const logoutAll = async () => {
@@ -5821,7 +5929,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           )}
         </div>
         {/* Restore (Phase GEN-C) */}
-        <div style={{marginTop:'1.5rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>
+        <div id="restore-section" style={{marginTop:'1.5rem', paddingTop:'1rem', borderTop:'1px solid var(--border)'}}>
           <h3 style={{fontSize:'1rem'}}>Restore from a Backup</h3>
           <p style={{fontSize:'0.82rem', color:'var(--text-muted)'}}>
             Loads a backup into this account. It only works on an account that is completely
@@ -5830,10 +5938,38 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
             (Danger Zone below), then restore.
           </p>
 
+          {/* R162: where the account stands, and the ways out. */}
+          {rsState === 'empty_pending_restore' && !rsStatus && (
+            <div className="alert alert-warning" style={{fontSize:'0.84rem'}}>
+              <strong>This account was emptied and is waiting for a backup.</strong> New customers, bills,
+              cylinders and payments can't be added until you restore one below — or cancel, if you
+              decided not to restore after all.
+              <div style={{marginTop:'0.6rem'}}>
+                <button className="btn btn-secondary" onClick={() => setRsAction('cancel')}>
+                  Cancel — Return to Normal Use…
+                </button>
+              </div>
+            </div>
+          )}
+          {restoreState && restoreState.unfinished && (
+            <div className="alert alert-danger" style={{fontSize:'0.84rem'}}>
+              <strong>This restore didn't finish.</strong> Try again, or remove the partial data and
+              start fresh. Either way, everything the unfinished restore wrote is removed first, so
+              nothing half-written is left behind. Nothing in this account can be changed until then.
+              {restoreState.last_job && restoreState.last_job.error && (
+                <div style={{marginTop:'0.4rem', fontSize:'0.8rem'}}>{restoreState.last_job.error}</div>
+              )}
+              <div style={{display:'flex', gap:'0.5rem', flexWrap:'wrap', marginTop:'0.6rem'}}>
+                <button className="btn btn-primary" onClick={() => setRsAction('retry')}>Try Again…</button>
+                <button className="btn btn-danger" onClick={() => setRsAction('discard')}>Remove the Partial Data…</button>
+              </div>
+            </div>
+          )}
+
           <input ref={rsInput} type="file" accept=".zip,application/zip" style={{display:'none'}}
             onChange={(e) => { const f = e.target.files[0]; if (f) { setRsFile(f); rsCheck(f); } }} />
 
-          {!rsPreview && !rsStatus && (
+          {!rsPreview && !rsStatus && rsState !== 'restore_in_progress' && (
             <button className="btn btn-secondary" disabled={rsBusy === 'checking'}
               onClick={() => rsInput.current && rsInput.current.click()}>
               {rsBusy === 'checking' ? 'Reading backup…' : '📂 Choose a Backup File…'}
@@ -5931,11 +6067,13 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
                 </>
               )}
 
-              {['FAILED', 'ROLLBACK_FAILED'].includes(rsStatus.status) && (
-                <div className={`alert ${rsStatus.status === 'FAILED' ? 'alert-danger' : 'alert-danger'}`} style={{fontSize:'0.82rem'}}>
+              {['FAILED', 'ROLLBACK_FAILED', 'INTERRUPTED'].includes(rsStatus.status) && (
+                <div className="alert alert-danger" style={{fontSize:'0.82rem'}}>
                   <strong>{rsStatus.status === 'FAILED'
                     ? 'The restore failed and everything it had written was removed.'
-                    : 'The restore failed AND could not undo itself — this account needs manual attention.'}</strong>
+                    : rsStatus.status === 'INTERRUPTED'
+                      ? 'The restore stopped part-way (the server restarted). Clear it above — try again, or remove the partial data.'
+                      : 'The restore failed AND could not undo itself. Clear it above — try again, or remove the partial data.'}</strong>
                   <div style={{marginTop:'0.4rem'}}>{rsStatus.error}</div>
                 </div>
               )}
@@ -5963,9 +6101,18 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
           or permanently delete your account and everything in it.
         </p>
         <div style={{display:'flex', flexWrap:'wrap', gap:'0.5rem'}}>
-          <button className="btn btn-danger" onClick={() => setShowEmpty(true)}>Empty This Account…</button>
-          <button className="btn btn-danger" onClick={() => setShowDelete(true)}>Delete Account</button>
+          <button className="btn btn-danger" onClick={() => setShowEmpty(true)}
+            disabled={rsState === 'restore_in_progress'}
+            style={rsState === 'restore_in_progress' ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}>Empty This Account…</button>
+          <button className="btn btn-danger" onClick={() => setShowDelete(true)}
+            disabled={rsState === 'restore_in_progress'}
+            style={rsState === 'restore_in_progress' ? { opacity: 0.45, cursor: 'not-allowed' } : undefined}>Delete Account</button>
         </div>
+        {rsState === 'restore_in_progress' && (
+          <p style={{fontSize:'0.8rem', color:'#7f1d1d', marginTop:'0.5rem'}}>
+            Not available while a restore is in progress or unfinished — see Restore from a Backup above.
+          </p>
+        )}
       </div>
       </div>
 
@@ -5982,6 +6129,7 @@ export function ProfilePage({ currentUser, onUserUpdated, onLoggedOut }) {
         <EmptyAccountModal backupDoneAt={backupDoneAt} backingUp={backingUp} onDownloadBackup={downloadBackup}
           onClose={() => setShowEmpty(false)} />
       )}
+      {rsAction && <RestoreStateActionModal mode={rsAction} onClose={() => setRsAction(null)} />}
       {stepUpAsk && (
         <StepUpVerificationModal title={stepUpAsk.title} context={stepUpAsk.context}
           message="Saving this change needs approval from a trusted person."
@@ -6141,6 +6289,134 @@ export function EmptyAccountModal({ onClose, backupDoneAt, backingUp, onDownload
             context="EMPTY this account (customers, transactions, cylinders, payments, history and settings) so a backup can be restored into it"
             ownerOnly
             onVerified={(auth) => { setAskOwner(false); doEmpty(auth); }}
+            onClose={() => setAskOwner(false)}
+          />
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── R162: the ways out of a non-normal restore state ───
+// Gated exactly like Empty This Account — the password, then an owner-only approval — but with no
+// backup step: the account is already empty (cancel), or holds only half-restored data (retry /
+// discard), and a backup of that would be of no use.
+const RESTORE_ACTIONS = {
+  cancel: {
+    title: 'Cancel the Restore',
+    body: 'The account stays empty (with the default gas list) and goes back to normal use. You can ' +
+      'still restore a backup into it later, as long as no records have been added by then.',
+    confirm: 'I understand the account stays empty and goes back to normal use',
+    button: 'Continue to owner approval',
+    context: 'cancel the pending restore and return this emptied account to normal use',
+    url: '/profile/restore-cancel', danger: false
+  },
+  retry: {
+    title: 'Try the Restore Again',
+    body: 'Everything the unfinished restore wrote is removed first, so nothing half-written is left ' +
+      'behind. The account then waits for the backup, and you choose the backup file again.',
+    confirm: 'I understand the partial data is removed, and I will choose the backup file again',
+    button: 'Continue to owner approval',
+    context: 'REMOVE the partial data an unfinished restore left, so the backup can be restored again',
+    url: '/profile/restore-recovery', danger: true
+  },
+  discard: {
+    title: 'Remove the Partial Data',
+    body: 'Everything the unfinished restore wrote is removed. The account is left empty, with the ' +
+      'default gas list, ready for normal use.',
+    confirm: 'I understand the partial data is removed and the account is left empty',
+    button: 'Continue to owner approval',
+    context: 'REMOVE the partial data an unfinished restore left and return the account to normal use',
+    url: '/profile/restore-recovery', danger: true
+  }
+};
+export function RestoreStateActionModal({ mode, onClose }) {
+  const cfg = RESTORE_ACTIONS[mode];
+  const [understood, setUnderstood] = useState(false);
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [askOwner, setAskOwner] = useState(false);
+  const [pwError, setPwError] = useState('');
+
+  const continueToApproval = async () => {
+    setPwError('');
+    if (!password) { setPwError('Enter your password to continue.'); return; }
+    setBusy(true);
+    try {
+      const res = await apiFetch(`${API_URL}/profile/verify-password`, {
+        method: 'POST',
+        body: JSON.stringify({ password })
+      });
+      if (res.ok) setAskOwner(true);
+      else setPwError(await apiErrorMessage(res, 'Incorrect password'));
+    } catch {
+      setPwError('Network error — is the server running?');
+    }
+    setBusy(false);
+  };
+
+  const run = async (auth) => {
+    setBusy(true);
+    try {
+      const res = await apiFetch(`${API_URL}${cfg.url}`, {
+        method: 'POST',
+        headers: { 'x-step-up-token': auth.step_up_token },
+        body: JSON.stringify(mode === 'cancel' ? { password } : { password, action: mode })
+      });
+      if (res.ok) {
+        const data = await res.json();
+        showToast(data.message || 'Done.', 'success');
+        if (mode === 'cancel') { await refreshRestoreState(); onClose(); }
+        // The account's contents just changed wholesale — start every screen and cache afresh.
+        else setTimeout(() => window.location.reload(), 1200);
+      } else {
+        showToast(await apiErrorMessage(res));
+        setBusy(false);
+      }
+    } catch { setBusy(false); }
+  };
+
+  const a11yRef = useModalA11y(onClose);
+  return (
+    <div className="modal-overlay" onClick={onClose}>
+      <div className="modal-card" ref={a11yRef} onClick={(e) => e.stopPropagation()} style={{maxWidth:'480px'}}>
+        <div className={`modal-header ${cfg.danger ? 'danger' : ''}`}>
+          <span>{cfg.danger ? '⚠️ ' : ''}{cfg.title}</span>
+          <button className="modal-close" onClick={onClose}>✕</button>
+        </div>
+        <div className="modal-body">
+          <div className={`alert ${cfg.danger ? 'alert-danger' : 'alert-warning'}`} style={{fontSize:'0.86rem'}}>{cfg.body}</div>
+          <label style={{display:'flex', gap:'0.5rem', alignItems:'flex-start', margin:'1rem 0', fontSize:'0.88rem'}}>
+            <input type="checkbox" checked={understood} onChange={(e) => setUnderstood(e.target.checked)} style={{marginTop:'0.2rem'}} />
+            <span>{cfg.confirm}</span>
+          </label>
+          <div className="form-group">
+            <label>Enter your password to confirm</label>
+            <input type="password" className="form-control" value={password}
+              onChange={(e) => { setPassword(e.target.value); setPwError(''); }}
+              onKeyDown={(e) => { if (e.key === 'Enter' && understood && password && !busy) continueToApproval(); }}
+              autoFocus />
+            {pwError && (
+              <div className="alert alert-danger" style={{marginTop:'0.5rem', fontSize:'0.82rem'}}>{pwError}</div>
+            )}
+          </div>
+          <div className="btn-group" style={{justifyContent:'flex-end'}}>
+            <button className="btn btn-secondary" onClick={onClose} disabled={busy}>Close</button>
+            <button className={`btn ${cfg.danger ? 'btn-danger' : 'btn-primary'}`} onClick={continueToApproval}
+              disabled={!understood || !password || busy}>
+              {busy ? 'Working…' : cfg.button}
+            </button>
+          </div>
+          <p style={{fontSize:'0.78rem', color:'var(--text-muted)', marginTop:'0.5rem', textAlign:'right'}}>
+            👑 Next step: only the account owner can approve this.
+          </p>
+        </div>
+        {askOwner && (
+          <StepUpVerificationModal
+            title={`Owner approval — ${cfg.title.toLowerCase()}`}
+            context={cfg.context}
+            ownerOnly
+            onVerified={(auth) => { setAskOwner(false); run(auth); }}
             onClose={() => setAskOwner(false)}
           />
         )}
